@@ -1,0 +1,984 @@
+#include "egtb/egtb_compress.h"
+#include "egtb/egtb_entry.h"
+#include "egtb/egtb_probe.h"
+
+#include "chess/piece_config.h"
+
+#include "util/allocation.h"
+#include "util/progress_bar.h"
+#include "util/filesystem.h"
+#include "util/memory.h"
+
+namespace {
+// Fill ILLEGAL (don't-care) runs with a neighbor value to maximize merged run
+// length for downstream compression. Returns false iff every cell is ILLEGAL
+// (caller skips compression; range is unreachable).
+template <typename T>
+NODISCARD bool prepare_entries_for_compression(Span<T> data, T illegal_val)
+{
+	const size_t size = data.size();
+	for (size_t begin = 0, end = 0; begin < size; begin = end)
+	{
+		while (begin < size && data[begin] != illegal_val)
+			++begin;
+		if (begin == size) break;
+
+		end = begin + 1;
+		while (end < size && data[end] == illegal_val)
+			++end;
+
+		const bool has_left  = (begin > 0);
+		const bool has_right = (end < size);
+
+		if (!has_left && !has_right)
+			return false;
+
+		T fill_value;
+		if (!has_left)
+			fill_value = data[end];
+		else if (!has_right)
+			fill_value = data[begin - 1];
+		else if (data[begin - 1] == data[end])
+			fill_value = data[begin - 1];
+		else
+		{
+			const T left_v  = data[begin - 1];
+			const T right_v = data[end];
+			size_t left_run = 0;
+			for (size_t i = begin; i-- > 0 && data[i] == left_v; ) ++left_run;
+			size_t right_run = 0;
+			for (size_t i = end; i < size && data[i] == right_v; ++i) ++right_run;
+			fill_value = (left_run >= right_run) ? left_v : right_v;
+		}
+
+		std::fill(data.begin() + begin, data.begin() + end, fill_value);
+	}
+	return true;
+}
+}  // namespace
+
+namespace {
+template <size_t N>
+Value_Rank_Table build_rank_table_impl(const std::array<uint64_t, N>& hist)
+{
+	struct Bin { uint16_t value; uint64_t count; };
+	std::vector<Bin> bins;
+	bins.reserve(N);
+	for (size_t v = 0; v < N; ++v)
+		if (hist[v] != 0)
+			bins.push_back({static_cast<uint16_t>(v), hist[v]});
+
+	// Descending by count; break ties by value so the table is deterministic.
+	std::sort(bins.begin(), bins.end(),
+		[](const Bin& a, const Bin& b) {
+			if (a.count != b.count) return a.count > b.count;
+			return a.value < b.value;
+		});
+
+	Value_Rank_Table t;
+	t.ranks.reserve(bins.size());
+	t.value_to_rank.assign(N, Value_Rank_Table::NO_RANK);
+	for (size_t r = 0; r < bins.size(); ++r)
+	{
+		t.ranks.push_back(bins[r].value);
+		t.value_to_rank[bins[r].value] = static_cast<uint16_t>(r);
+	}
+	return t;
+}
+}  // namespace
+
+Value_Rank_Table Value_Rank_Table::build_1b(const std::array<uint64_t, Value_Histogram::HIST_BINS>& hist)
+{
+	return build_rank_table_impl(hist);
+}
+
+Value_Rank_Table Value_Rank_Table::build_2b(const std::array<uint64_t, Value_Histogram::HIST_BINS>& hist)
+{
+	return build_rank_table_impl(hist);
+}
+
+bool prepare_packed_wdl_entries_for_compression(Span<Packed_WDL_Entries> data)
+{
+	if (data.size() == 0)
+		return true;
+
+	auto dst_buf = cpp20::make_unique_for_overwrite<WDL_Entry[]>(data.size() * WDL_ENTRY_PACK_RATIO);
+	const Span unpacked_span(dst_buf.get(), data.size() * WDL_ENTRY_PACK_RATIO);
+
+	unpack_wdl_entries(data, unpacked_span);
+
+	if (!prepare_entries_for_compression<WDL_Entry>(unpacked_span, WDL_Entry::ILLEGAL))
+		return false;
+
+	pack_wdl_entries(unpacked_span, data);
+	return true;
+}
+
+namespace {
+constexpr size_t WDL_DICT_MAX_SIZE = 1024 * 32;
+constexpr size_t WDL_DICT_MAX_TOTAL_SAMPLES_SIZE = WDL_DICT_MAX_SIZE * 1024;
+constexpr size_t WDL_DICT_SAMPLE_BLOCK_SIZE = 4096;
+constexpr size_t WDL_DICT_MIN_BLOCKS_TO_MAKE = 256;
+}  // namespace
+
+std::optional<LZ4_Dict> make_dict_for_wdl(
+	const Block_Source& src,
+	size_t block_size
+)
+{
+	const size_t block_cnt = src.total_size / block_size;
+	if (block_cnt < WDL_DICT_MIN_BLOCKS_TO_MAKE)
+		return std::nullopt;
+
+	const size_t num_blocks_to_use = std::min(WDL_DICT_MAX_TOTAL_SAMPLES_SIZE / block_size, block_cnt);
+	const size_t split = std::max(block_cnt / num_blocks_to_use, (size_t)1);
+	const size_t buf_size = num_blocks_to_use * block_size;
+
+	auto dist_buf = cpp20::make_unique_for_overwrite<uint8_t[]>(buf_size);
+	auto scratch  = cpp20::make_unique_for_overwrite<uint8_t[]>(block_size);
+
+	for (size_t i = 0; i < num_blocks_to_use; ++i)
+	{
+		const size_t bid = i * split;
+		const auto blk = src.get(bid, Span<uint8_t>(scratch.get(), block_size));
+		// num_blocks_to_use <= block_cnt = total/block_size, so sampled ids never hit the trailing-partial block.
+		ASSERT(blk.size() == block_size);
+		std::memcpy(dist_buf.get() + i * block_size, blk.data(), block_size);
+	}
+
+	return LZ4_Dict::make(
+		Const_Span<uint8_t>(dist_buf.get(), buf_size),
+		WDL_DICT_MAX_SIZE,
+		WDL_DICT_SAMPLE_BLOCK_SIZE
+	);
+}
+
+Compressed_EGTB save_compress_wdl(
+	In_Out_Param<Thread_Pool> thread_pool,
+	const Block_Source& src,
+	Color color,
+	size_t max_workers
+)
+{
+	const std::string task_name = std::string("save_compress_wdl ") + std::to_string(static_cast<int>(color));
+
+	auto dict = make_dict_for_wdl(src, WDL_BLOCK_SIZE);
+
+	auto compressed_blocks = compress_blocks(
+		thread_pool,
+		src,
+		WDL_BLOCK_SIZE,
+		std::make_unique<LZ4_Compress_Helper>(dict.has_value() ? &*dict : nullptr),
+		task_name,
+		max_workers
+	);
+
+	return Compressed_EGTB(
+		std::move(compressed_blocks),
+		WDL_BLOCK_SIZE,
+		src.total_size % WDL_BLOCK_SIZE,
+		std::move(dict),
+		/*entry_bytes=*/0
+	);
+}
+
+size_t LZMA_Rank_Compress_Helper::compress(Span<uint8_t> dest, Const_Span<uint8_t> src)
+{
+	ASSERT(src.size() % sizeof(uint16_t) == 0);
+	const size_t entries = src.size() / sizeof(uint16_t);
+	if (entries == 0) return 0;
+	const size_t output_bytes = entries * m_entry_bytes;
+	const size_t work_bytes = entries * sizeof(uint16_t);
+	const size_t need_bytes = work_bytes > output_bytes ? work_bytes : output_bytes;
+	if (m_scratch.size() < need_bytes) m_scratch.resize(need_bytes);
+
+	const auto* const in = reinterpret_cast<const uint16_t*>(src.data());
+	const uint16_t* const v2r = m_rank_table->value_to_rank.data();
+	auto* const work = reinterpret_cast<uint16_t*>(m_scratch.data());
+
+	// Single storage callback covers both tiers. DTC's 2B path returns raw
+	// VALUE_MASK bits; DTM's path always halves (parity-lossless).
+	const uint16_t illegal_v = m_storage_fn(DTC_Final_Entry::ILLEGAL_VAL, m_entry_bytes);
+	for (size_t i = 0; i < entries; ++i)
+		work[i] = m_storage_fn(in[i], m_entry_bytes);
+
+	if (!prepare_entries_for_compression<uint16_t>(Span<uint16_t>(work, entries), illegal_v))
+		return 0;
+
+	if (m_entry_bytes == 2)
+	{
+		for (size_t i = 0; i < entries; ++i)
+			work[i] = v2r[work[i]];
+	}
+	else
+	{
+		uint8_t* const out = m_scratch.data();
+		for (size_t i = 0; i < entries; ++i)
+			out[i] = static_cast<uint8_t>(v2r[work[i]]);
+	}
+
+	return m_lzma.compress(dest, Const_Span<uint8_t>(m_scratch.data(), output_bytes));
+}
+
+Compressed_EGTB save_compress_egtb(
+	In_Out_Param<Thread_Pool> thread_pool,
+	const Block_Source& src,
+	Color color,
+	const EGTB_Info& info,
+	size_t entry_bytes,
+	size_t block_size,
+	size_t max_workers,
+	Value_Rank_Table rank_table,
+	LZMA_Rank_Compress_Helper::Storage_Fn storage_fn
+)
+{
+	const std::string task_name = std::string("save_compress_egtb ") + std::to_string(static_cast<int>(color));
+
+	if (info.win_cnt[color] + info.lose_cnt[color] == 0)
+	{
+		printf("%s: singular\n", task_name.c_str());
+		return Compressed_EGTB::make_singular(WDL_Entry::DRAW);
+	}
+
+	auto compressed_blocks = compress_blocks(
+		thread_pool,
+		src,
+		block_size,
+		std::make_unique<LZMA_Rank_Compress_Helper>(rank_table, entry_bytes, storage_fn),
+		task_name,
+		max_workers
+	);
+
+	return Compressed_EGTB(
+		std::move(compressed_blocks),
+		block_size,
+		src.total_size % block_size,
+		std::nullopt,
+		entry_bytes,
+		std::move(rank_table)
+	);
+}
+
+void save_wdl_table(
+	const Piece_Config& ps,
+	const Compressed_EGTB save_info[COLOR_NB],
+	std::filesystem::path file_path,
+	const Fixed_Vector<Color, 2> table_colors,
+	EGTB_Magic magic
+)
+{
+	size_t file_size = 8;  // header
+	size_t offset_bits[COLOR_NB] = { 4, 4 };
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			file_size += 2;
+		else
+		{
+			offset_bits[i] = t.total_compressed_size() <= 0xffffffff ? 4 : 6;
+			file_size += 20;
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		file_size += 2;
+		if (t.dict().has_value())
+		{
+			file_size += t.dict()->size();
+			if (file_size & 1)
+				file_size += 1;
+		}
+	}
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		file_size += (offset_bits[i] + 2) * t.num_blocks();
+	}
+
+	file_size = ceil_to_multiple(file_size, (size_t)64);
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		file_size += t.total_compressed_size();
+		file_size = ceil_to_multiple(file_size, (size_t)64);
+	}
+
+	// file_size is found.
+
+	Memory_Mapped_File write_map;
+	if (!write_map.create(file_path.c_str(), file_size + 8))
+		abort();
+
+	Serial_Memory_Writer writer(write_map.data_span());
+
+	writer.write<uint32_t>(narrowing_static_cast<uint32_t>(magic));
+	writer.write<uint32_t>(narrowing_static_cast<uint32_t>((ps.min_material_key().value() << 2ull) + table_colors.size()));
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+		{
+			writer.write<uint8_t>(narrowing_static_cast<uint8_t>(EGTB_SINGULAR_FLAG));
+			writer.write<uint8_t>(narrowing_static_cast<uint8_t>(t.single_val()));
+		}
+		else
+		{
+			writer.write<uint8_t>(0);
+			writer.write<uint8_t>(narrowing_static_cast<uint8_t>(offset_bits[i]));
+
+			writer.write<uint16_t>(narrowing_static_cast<uint16_t>(t.tail_size()));
+			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.block_size()));
+			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.num_blocks()));
+			writer.write<uint64_t>(narrowing_static_cast<uint64_t>(t.total_compressed_size()));
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		if (t.dict().has_value())
+		{
+			writer.write<uint16_t>(narrowing_static_cast<uint16_t>(t.dict()->size()));
+			writer.write(Const_Span(t.dict()->data(), t.dict()->size()));
+			writer.zero_align(2);
+		}
+		else
+			writer.write<uint16_t>(0);
+	}
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		size_t offset = 0;
+		for (const auto& block : t.compressed_blocks())
+		{
+			if (block.empty())
+			{
+				writer.write<uint16_t>(0);
+				writer.write<uint32_t>(0);
+				if (offset_bits[i] == 6)
+					writer.write<uint16_t>(0);
+				continue;
+			}
+
+			writer.write<uint16_t>(narrowing_static_cast<uint16_t>(block.size()));
+			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(offset));
+
+			if (offset_bits[i] == 6)
+				writer.write<uint16_t>(narrowing_static_cast<uint16_t>(offset >> 32));
+
+			offset += block.size();
+		}
+	}
+
+	writer.zero_align(64);
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		for (const auto& block : t.compressed_blocks())
+			writer.write(Const_Span(block));
+
+		writer.zero_align(64);
+	}
+
+	if (writer.num_bytes_written() != file_size)
+		print_and_abort("file size is wrong.\n");
+
+	writer.write_end_checksum(static_cast<uint64_t>(EGTB_CHECKSUM_INIT_VALUE));
+
+	write_map.close();
+}
+
+void save_egtb_table(
+	const Piece_Config& ps,
+	const Compressed_EGTB save_info[COLOR_NB],
+	std::filesystem::path file_path,
+	const Fixed_Vector<Color, 2> table_colors,
+	EGTB_Magic magic
+)
+{
+	size_t file_size = 8;  // header
+
+	for (const Color i : table_colors)
+	{
+		if (save_info[i].is_singular())
+		{
+			file_size += 2;
+		}
+		else
+		{
+			file_size += 22 + 2 + save_info[i].rank_table().ranks.size() * 2;
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		file_size += t.num_blocks() * 8;
+	}
+
+	file_size = ceil_to_multiple(file_size, (size_t)64);
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		file_size += t.total_compressed_size();
+		file_size = ceil_to_multiple(file_size, (size_t)64);
+	}
+
+	// file_size is found.
+
+	Memory_Mapped_File write_map;
+	write_map.create(file_path.c_str(), file_size + 8);
+
+	Serial_Memory_Writer writer(write_map.data_span());
+
+	writer.write<uint32_t>(narrowing_static_cast<uint32_t>(magic));
+	writer.write<uint32_t>(narrowing_static_cast<uint32_t>((ps.min_material_key().value() << 2ull) + table_colors.size()));
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+		{
+			writer.write<uint8_t>(narrowing_static_cast<uint8_t>(EGTB_SINGULAR_FLAG));
+			writer.write<uint8_t>(narrowing_static_cast<uint8_t>(t.single_val()));
+		}
+		else
+		{
+			writer.write<uint8_t>(0);
+			writer.write<uint8_t>(narrowing_static_cast<uint8_t>(t.entry_bytes()));
+
+			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.tail_size()));
+			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.block_size()));
+			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.num_blocks()));
+			writer.write<uint64_t>(narrowing_static_cast<uint64_t>(t.total_compressed_size()));
+
+			// Inline rank table: num_ranks=0 means "no remap, stream stores storage values".
+			const auto& rt = t.rank_table();
+			writer.write<uint16_t>(narrowing_static_cast<uint16_t>(rt.ranks.size()));
+			for (uint16_t v : rt.ranks)
+				writer.write<uint16_t>(v);
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		size_t offset = 0;
+		for (const auto& block : t.compressed_blocks())
+		{
+			if (block.empty())
+			{
+				writer.write<uint64_t>(0);
+				continue;
+			}
+			ASSERT(block.size() < (1 << 20));
+			writer.write<uint64_t>((offset << 20) + block.size());
+			offset += block.size();
+		}
+	}
+
+	writer.zero_align(64);
+
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular())
+			continue;
+
+		for (const auto& block : t.compressed_blocks())
+			writer.write(Const_Span(block));
+		writer.zero_align(64);
+	}
+
+	if (writer.num_bytes_written() != file_size)
+		print_and_abort("file size is wrong.\n");
+
+	writer.write_end_checksum(static_cast<uint64_t>(EGTB_CHECKSUM_INIT_VALUE));
+
+	write_map.close();
+}
+
+Compressed_EGTB::Compressed_EGTB(
+	std::vector<std::vector<uint8_t>>&& compressed_blocks,
+	size_t src_blk_sz,
+	size_t tail_blk_sz,
+	std::optional<LZ4_Dict> d,
+	size_t entry_bytes,
+	Value_Rank_Table rank_table
+) :
+	m_is_singular(false),
+	m_entry_bytes(narrowing_static_cast<uint8_t>(entry_bytes)),
+	m_single_val(WDL_Entry::DRAW),
+	m_block_size(src_blk_sz),
+	m_tail_size(tail_blk_sz),
+	m_compressed_blocks(std::move(compressed_blocks)),
+	m_total_compressed_size(0),
+	m_dict(std::move(d)),
+	m_rank_table(std::move(rank_table))
+{
+	for (const auto& block : this->m_compressed_blocks)
+		m_total_compressed_size += block.size();
+}
+
+void load_wdl_table(
+	Out_Param<WDL_File_For_Probe> wdl,
+	const Piece_Config& ps,
+	std::filesystem::path sub_wdl,
+	EGTB_Magic wdl_magic
+)
+{
+	if (!wdl->m_lzw_file.open_readonly(sub_wdl.c_str()))
+		throw std::runtime_error("Could not open WDL file trying to load " + sub_wdl.string());
+
+	const Const_Span<uint8_t> input = wdl->m_lzw_file.data_span();
+
+	if ((input.size() & 63) != 8)
+		throw std::runtime_error("Invalid WDL file size trying to load " + sub_wdl.string());
+
+	Serial_Memory_Reader reader(input);
+
+	if (!reader.is_end_checksum_ok(static_cast<uint64_t>(EGTB_CHECKSUM_INIT_VALUE)))
+		throw std::runtime_error("Invalid WDL file checksum trying to load " + sub_wdl.string());
+
+	size_t block_cnt[COLOR_NB]{ 0, 0 };
+	size_t block_size[COLOR_NB]{ 0, 0 };
+	size_t tail_size[COLOR_NB]{ 0, 0 };
+
+	size_t dict_size[COLOR_NB]{ 0, 0 };
+	const uint8_t* lp_dict[COLOR_NB]{ nullptr, nullptr };
+	size_t offset_bits[COLOR_NB]{ 0, 0 };
+	const uint8_t* data[COLOR_NB]{ nullptr, nullptr };
+	size_t data_size[COLOR_NB]{ 0, 0 };
+	const uint8_t* offset_tb[COLOR_NB]{ nullptr, nullptr };
+
+	const uint32_t magic = reader.read<uint32_t>();
+
+	if (magic != narrowing_static_cast<uint32_t>(wdl_magic))
+		throw std::runtime_error("Invalid WDL file magic trying to load " + sub_wdl.string());
+
+	const uint32_t key_and_table_num = reader.read<uint32_t>();
+	const Material_Key key = static_cast<Material_Key>(key_and_table_num >> 2u);
+	if (key != ps.min_material_key())
+		throw std::runtime_error("Wrong material key in WDL file " + sub_wdl.string());
+
+	const size_t table_num = key_and_table_num & 3;
+	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+
+	for (const Color i : table_colors)
+	{
+		if (reader.read<uint8_t>() & 0x80)
+		{
+			wdl->m_is_singular[i] = true;
+			wdl->m_single_val[i] = static_cast<WDL_Entry>(reader.read<uint8_t>());
+		}
+		else
+		{
+			wdl->m_is_singular[i] = false;
+
+			offset_bits[i] = reader.read<uint8_t>();
+			tail_size[i] = reader.read<uint16_t>();
+			block_size[i] = reader.read<uint32_t>();
+			block_cnt[i] = reader.read<uint32_t>();
+			data_size[i] = reader.read<uint64_t>();
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (wdl->m_is_singular[i])
+			continue;
+
+		dict_size[i] = reader.read<uint16_t>();
+		if (dict_size[i] != 0)
+		{
+			lp_dict[i] = reader.caret();
+			reader.advance(dict_size[i]);
+			reader.align(2);
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (wdl->m_is_singular[i])
+			continue;
+
+		offset_tb[i] = reader.caret();
+		reader.advance((2 + offset_bits[i]) * block_cnt[i]);
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (wdl->m_is_singular[i])
+			continue;
+
+		reader.align(64);
+		data[i] = reader.caret();
+		reader.advance(data_size[i]);
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (wdl->m_is_singular[i])
+			continue;
+
+		ASSERT(data[i] != nullptr);
+		ASSERT(offset_tb[i] != nullptr);
+
+		const size_t num_full_sized_blocks =
+			tail_size[i] != 0
+			? block_cnt[i] - 1
+			: block_cnt[i];
+		const size_t file_sz = block_size[i] * num_full_sized_blocks + tail_size[i];
+		if (file_sz != ceil_div(Piece_Config_For_Gen(ps).num_positions(), WDL_ENTRY_PACK_RATIO))
+			throw std::runtime_error("Invalid decompressed size of WDL table from " + sub_wdl.string());
+
+		auto& pc = wdl->m_per_color[i];
+		pc.block_size = block_size[i];
+		pc.tail_size = tail_size[i];
+		pc.block_cnt = block_cnt[i];
+		pc.compressed_data = data[i];
+		pc.dict = LZ4_Dict::load(Const_Span(lp_dict[i], lp_dict[i] + dict_size[i]));
+
+		// On-disk offset table: 2 bytes comp_size + offset_bits bytes data_offset
+		// (offset_bits = 4 for tables <= 4 GiB compressed, else 6).
+		pc.index.resize(block_cnt[i]);
+		for (size_t idx = 0; idx < block_cnt[i]; ++idx)
+		{
+			Serial_Memory_Reader block_reader(Const_Span(offset_tb[i] + (offset_bits[i] + 2) * idx, 2 + 4 + 2));
+			const uint16_t comp_size = block_reader.read<uint16_t>();
+			size_t data_offset = block_reader.read<uint32_t>();
+			if (offset_bits[i] == 6)
+			{
+				const size_t hi = block_reader.read<uint16_t>();
+				data_offset += hi << 32;
+			}
+			pc.index[idx].data_offset = data_offset;
+			pc.index[idx].comp_size = comp_size;
+		}
+	}
+}
+
+// File format is identical to save_egtb_table (DTC writer): per-color header
+// {flag, entry_bytes, tail_size, block_size, block_cnt, data_size, num_ranks,
+// ranks[]}, followed by per-color packed 8-byte block-offset table, 64-byte
+// align, then compressed-data regions. See save_egtb_table for the wire layout.
+void load_dtm_table(
+	Out_Param<DTM_File_For_Probe> dtm,
+	const Piece_Config& ps,
+	std::filesystem::path sub_dtm,
+	EGTB_Magic dtm_magic
+)
+{
+	if (!dtm->m_lzdtm_file.open_readonly(sub_dtm.c_str()))
+		throw std::runtime_error("Could not open DTM file trying to load " + sub_dtm.string());
+
+	const Const_Span<uint8_t> input = dtm->m_lzdtm_file.data_span();
+
+	if ((input.size() & 63) != 8)
+		throw std::runtime_error("Invalid DTM file size trying to load " + sub_dtm.string());
+
+	Serial_Memory_Reader reader(input);
+
+	if (!reader.is_end_checksum_ok(static_cast<uint64_t>(EGTB_CHECKSUM_INIT_VALUE)))
+		throw std::runtime_error("Invalid DTM file checksum trying to load " + sub_dtm.string());
+
+	const uint32_t magic = reader.read<uint32_t>();
+	if (magic != narrowing_static_cast<uint32_t>(dtm_magic))
+		throw std::runtime_error("Invalid DTM file magic trying to load " + sub_dtm.string());
+
+	const uint32_t key_and_table_num = reader.read<uint32_t>();
+	const Material_Key key = static_cast<Material_Key>(key_and_table_num >> 2u);
+	if (key != ps.min_material_key())
+		throw std::runtime_error("Wrong material key in DTM file " + sub_dtm.string());
+
+	const size_t table_num = key_and_table_num & 3;
+	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+
+	size_t data_size[COLOR_NB]{ 0, 0 };
+
+	for (const Color i : table_colors)
+	{
+		const uint8_t flag = reader.read<uint8_t>();
+		if (flag & EGTB_SINGULAR_FLAG)
+		{
+			dtm->m_is_singular[i] = true;
+			dtm->m_single_val[i] = static_cast<WDL_Entry>(reader.read<uint8_t>());
+		}
+		else
+		{
+			dtm->m_is_singular[i] = false;
+			auto& pc = dtm->m_per_color[i];
+			pc.entry_bytes = reader.read<uint8_t>();
+			if (pc.entry_bytes != sizeof(DTM_Final_Entry) && pc.entry_bytes != 1)
+				throw std::runtime_error("Bad DTM entry_bytes in " + sub_dtm.string());
+			pc.tail_size  = reader.read<uint32_t>();
+			pc.block_size = reader.read<uint32_t>();
+			pc.block_cnt  = reader.read<uint32_t>();
+			data_size[i]  = reader.read<uint64_t>();
+
+			const size_t num_ranks = reader.read<uint16_t>();
+			pc.rank_to_value.resize(num_ranks);
+			for (size_t r = 0; r < num_ranks; ++r)
+				pc.rank_to_value[r] = reader.read<uint16_t>();
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (dtm->m_is_singular[i]) continue;
+		dtm->m_per_color[i].offset_tb = reader.caret();
+		reader.advance(dtm->m_per_color[i].block_cnt * 8);
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (dtm->m_is_singular[i]) continue;
+		reader.align(64);
+		dtm->m_per_color[i].compressed_data = reader.caret();
+		reader.advance(data_size[i]);
+	}
+
+	const size_t num_positions = Piece_Config_For_Gen(ps).num_positions();
+	for (const Color i : table_colors)
+	{
+		if (dtm->m_is_singular[i]) continue;
+		auto& pc = dtm->m_per_color[i];
+		const size_t num_full = pc.tail_size != 0 ? pc.block_cnt - 1 : pc.block_cnt;
+		const size_t src_sz   = pc.block_size * num_full + pc.tail_size;
+		if (src_sz != num_positions * pc.entry_bytes)
+			throw std::runtime_error("DTM decompressed size mismatch " + sub_dtm.string());
+	}
+}
+
+// Same wire format as load_dtm_table, but instead of stashing block pointers
+// for lazy LZMA-decode-on-read, this version eagerly decompresses every block,
+// remaps rank→storage value, resolves WDL class → DTM_Final_Entry inline, and
+// streams the result into a per-color tmp file that's then mmap'd into flat->m_files.
+// Read becomes a flat indexed memcpy — no per-thread cache, no LZMA on the hot path.
+void load_dtm_sub_flat(
+	Out_Param<DTM_Sub_File_Flat> flat,
+	const EGTB_Paths& egtb_files,
+	const Piece_Config& ps,
+	In_Out_Param<Thread_Pool> thread_pool
+)
+{
+	std::filesystem::path dtm_path;
+	if (!egtb_files.find_dtm_file(ps, &dtm_path))
+		throw std::runtime_error("Could not find a DTM file for " + ps.name());
+	std::filesystem::path wdl_path;
+	if (!egtb_files.find_wdl_file(ps, &wdl_path))
+		throw std::runtime_error("Could not find a WDL file for " + ps.name()
+			+ " (DTM consumes DTC's wdl/ output)");
+
+	// Companion WDL for class resolution. Sized for parallel reads from the
+	// per-block decode workers below — each worker probes wdl.read() with its
+	// own thread_id.
+	const WDL_File_For_Probe wdl(egtb_files, ps, thread_pool);
+
+	Memory_Mapped_File map_file;
+	if (!map_file.open_readonly(dtm_path.c_str()))
+		throw std::runtime_error("Could not open DTM file trying to load " + dtm_path.string());
+
+	const Const_Span<uint8_t> input = map_file.data_span();
+	if ((input.size() & 63) != 8)
+		throw std::runtime_error("Invalid DTM file size trying to load " + dtm_path.string());
+
+	Serial_Memory_Reader reader(input);
+	if (!reader.is_end_checksum_ok(static_cast<uint64_t>(EGTB_CHECKSUM_INIT_VALUE)))
+		throw std::runtime_error("Invalid DTM file checksum trying to load " + dtm_path.string());
+
+	const uint32_t magic = reader.read<uint32_t>();
+	if (magic != narrowing_static_cast<uint32_t>(EGTB_Magic::DTM_MAGIC))
+		throw std::runtime_error("Invalid DTM file magic trying to load " + dtm_path.string());
+
+	const uint32_t key_and_table_num = reader.read<uint32_t>();
+	const Material_Key key = static_cast<Material_Key>(key_and_table_num >> 2u);
+	if (key != ps.min_material_key())
+		throw std::runtime_error("Wrong material key in DTM file " + dtm_path.string());
+
+	const size_t table_num = key_and_table_num & 3;
+	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+
+	size_t entry_bytes[COLOR_NB]{ 0, 0 };
+	size_t tail_size[COLOR_NB]{ 0, 0 };
+	size_t block_size[COLOR_NB]{ 0, 0 };
+	size_t block_cnt[COLOR_NB]{ 0, 0 };
+	size_t data_size[COLOR_NB]{ 0, 0 };
+	bool is_singular[COLOR_NB]{ false, false };
+	std::vector<uint16_t> rank_to_value[COLOR_NB];
+	const uint8_t* offset_tb[COLOR_NB]{ nullptr, nullptr };
+	const uint8_t* data[COLOR_NB]{ nullptr, nullptr };
+
+	for (const Color i : table_colors)
+	{
+		const uint8_t flag = reader.read<uint8_t>();
+		if (flag & EGTB_SINGULAR_FLAG)
+		{
+			is_singular[i] = true;
+			reader.advance(1);  // single_val byte (unused; resolved via WDL below)
+		}
+		else
+		{
+			entry_bytes[i] = reader.read<uint8_t>();
+			if (entry_bytes[i] != sizeof(DTM_Final_Entry) && entry_bytes[i] != 1)
+				throw std::runtime_error("Bad DTM entry_bytes in " + dtm_path.string());
+			tail_size[i]  = reader.read<uint32_t>();
+			block_size[i] = reader.read<uint32_t>();
+			block_cnt[i]  = reader.read<uint32_t>();
+			data_size[i]  = reader.read<uint64_t>();
+
+			const size_t num_ranks = reader.read<uint16_t>();
+			rank_to_value[i].resize(num_ranks);
+			for (size_t r = 0; r < num_ranks; ++r)
+				rank_to_value[i][r] = reader.read<uint16_t>();
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (is_singular[i]) continue;
+		offset_tb[i] = reader.caret();
+		reader.advance(block_cnt[i] * 8);
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (is_singular[i]) continue;
+		reader.align(64);
+		data[i] = reader.caret();
+		reader.advance(data_size[i]);
+	}
+
+	const size_t num_positions = Piece_Config_For_Gen(ps).num_positions();
+	const size_t file_bytes = num_positions * sizeof(DTM_Final_Entry);
+
+	for (const Color i : table_colors)
+	{
+		const auto tmp_path = egtb_files.dtm_sub_flat_path(ps, i);
+		flat->m_tmp_files.track_path(tmp_path);
+
+		Memory_Mapped_File out_map(Memory_Mapped_File::Access_Advice::RANDOM);
+		if (!out_map.create(tmp_path.c_str(), file_bytes))
+			throw std::runtime_error("Could not create flat sub-DTM at " + tmp_path.string());
+		DTM_Final_Entry* out = reinterpret_cast<DTM_Final_Entry*>(out_map.data());
+
+		if (is_singular[i])
+		{
+			// Singular DTM ⇒ DRAW everywhere WDL says legal, ILLEGAL elsewhere.
+			// (DTC's WDL is the source of legality info; DTM doesn't carry its own.)
+			for (size_t k = 0; k < num_positions; ++k)
+			{
+				const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(k), 0);
+				out[k] = (w == WDL_Entry::ILLEGAL)
+					? DTM_Final_Entry::make_illegal()
+					: DTM_Final_Entry::make_draw();
+			}
+		}
+		else
+		{
+			const size_t num_full = tail_size[i] != 0 ? block_cnt[i] - 1 : block_cnt[i];
+			const size_t src_sz   = block_size[i] * num_full + tail_size[i];
+			if (src_sz != num_positions * entry_bytes[i])
+				throw std::runtime_error("DTM decompressed size mismatch " + dtm_path.string());
+
+			// Each block writes a disjoint output slice (every non-tail block
+			// writes exactly positions_per_block entries at idx*positions_per_block),
+			// so workers can decode in parallel without coordination. Atomic
+			// fetch_add gives dynamic load-balance — cheap all-ILLEGAL blocks
+			// (dsz == 0) don't stall workers stuck on slower LZMA blocks.
+			const auto& r2v = rank_to_value[i];
+			const size_t blocks = block_cnt[i];
+			const size_t positions_per_block = block_size[i] / entry_bytes[i];
+			std::atomic<size_t> next_block(0);
+
+			thread_pool->run_sync_task_on_all_threads([&](size_t thread_id) {
+				LZMA_Decompress_Helper dc_helper(block_size[i]);
+
+				for (;;)
+				{
+					const size_t idx = next_block.fetch_add(1, std::memory_order_relaxed);
+					if (idx >= blocks) return;
+
+					const uint8_t* offset = offset_tb[i] + idx * 8;
+					const uint64_t dso = reinterpret_cast<const uint64_t*>(offset)[0];
+					const size_t dsz  = dso & 0xFFFFF;
+					const size_t doff = dso >> 20;
+
+					const size_t decode_sz =
+						(idx == blocks - 1 && tail_size[i] != 0) ? tail_size[i] : block_size[i];
+					const size_t positions = decode_sz / entry_bytes[i];
+					const size_t pos = idx * positions_per_block;
+
+					if (dsz == 0)
+					{
+						// All-ILLEGAL block.
+						for (size_t k = 0; k < positions; ++k)
+							out[pos + k] = DTM_Final_Entry::make_illegal();
+						continue;
+					}
+
+					const Const_Span<uint8_t> raw = dc_helper.decompress(
+						Const_Span<uint8_t>(data[i] + doff, dsz), decode_sz);
+
+					if (entry_bytes[i] == 1)
+					{
+						for (size_t k = 0; k < positions; ++k)
+						{
+							const uint16_t stored = r2v[raw[k]];
+							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
+							out[pos + k] = dtm_entry_from_storage(stored, w);
+						}
+					}
+					else
+					{
+						const uint16_t* in = reinterpret_cast<const uint16_t*>(raw.data());
+						for (size_t k = 0; k < positions; ++k)
+						{
+							const uint16_t stored = r2v[in[k]];
+							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
+							out[pos + k] = dtm_entry_from_storage(stored, w);
+						}
+					}
+				}
+			});
+		}
+
+		flat->m_files[i] = std::move(out_map);
+	}
+}

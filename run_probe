@@ -1,0 +1,7 @@
+#!/bin/bash
+# Build (incremental, via tests/Makefile) and run the DTC FEN probe.
+set -e
+cd "$(dirname "$0")"
+
+make -s -C tests probe
+tests/probe_fen "$@"

@@ -1,0 +1,429 @@
+#include "chess/attack.h"
+#include "chess/piece_config.h"
+
+#include "egtb/egtb_gen_dtc.h"
+#include "egtb/egtb_gen_dtm.h"
+#include "egtb/egtb_probe.h"
+
+#include "util/endian.h"
+#include "util/thread_pool.h"
+
+#include <algorithm>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <set>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+struct Options
+{
+	size_t num_threads = std::max(1u, std::thread::hardware_concurrency());
+	std::vector<std::string> materials;
+	std::filesystem::path list_file;
+	std::filesystem::path wdl_dir = "./wdl/";
+	std::filesystem::path dtc_dir = "./dtc/";
+	std::filesystem::path dtm_dir = "./dtm/";
+	std::filesystem::path tmp_dir = "./tmp/";
+	std::vector<std::filesystem::path> info_paths;
+	size_t mem_mib = 0;
+	size_t enumerate_up_to = 0;
+	bool estimate_only = false;
+	bool build_dtm = false;
+};
+
+static void print_usage()
+{
+	std::cerr <<
+		"Usage: chesstb [options]\n"
+		"  -r LIST       comma-separated materials (e.g. -r KQK,KRK)\n"
+		"  --list FILE   read newline-separated materials from FILE\n"
+		"  -t N          worker threads (default: hardware concurrency)\n"
+		"  --wdl DIR     WDL output directory (default: ./wdl/)\n"
+		"  --dtc DIR     DTC output directory (default: ./dtc/)\n"
+		"  --tmp DIR     scratch directory (default: ./tmp/)\n"
+		"  --dtm DIR     DTM output directory (default: ./dtm/)\n"
+		"  --mem MiB     resident DTC memory cap per material (0 = unbounded)\n"
+		"  --builddtm    after DTC, also build DTM for each material\n"
+		"  --enumerate N print canonical material names with <= N total pieces\n"
+		"  --estimate    print the working-set estimate and exit\n"
+		"  --info PATHS  dump one or more EGTB_Info (.info) files and exit\n"
+		"                accepts shell globs: chesstb --info dtc/*.info\n";
+}
+
+static bool parse_args(int argc, char** argv, Options& out)
+{
+	for (int i = 1; i < argc; ++i)
+	{
+		std::string a = argv[i];
+		auto take = [&](const char* flag) -> const char* {
+			if (a != flag) return nullptr;
+			if (i + 1 >= argc) { std::cerr << flag << " needs an argument\n"; std::exit(1); }
+			return argv[++i];
+		};
+		if (const char* v = take("-r")) {
+			std::stringstream ss(v);
+			for (std::string s; std::getline(ss, s, ',');)
+				if (!s.empty()) out.materials.push_back(s);
+		}
+		else if (const char* v = take("--list")) out.list_file = v;
+		else if (const char* v = take("-t"))     out.num_threads = std::atoi(v);
+		else if (const char* v = take("--wdl"))  out.wdl_dir = v;
+		else if (const char* v = take("--dtc"))  out.dtc_dir = v;
+		else if (const char* v = take("--dtm"))  out.dtm_dir = v;
+		else if (const char* v = take("--tmp"))  out.tmp_dir = v;
+		else if (a == "--builddtm")              out.build_dtm = true;
+		else if (const char* v = take("--mem"))  {
+			out.mem_mib = std::strtoull(v, nullptr, 10);
+			if (out.mem_mib > 0 && out.mem_mib < 64) out.mem_mib = 64;
+		}
+		else if (const char* v = take("--enumerate")) out.enumerate_up_to = std::strtoull(v, nullptr, 10);
+		else if (const char* v = take("--info")) {
+			out.info_paths.emplace_back(v);
+			// Gobble any subsequent positional paths so shell globs like
+			// `--info dtc/*.info` expand cleanly without bumping into the
+			// unknown-arg error.
+			while (i + 1 < argc && argv[i + 1][0] != '-')
+				out.info_paths.emplace_back(argv[++i]);
+		}
+		else if (a == "--estimate") out.estimate_only = true;
+		else if (a == "-h" || a == "--help") { print_usage(); std::exit(0); }
+		else { std::cerr << "unknown arg: " << a << "\n"; print_usage(); return false; }
+	}
+	return true;
+}
+
+static size_t estimate_dtc_ram_bytes(const Piece_Config& ps)
+{
+	Piece_Config_For_Gen epsi(ps);
+	const size_t N = epsi.num_positions();
+	return static_cast<size_t>(2) * N * sizeof(DTC_Final_Entry);
+}
+
+static std::vector<std::string> enumerate_materials(size_t max_pieces)
+{
+	const Piece_Type types[] = { QUEEN, ROOK, BISHOP, KNIGHT, PAWN };
+	std::set<std::pair<size_t, std::string>> seen;
+
+	std::function<void(size_t, size_t, std::vector<Piece_Type>&,
+	                   const std::function<void(const std::vector<Piece_Type>&)>&)> enum_ms;
+	enum_ms = [&](size_t start, size_t left, std::vector<Piece_Type>& cur,
+	              const std::function<void(const std::vector<Piece_Type>&)>& cb) {
+		if (left == 0) { cb(cur); return; }
+		for (size_t i = start; i < 5; ++i) {
+			cur.push_back(types[i]);
+			enum_ms(i, left - 1, cur, cb);
+			cur.pop_back();
+		}
+	};
+
+	for (size_t total = 3; total <= max_pieces; ++total)
+	{
+		const size_t nk = total - 2;
+		for (size_t w = 0; w <= nk; ++w)
+		{
+			const size_t b = nk - w;
+			std::vector<Piece_Type> wp;
+			enum_ms(0, w, wp, [&](const std::vector<Piece_Type>& w_pieces) {
+				std::vector<Piece_Type> bp;
+				enum_ms(0, b, bp, [&](const std::vector<Piece_Type>& b_pieces) {
+					std::vector<Piece> pcs;
+					pcs.reserve(total);
+					pcs.push_back(piece_make(WHITE, KING));
+					for (auto t : w_pieces) pcs.push_back(piece_make(WHITE, t));
+					pcs.push_back(piece_make(BLACK, KING));
+					for (auto t : b_pieces) pcs.push_back(piece_make(BLACK, t));
+					if (!Piece_Config::is_constructible_from(
+					        Const_Span<Piece>(pcs.data(), pcs.size())))
+						return;
+					Piece_Config ps(Const_Span<Piece>(pcs.data(), pcs.size()));
+					seen.emplace(total, ps.name());
+				});
+			});
+		}
+	}
+
+	std::vector<std::string> out;
+	out.reserve(seen.size());
+	for (const auto& [_, n] : seen) out.push_back(n);
+	return out;
+}
+
+static std::vector<std::string> read_list_file(const std::filesystem::path& path)
+{
+	std::ifstream f(path);
+	if (!f) throw std::runtime_error("Could not open list file: " + path.string());
+	std::vector<std::string> out;
+	for (std::string line; std::getline(f, line);)
+	{
+		auto h = line.find_first_of(";#");
+		if (h != std::string::npos) line.resize(h);
+		while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
+		size_t i = 0; while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+		if (i < line.size()) out.push_back(line.substr(i));
+	}
+	return out;
+}
+
+static int dump_info_file(const std::filesystem::path& path)
+{
+	std::ifstream fp(path, std::ios::binary);
+	if (!fp) { std::cerr << "Cannot open " << path << "\n"; return 1; }
+	EGTB_Info info;
+	fp.read(reinterpret_cast<char*>(&info), sizeof(EGTB_Info));
+	if (fp.gcount() != static_cast<std::streamsize>(sizeof(EGTB_Info)))
+	{
+		std::cerr << "Short read on " << path
+			<< " (got " << fp.gcount() << " bytes, expected " << sizeof(EGTB_Info) << ")\n";
+		return 1;
+	}
+
+	std::cout << path.string() << " (" << sizeof(EGTB_Info) << " bytes)\n";
+	for (Color c : { WHITE, BLACK })
+	{
+		const char* tag = (c == WHITE) ? "WHITE" : "BLACK";
+		const uint64_t legal = info.win_cnt[c] + info.draw_cnt[c] + info.lose_cnt[c];
+		std::cout << "  " << tag
+			<< "  win=" << info.win_cnt[c]
+			<< "  draw=" << info.draw_cnt[c]
+			<< "  lose=" << info.lose_cnt[c]
+			<< "  illegal=" << info.illegal_cnt[c]
+			<< "  legal=" << legal << "\n";
+		std::cout << "         longest_win=" << info.longest_win[c]
+			<< " idx=" << info.longest_idx[c]
+			<< " fen=\"" << info.longest_fen[c] << "\"\n";
+	}
+	return 0;
+}
+
+int main(int argc, char** argv)
+{
+	if (!is_little_endian()) { std::cerr << "Only little-endian hosts supported.\n"; return 1; }
+	attack_init();
+
+	Options opt;
+	if (!parse_args(argc, argv, opt)) return 1;
+
+	if (!opt.info_paths.empty())
+	{
+		int rc = 0;
+		for (const auto& p : opt.info_paths)
+			rc |= dump_info_file(p);
+		return rc;
+	}
+
+	if (opt.enumerate_up_to > 0)
+	{
+		for (const auto& name : enumerate_materials(opt.enumerate_up_to))
+			std::cout << name << "\n";
+		return 0;
+	}
+
+	if (!opt.list_file.empty())
+	{
+		const auto more = read_list_file(opt.list_file);
+		opt.materials.insert(opt.materials.end(), more.begin(), more.end());
+	}
+	if (opt.materials.empty())
+	{
+		std::cerr << "No materials given. Use -r or --list.\n";
+		print_usage();
+		return 1;
+	}
+
+	if (opt.estimate_only)
+	{
+		auto fmt_bytes = [](size_t bytes) {
+			char buf[64];
+			if (bytes >= 1ull << 40)      std::snprintf(buf, sizeof(buf), "%.2f TiB", bytes / static_cast<double>(1ull << 40));
+			else if (bytes >= 1ull << 30) std::snprintf(buf, sizeof(buf), "%.2f GiB", bytes / static_cast<double>(1ull << 30));
+			else if (bytes >= 1ull << 20) std::snprintf(buf, sizeof(buf), "%.2f MiB", bytes / static_cast<double>(1ull << 20));
+			else if (bytes >= 1ull << 10) std::snprintf(buf, sizeof(buf), "%.2f KiB", bytes / static_cast<double>(1ull << 10));
+			else                          std::snprintf(buf, sizeof(buf), "%zu B", bytes);
+			return std::string(buf);
+		};
+		for (const auto& name : opt.materials)
+		{
+			if (!Piece_Config::is_constructible_from(name))
+			{
+				std::cout << name << ": invalid material name\n";
+				continue;
+			}
+			const Piece_Config ps(name);
+			if (ps.num_pieces() <= 2)
+			{
+				std::cout << ps.name() << ": <=2 pieces, trivial draw, no table generated\n";
+				continue;
+			}
+			const Working_Set_Estimate w = compute_working_set(ps, opt.build_dtm);
+			std::cout << ps.name() << ":\n";
+			std::printf("  positions             : %zu\n", w.num_positions);
+			std::printf("  total table (resident): %s  (both colors)\n", fmt_bytes(w.total_table_bytes).c_str());
+			std::printf("  bytes per slice       : %s  (within=%zu cells x 2 B)\n",
+				fmt_bytes(w.bytes_per_slice).c_str(),
+				w.bytes_per_slice / sizeof(DTC_Final_Entry));
+			std::printf("  slices per group      : %zu\n", w.slices_per_group);
+			std::printf("  bytes per group       : %s\n", fmt_bytes(w.bytes_per_group).c_str());
+			std::printf("  num slices / groups   : %zu / %zu\n", w.num_slices, w.num_groups);
+			std::printf("  iter per-dispatch     : %zu groups = %s  (minimum: one me-group + king-adj opp)\n",
+				w.peak_per_group_iter_groups,
+				fmt_bytes(w.peak_per_group_iter_groups * w.bytes_per_group).c_str());
+			std::printf("  iter per-pair_sid     : %zu groups = %s  (cache fits one pair_sid trajectory)\n",
+				w.peak_pair_iter_groups,
+				fmt_bytes(w.peak_pair_iter_groups * w.bytes_per_group).c_str());
+			std::printf("  iter per-batch        : %zu groups = %s  (unbounded fusion, --mem 0 ceiling)\n",
+				w.peak_batch_iter_groups,
+				fmt_bytes(w.peak_batch_iter_groups * w.bytes_per_group).c_str());
+			std::printf("  init per-dispatch     : %zu groups = %s\n",
+				w.peak_per_group_init_groups,
+				fmt_bytes(w.peak_per_group_init_groups * w.bytes_per_group).c_str());
+			std::printf("  init per-pair_sid     : %zu groups = %s\n",
+				w.peak_pair_init_groups,
+				fmt_bytes(w.peak_pair_init_groups * w.bytes_per_group).c_str());
+			std::printf("  init per-batch        : %zu groups = %s\n",
+				w.peak_batch_init_groups,
+				fmt_bytes(w.peak_batch_init_groups * w.bytes_per_group).c_str());
+			std::cout << "\n";
+		}
+		return 0;
+	}
+
+	EGTB_Paths paths;
+	paths.add_wdl_path(opt.wdl_dir);
+	paths.add_dtc_path(opt.dtc_dir);
+	paths.add_dtm_path(opt.dtm_dir);
+	paths.set_tmp_path(opt.tmp_dir);
+	paths.init_directories();
+
+	Unique_Piece_Configs requested;
+	for (const auto& name : opt.materials)
+	{
+		if (!Piece_Config::is_constructible_from(name))
+		{
+			std::cerr << "Skipping " << name << ": not a valid piece configuration.\n";
+			continue;
+		}
+		requested.add_unique(Piece_Config(name));
+	}
+
+	Unique_Piece_Configs closured;
+	for (const Piece_Config& ps : requested)
+		ps.add_closure_in_dependency_order_to(closured, true);
+
+	closured.remove_if([](const Piece_Config& ps) { return ps.num_pieces() <= 2; });
+
+	const size_t budget_bytes = opt.mem_mib * 1024ull * 1024ull;
+	std::cout << closured.size() << " piece configurations in plan"
+	          << (opt.mem_mib > 0 ? " (--mem " + std::to_string(opt.mem_mib) + " MiB)" : "")
+	          << (opt.build_dtm ? " (+dtm)" : "")
+	          << ":\n";
+	for (const Piece_Config& ps : closured)
+	{
+		const bool has_wdl = paths.find_wdl_file(ps);
+		const bool has_dtc = paths.find_dtc_file(ps);
+		const bool has_dtm = opt.build_dtm ? paths.find_dtm_file(ps) : true;
+		const size_t est = estimate_dtc_ram_bytes(ps);
+		if (opt.build_dtm)
+			std::printf("  %-8s  WDL %c  DTC %c  DTM %c  ~%6.1f MiB\n",
+				ps.name().c_str(),
+				has_wdl ? '+' : '-',
+				has_dtc ? '+' : '-',
+				has_dtm ? '+' : '-',
+				est / (1024.0 * 1024.0));
+		else
+			std::printf("  %-8s  WDL %c  DTC %c  ~%6.1f MiB\n",
+				ps.name().c_str(),
+				has_wdl ? '+' : '-',
+				has_dtc ? '+' : '-',
+				est / (1024.0 * 1024.0));
+	}
+
+	Thread_Pool pool(opt.num_threads);
+
+	{
+		struct sigaction sa{};
+		sa.sa_handler = [](int) { egtb_request_interrupt(); };
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGINT, &sa, nullptr);
+	}
+
+	const auto t_total_start = std::chrono::steady_clock::now();
+	size_t idx = 0;
+	for (const Piece_Config& ps : closured)
+	{
+		++idx;
+		if (egtb_is_interrupt_requested())
+		{
+			std::cout << "interrupted before " << ps.name() << ".\n";
+			return 130;
+		}
+
+		// DTC pass (always; gated by file existence). Produces wdl/<name>.lzw
+		// which the DTM pass below consumes for class info.
+		const bool need_wdl = !paths.find_wdl_file(ps);
+		const bool need_dtc = !paths.find_dtc_file(ps);
+		if (need_wdl || need_dtc)
+		{
+			std::cout << "[" << idx << "/" << closured.size() << "] " << ps.name()
+			          << ": generating DTC...\n";
+			const auto t_start = std::chrono::steady_clock::now();
+
+			auto subs = EGTB_Generator::open_sub_probes<WDL_File_For_Probe>(ps, paths, inout_param(pool));
+			DTC_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
+			try
+			{
+				g.gen(inout_param(pool), paths);
+				g.save_to_disk(inout_param(pool), paths);
+			}
+			catch (const DTC_Interrupted&)
+			{
+				return 130;
+			}
+
+			const auto t_end = std::chrono::steady_clock::now();
+			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+			std::cout << "  " << ps.name() << " DTC done in " << ms << " ms"
+			          << "  (WDL " << std::filesystem::file_size(paths.wdl_save_path(ps)) << " B, "
+			          << "DTC " << std::filesystem::file_size(paths.dtc_save_path(ps)) << " B)\n";
+		}
+		else
+		{
+			std::cout << "[" << idx << "/" << closured.size() << "] " << ps.name() << ": DTC already on disk.\n";
+		}
+
+		// Optional DTM pass for this material.
+		if (opt.build_dtm && !paths.find_dtm_file(ps))
+		{
+			std::cout << "  " << ps.name() << ": generating DTM...\n";
+			const auto t_start = std::chrono::steady_clock::now();
+
+			auto subs = EGTB_Generator::open_sub_probes<DTM_Sub_File_Flat>(ps, paths, inout_param(pool));
+			DTM_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
+			try
+			{
+				g.gen(inout_param(pool), paths);
+				g.save_to_disk(inout_param(pool), paths);
+			}
+			catch (const DTM_Interrupted&)
+			{
+				return 130;
+			}
+
+			const auto t_end = std::chrono::steady_clock::now();
+			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+			std::cout << "  " << ps.name() << " DTM done in " << ms << " ms"
+			          << "  (DTM " << std::filesystem::file_size(paths.dtm_save_path(ps)) << " B)\n";
+		}
+	}
+	const auto t_total_end = std::chrono::steady_clock::now();
+	const auto sec = std::chrono::duration_cast<std::chrono::seconds>(t_total_end - t_total_start).count();
+	std::cout << "All done in " << sec << " s.\n";
+	return 0;
+}
