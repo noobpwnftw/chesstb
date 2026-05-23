@@ -2,10 +2,10 @@
 
 Chess endgame tablebase generator. Produces three tables per material:
 
-- **WDL** — 50-move-rule-aware win/draw/loss with cursed/blessed classes.
-- **DTC** — distance-to-conversion (plies to the next zeroing move:
+- **WDL** -- 50-move-rule-aware win/draw/loss with cursed/blessed classes.
+- **DTC** -- distance-to-conversion (plies to the next zeroing move:
   capture, promotion, or pawn push), 50-move-rule-aware.
-- **DTM** — distance-to-mate, no 50-move-rule. Flat ply count to mate
+- **DTM** -- distance-to-mate, no 50-move-rule. Flat ply count to mate
   across all moves, including captures and promotions into sub-tablebases.
 
 WDL is the projection induced by the DTC table and is written alongside it.
@@ -25,11 +25,11 @@ probe time for class reconstruction.
 The 2-byte tier stores raw values. For DTC, ordinary win/loss plies are
 exact and the 1-byte tier halves only cursed/blessed plies. For DTM the
 parity invariant (WIN values odd, LOSS values even) means the 1-byte
-tier halves every classified value losslessly — class is recovered from
+tier halves every classified value losslessly -- class is recovered from
 the WDL companion at decode time.
 
 The `.info` counts are symmetry-expanded orbit-weighted counts; for each
-stored color, W + D + L + illegal equals the table’s weighted domain total.
+stored color, W + D + L + illegal equals the table's weighted domain total.
 This verifies that legal and illegal cells exhaust the indexed chess domain.
 
 ## Build
@@ -66,8 +66,7 @@ Outputs:
 Requested materials are expanded through their capture/promotion
 dependency closure and generated in dependency order. The DTC pass always
 runs; the DTM pass runs after DTC for each material when `--builddtm` is
-set. Existing final files are skipped. Shrunk shipping-format files are
-treated as absent and regenerated as full files.
+set. Existing final files are skipped.
 
 ## Memory
 
@@ -84,7 +83,7 @@ Use `--estimate` before a large run:
 
 The estimate reports total resident-table size and peak group counts for
 init and iterate passes. With `--builddtm`, the iterate peak unions
-opp's pawn-push-target groups (DTM's `PAWN_EVAL` reads them forward).
+opponent's pawn-push-target groups (DTM's `PAWN_EVAL` reads them forward).
 Generation can run beyond RAM since storage is split into load/evict
 groups and spilled as needed.
 
@@ -97,18 +96,13 @@ restarting it. DTC and DTM each carry their own checkpoint files; the
 DTC pass restarts independently of DTM. Checkpoints and scratch group
 files are removed after `save_to_disk` completes.
 
-## Compare And Probe
+## Probe
 
 ```sh
-./run_compare --enumerate 5
-./run_compare --list five.txt
 ./run_probe "8/8/8/5k2/8/8/1Q6/K7 w"
 ./run_probe --children "8/8/8/6B1/3k4/3B4/p7/1K6 w - - 0 1"
 ./run_probe --wdl ./wdl --dtc ./dtc --dtm ./dtm "8/8/8/8/4k3/8/Q7/K7 w"
 ```
-
-`run_compare` compares generated WDL against Syzygy through Fathom. It
-expects matching Syzygy `.rtbw` files under `syzygy/`.
 
 `run_probe` reports WDL, DTC (as `dtz`), and DTM (when present). It derives
 the material from the FEN, mirrors to the canonical table orientation when
@@ -116,11 +110,40 @@ needed, and honors a legal FEN en-passant target. DTC and DTM both require
 the WDL companion to decode class; the probe gates each field on its
 companion being available.
 
-The test binaries can also be built directly:
+## Verify
+
+Two internal verifiers plus an external cross-check, layered from cheap
+to exhaustive:
 
 ```sh
-make -C tests
+./tests/check_tables --enumerate 5
+./tests/check_tables --list five.txt KRRK
+./tests/check_fixedpoint KRRK
+./tests/check_fixedpoint --enumerate 5
+./run_compare --enumerate 5
+./run_compare --list five.txt
 ```
+
+- `check_tables` -- internal-consistency pass. Walks every legal canonical
+  position and checks the table's own invariants (DTC: `DRAW=0`, wins
+  `>0`, losses zero only at mate, cursed iff `dtc>100`; DTM: wins `>0`,
+  losses zero only at mate, WIN odd, LOSE even). Works on **both** full
+  and shrunk shipping-format files, so it can verify a shrink in place --
+  considerably slower against shrunk files because dropped-STM lookups
+  reconstruct by one-ply minimax.
+- `check_fixedpoint` -- full Bellman verifier. Recomputes each table value
+  from its legal children and compares to disk; this is the exhaustive
+  correctness check. **Full tables only**; shipping-format files with a
+  dropped STM color are rejected.
+- `run_compare` -- disk WDL vs. Syzygy through Fathom for every legal
+  canonical position, plus a DTZ cross-check on the longest-win FEN
+  against Syzygy's root probe (`+/-1` ply tolerance, since Fathom root DTZ
+  is approximate). Requires matching `.rtbw` and `.rtbz` files under
+  `syzygy/` and a Fathom checkout at `lib/Fathom/` (`git clone
+  https://github.com/jdart1/Fathom.git lib/Fathom`).
+
+`make -C tests` builds all four test binaries directly: `probe_fen`,
+`compare_chesstb`, `check_tables`, `check_fixedpoint`.
 
 ## Shrink
 
@@ -134,6 +157,10 @@ dropped colors and reconstructs them by one-ply minimax against the kept
 color and sub-TBs. The DTC and DTM wire layouts are identical, so a
 single rank-encoded shrinker handles both.
 
+Shrink is a postprocessing step. The generator does not accept any
+dependency on shrunken files -- shipping-format files are treated as
+absent and regenerated as full files.
+
 ## Layout
 
 ```text
@@ -142,7 +169,7 @@ src/egtb/    generator (DTC + DTM), compression, slicing, paging
 src/probe/   standalone probe library
 src/shrink/  shipping-format shrinker
 src/util/    allocation, threading, compression helpers
-tests/       Syzygy compare and FEN probe tools
+tests/       FEN probe, table/fixedpoint verifiers, Syzygy compare
 lib/         vendored LZ4, LZMA, zstd
 ```
 
@@ -152,4 +179,4 @@ lib/         vendored LZ4, LZMA, zstd
 - DTC files use `.lzdtc`; DTM files use `.lzdtm`.
 - DTC scratch groups use `.dtcs`; DTM scratch groups use `.dtms` (both
   under `--tmp`).
-- Building DTM standalone is not supported (requires DTC produced WDL).
+- Building DTM standalone is not supported (requires the DTC-produced WDL).
