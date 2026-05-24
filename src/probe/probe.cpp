@@ -33,14 +33,24 @@ namespace {
 // Enough slots to avoid thrashing during derive_dropped child probes.
 constexpr size_t BLOCK_CACHE_SLOTS = 32;
 
+// Globally-unique id stamped onto each Per_Color at construction. Used by the
+// per-thread last-block cache below so that heap-address reuse (e.g. when a
+// Probe_Tables instance is destroyed and the next one reuses the same memory)
+// does not produce a spurious cache hit pointing at a destroyed object.
+inline uint64_t next_probe_epoch()
+{
+	static std::atomic<uint64_t> ctr{0};
+	return ctr.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 // Per-thread last-block cache for Probe_File::read(). Workers iterate
 // Board_Indexes sequentially, so consecutive probes hit the same decoded
 // block; serving them from a thread-local copy avoids serializing on
 // Per_Color::mu and its shared LZ4 decompressor.
 struct TL_Block_Slot
 {
-	const void* owner = nullptr;
-	size_t      block_id = SIZE_MAX;
+	uint64_t epoch    = 0;          // 0 means empty; Per_Color::epoch is always > 0
+	size_t   block_id = SIZE_MAX;
 	std::vector<uint8_t> bytes;
 };
 
@@ -122,6 +132,7 @@ struct WDL_Probe_File
 		const uint8_t* compressed_data = nullptr;
 		LZ4_Dict dict;
 
+		const uint64_t epoch = next_probe_epoch();
 		mutable std::mutex mu;  // guards cache state and decompressor
 		std::array<size_t, BLOCK_CACHE_SLOTS> block_id{};
 		std::array<std::vector<uint8_t>, BLOCK_CACHE_SLOTS> data;
@@ -141,7 +152,7 @@ struct WDL_Probe_File
 
 private:
 	// Valid only while pc.mu is held.
-	NODISCARD const uint8_t* get_block_locked(Per_Color& pc, size_t block_id);
+	NODISCARD Const_Span<uint8_t> get_block_locked(Per_Color& pc, size_t block_id);
 };
 
 void WDL_Probe_File::load(const Piece_Config& ps, const std::filesystem::path& path)
@@ -258,12 +269,12 @@ void WDL_Probe_File::load(const Piece_Config& ps, const std::filesystem::path& p
 	}
 }
 
-const uint8_t* WDL_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
+Const_Span<uint8_t> WDL_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 {
 	for (size_t i = 0; i < pc.live; ++i)
 	{
 		if (pc.block_id[i] == block_id)
-			return pc.data[i].data();
+			return Const_Span<uint8_t>(pc.data[i].data(), pc.data[i].size());
 	}
 
 	if (!pc.decomp)
@@ -287,7 +298,7 @@ const uint8_t* WDL_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 	}
 	pc.block_id[slot] = block_id;
 	pc.data[slot].assign(decompressed.begin(), decompressed.end());
-	return pc.data[slot].data();
+	return Const_Span<uint8_t>(pc.data[slot].data(), pc.data[slot].size());
 }
 
 WDL_Entry WDL_Probe_File::read(Color c, Board_Index pos)
@@ -304,14 +315,12 @@ WDL_Entry WDL_Probe_File::read(Color c, Board_Index pos)
 		return WDL_Entry::ILLEGAL;
 
 	thread_local TL_Block_Slot tl;
-	if (tl.owner != &pc || tl.block_id != block_id)
+	if (tl.epoch != pc.epoch || tl.block_id != block_id)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
-		const uint8_t* block = get_block_locked(pc, block_id);
-		const size_t bsz = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
-			? pc.tail_size : pc.block_size;
-		tl.bytes.assign(block, block + bsz);
-		tl.owner = &pc;
+		const Const_Span<uint8_t> blk = get_block_locked(pc, block_id);
+		tl.bytes.assign(blk.begin(), blk.end());
+		tl.epoch = pc.epoch;
 		tl.block_id = block_id;
 	}
 	Packed_WDL_Entries entry;
@@ -331,6 +340,7 @@ struct DTC_Probe_File
 		const uint8_t* compressed_data = nullptr;
 		std::vector<uint16_t> rank_to_value;
 
+		const uint64_t epoch = next_probe_epoch();
 		mutable std::mutex mu;
 		std::array<size_t, BLOCK_CACHE_SLOTS> block_id{};
 		std::array<std::vector<uint8_t>, BLOCK_CACHE_SLOTS> data;
@@ -348,7 +358,7 @@ struct DTC_Probe_File
 	NODISCARD DTC_Final_Entry read(Color c, Board_Index pos, WDL_Entry wdl);
 
 private:
-	NODISCARD const uint8_t* get_block_locked(Per_Color& pc, size_t block_id);
+	NODISCARD Const_Span<uint8_t> get_block_locked(Per_Color& pc, size_t block_id);
 };
 
 void DTC_Probe_File::load(const Piece_Config& ps, const std::filesystem::path& path)
@@ -441,7 +451,7 @@ const uint8_t* DTC_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 	for (size_t i = 0; i < pc.live; ++i)
 	{
 		if (pc.block_id[i] == block_id)
-			return pc.data[i].data();
+			return Const_Span<uint8_t>(pc.data[i].data(), pc.data[i].size());
 	}
 
 	const size_t decode_sz =
@@ -488,7 +498,7 @@ const uint8_t* DTC_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 		}
 	}
 
-	return buf.data();
+	return Const_Span<uint8_t>(buf.data(), buf.size());
 }
 
 DTC_Final_Entry DTC_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
@@ -506,16 +516,12 @@ DTC_Final_Entry DTC_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 		return DTC_Final_Entry::make_illegal();
 
 	thread_local TL_Block_Slot tl;
-	if (tl.owner != &pc || tl.block_id != block_id)
+	if (tl.epoch != pc.epoch || tl.block_id != block_id)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
-		const uint8_t* block = get_block_locked(pc, block_id);
-		// Decoded buffer holds positions * sizeof(uint16_t) bytes, not raw decode_sz.
-		const size_t this_positions = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
-			? (pc.tail_size / pc.entry_bytes) : positions_per_block;
-		const size_t bsz = this_positions * sizeof(uint16_t);
-		tl.bytes.assign(block, block + bsz);
-		tl.owner = &pc;
+		const Const_Span<uint8_t> blk = get_block_locked(pc, block_id);
+		tl.bytes.assign(blk.begin(), blk.end());
+		tl.epoch = pc.epoch;
 		tl.block_id = block_id;
 	}
 	DTC_Final_Entry stored;
@@ -536,6 +542,7 @@ struct DTM_Probe_File
 		const uint8_t* compressed_data = nullptr;
 		std::vector<uint16_t> rank_to_value;
 
+		const uint64_t epoch = next_probe_epoch();
 		mutable std::mutex mu;
 		std::array<size_t, BLOCK_CACHE_SLOTS> block_id{};
 		std::array<std::vector<uint8_t>, BLOCK_CACHE_SLOTS> data;
@@ -553,7 +560,7 @@ struct DTM_Probe_File
 	NODISCARD DTM_Final_Entry read(Color c, Board_Index pos, WDL_Entry wdl);
 
 private:
-	NODISCARD const uint8_t* get_block_locked(Per_Color& pc, size_t block_id);
+	NODISCARD Const_Span<uint8_t> get_block_locked(Per_Color& pc, size_t block_id);
 };
 
 void DTM_Probe_File::load(const Piece_Config& ps, const std::filesystem::path& path)
@@ -646,7 +653,7 @@ const uint8_t* DTM_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 	for (size_t i = 0; i < pc.live; ++i)
 	{
 		if (pc.block_id[i] == block_id)
-			return pc.data[i].data();
+			return Const_Span<uint8_t>(pc.data[i].data(), pc.data[i].size());
 	}
 
 	const size_t decode_sz =
@@ -693,7 +700,7 @@ const uint8_t* DTM_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 		}
 	}
 
-	return buf.data();
+	return Const_Span<uint8_t>(buf.data(), buf.size());
 }
 
 DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
@@ -711,16 +718,12 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 		return DTM_Final_Entry::make_illegal();
 
 	thread_local TL_Block_Slot tl;
-	if (tl.owner != &pc || tl.block_id != block_id)
+	if (tl.epoch != pc.epoch || tl.block_id != block_id)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
-		const uint8_t* block = get_block_locked(pc, block_id);
-		// Decoded buffer holds positions * sizeof(uint16_t) bytes, not raw decode_sz.
-		const size_t this_positions = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
-			? (pc.tail_size / pc.entry_bytes) : positions_per_block;
-		const size_t bsz = this_positions * sizeof(uint16_t);
-		tl.bytes.assign(block, block + bsz);
-		tl.owner = &pc;
+		const Const_Span<uint8_t> blk = get_block_locked(pc, block_id);
+		tl.bytes.assign(blk.begin(), blk.end());
+		tl.epoch = pc.epoch;
 		tl.block_id = block_id;
 	}
 	uint16_t stored;
@@ -837,26 +840,25 @@ template <typename T>
 struct TL_Probe_Cache
 {
 	static constexpr size_t N = 4;
-	const void* inst[N] = {};
-	uint32_t    key [N] = {};
-	T*          val [N] = {};
-	bool        live[N] = {};
-	size_t      rr      = 0;
+	uint64_t    epoch[N] = {};   // 0 = empty slot; live Impl epochs are > 0
+	uint32_t    key  [N] = {};
+	T*          val  [N] = {};
+	size_t      rr       = 0;
 
-	bool lookup(const void* impl, uint32_t k, T*& out) const
+	bool lookup(uint64_t impl_epoch, uint32_t k, T*& out) const
 	{
 		for (size_t i = 0; i < N; ++i)
-			if (live[i] && inst[i] == impl && key[i] == k)
+			if (epoch[i] == impl_epoch && key[i] == k)
 				{ out = val[i]; return true; }
 		return false;
 	}
-	void insert(const void* impl, uint32_t k, T* v)
+	void insert(uint64_t impl_epoch, uint32_t k, T* v)
 	{
 		for (size_t i = 0; i < N; ++i)
-			if (live[i] && inst[i] == impl && key[i] == k)
+			if (epoch[i] == impl_epoch && key[i] == k)
 				{ val[i] = v; return; }
 		const size_t i = (rr++) & (N - 1);
-		inst[i] = impl; key[i] = k; val[i] = v; live[i] = true;
+		epoch[i] = impl_epoch; key[i] = k; val[i] = v;
 	}
 };
 
@@ -864,6 +866,7 @@ struct TL_Probe_Cache
 
 struct Probe_Tables::Impl
 {
+	const uint64_t epoch = next_probe_epoch();
 	std::vector<std::filesystem::path> wdl_dirs = { "./wdl/" };
 	std::vector<std::filesystem::path> dtc_dirs = { "./dtc/" };
 	std::vector<std::filesystem::path> dtm_dirs = { "./dtm/" };
@@ -885,18 +888,18 @@ struct Probe_Tables::Impl
 		const uint32_t k = ps.min_material_key().value();
 		thread_local TL_Probe_Cache<const Piece_Config_For_Gen> tl;
 		const Piece_Config_For_Gen* hit;
-		if (tl.lookup(this, k, hit)) return *hit;
+		if (tl.lookup(epoch, k, hit)) return *hit;
 		{
 			std::shared_lock rlk(epsi_mu);
 			auto it = epsi_cache.find(k);
 			if (it != epsi_cache.end())
-				{ tl.insert(this, k, it->second.get()); return *it->second; }
+				{ tl.insert(epoch, k, it->second.get()); return *it->second; }
 		}
 		auto e = std::make_unique<Piece_Config_For_Gen>(ps);
 		std::unique_lock wlk(epsi_mu);
 		auto [it, inserted] = epsi_cache.try_emplace(k, std::move(e));
 		const Piece_Config_For_Gen* raw = it->second.get();
-		tl.insert(this, k, raw);
+		tl.insert(epoch, k, raw);
 		return *raw;
 	}
 
@@ -905,12 +908,12 @@ struct Probe_Tables::Impl
 		const uint32_t k = ps.min_material_key().value();
 		thread_local TL_Probe_Cache<WDL_Probe_File> tl;
 		WDL_Probe_File* hit;
-		if (tl.lookup(this, k, hit)) return hit;
+		if (tl.lookup(epoch, k, hit)) return hit;
 		{
 			std::shared_lock rlk(wdl_mu);
 			auto it = wdl_cache.find(k);
 			if (it != wdl_cache.end())
-				{ tl.insert(this, k, it->second.get()); return it->second.get(); }
+				{ tl.insert(epoch, k, it->second.get()); return it->second.get(); }
 		}
 		std::filesystem::path path;
 		std::unique_ptr<WDL_Probe_File> f;
@@ -922,7 +925,7 @@ struct Probe_Tables::Impl
 		std::unique_lock wlk(wdl_mu);
 		auto [it, inserted] = wdl_cache.try_emplace(k, std::move(f));
 		WDL_Probe_File* raw = it->second.get();
-		tl.insert(this, k, raw);
+		tl.insert(epoch, k, raw);
 		return raw;
 	}
 
@@ -931,12 +934,12 @@ struct Probe_Tables::Impl
 		const uint32_t k = ps.min_material_key().value();
 		thread_local TL_Probe_Cache<DTC_Probe_File> tl;
 		DTC_Probe_File* hit;
-		if (tl.lookup(this, k, hit)) return hit;
+		if (tl.lookup(epoch, k, hit)) return hit;
 		{
 			std::shared_lock rlk(dtc_mu);
 			auto it = dtc_cache.find(k);
 			if (it != dtc_cache.end())
-				{ tl.insert(this, k, it->second.get()); return it->second.get(); }
+				{ tl.insert(epoch, k, it->second.get()); return it->second.get(); }
 		}
 		std::filesystem::path path;
 		std::unique_ptr<DTC_Probe_File> f;
@@ -948,7 +951,7 @@ struct Probe_Tables::Impl
 		std::unique_lock wlk(dtc_mu);
 		auto [it, inserted] = dtc_cache.try_emplace(k, std::move(f));
 		DTC_Probe_File* raw = it->second.get();
-		tl.insert(this, k, raw);
+		tl.insert(epoch, k, raw);
 		return raw;
 	}
 
@@ -957,12 +960,12 @@ struct Probe_Tables::Impl
 		const uint32_t k = ps.min_material_key().value();
 		thread_local TL_Probe_Cache<DTM_Probe_File> tl;
 		DTM_Probe_File* hit;
-		if (tl.lookup(this, k, hit)) return hit;
+		if (tl.lookup(epoch, k, hit)) return hit;
 		{
 			std::shared_lock rlk(dtm_mu);
 			auto it = dtm_cache.find(k);
 			if (it != dtm_cache.end())
-				{ tl.insert(this, k, it->second.get()); return it->second.get(); }
+				{ tl.insert(epoch, k, it->second.get()); return it->second.get(); }
 		}
 		std::filesystem::path path;
 		std::unique_ptr<DTM_Probe_File> f;
@@ -974,7 +977,7 @@ struct Probe_Tables::Impl
 		std::unique_lock wlk(dtm_mu);
 		auto [it, inserted] = dtm_cache.try_emplace(k, std::move(f));
 		DTM_Probe_File* raw = it->second.get();
-		tl.insert(this, k, raw);
+		tl.insert(epoch, k, raw);
 		return raw;
 	}
 
