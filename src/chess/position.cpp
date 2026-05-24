@@ -117,18 +117,11 @@ void Position::gen_pseudo_legal(Out_Param<Move_List> out) const
 {
 	out->clear();
 	const Color me = m_turn;
-	const Color opp = color_opp(me);
 	const Bitboard occ = m_occupied;
-	const Bitboard empty = ~occ;
-	const Bitboard opp_bb = m_pieces[piece_occupy(opp)];
 
-	// Knight / sliding / king (skip for PAWN_PUSHES; target depends on kind).
-	if constexpr (K != Move_Kind::PAWN_PUSHES)
+	if constexpr (K == Move_Kind::ALL)
 	{
-		const Bitboard target =
-			(K == Move_Kind::ALL)         ? ~m_pieces[piece_occupy(me)] :
-			(K == Move_Kind::QUIETS)      ? empty :
-			/* CONVERSIONS */                opp_bb;
+		const Bitboard target = ~m_pieces[piece_occupy(me)];
 
 		Bitboard knights = m_pieces[piece_make(me, KNIGHT)];
 		while (knights)
@@ -161,60 +154,41 @@ void Position::gen_pseudo_legal(Out_Param<Move_List> out) const
 			out->add(Move::make_quiet(ksq, kmoves.pop_first_square()));
 	}
 
-	// Pawns (skip for QUIETS; pushes / push-promos / caps gated by kind).
-	if constexpr (K != Move_Kind::QUIETS)
+	const Rank promo_rank = (me == WHITE) ? RANK_8 : RANK_1;
+	Bitboard pawns = m_pieces[piece_make(me, PAWN)];
+	while (pawns)
 	{
-		const Rank promo_rank = (me == WHITE) ? RANK_8 : RANK_1;
-		Bitboard pawns = m_pieces[piece_make(me, PAWN)];
-		while (pawns)
+		const Square from = pawns.pop_first_square();
+
+		Bitboard push = pawn_pushes(me, from) & ~occ;
+		if (push)
 		{
-			const Square from = pawns.pop_first_square();
-
-			Bitboard push = pawn_pushes(me, from) & ~occ;
-			if (push)
+			const Square to = push.peek_first_square();
+			const bool is_promo = sq_rank(to) == promo_rank;
+			if constexpr (K == Move_Kind::ALL)
+				add_pawn_moves_with_promos(out, from, to, me);
+			else if (!is_promo)
+				out->add(Move::make_quiet(from, to));
+			if (!is_promo)
 			{
-				const Square to = push.peek_first_square();
-				const bool is_promo = sq_rank(to) == promo_rank;
-				if constexpr (K == Move_Kind::ALL)
-				{
-					add_pawn_moves_with_promos(out, from, to, me);
-					if (!is_promo)
-					{
-						Bitboard dp = pawn_double_pushes(me, from) & ~occ;
-						if (dp) out->add(Move::make_quiet(from, dp.peek_first_square()));
-					}
-				}
-				else if constexpr (K == Move_Kind::CONVERSIONS)
-				{
-					if (is_promo) add_pawn_moves_with_promos(out, from, to, me);
-				}
-				else if constexpr (K == Move_Kind::PAWN_PUSHES)
-				{
-					if (!is_promo)
-					{
-						out->add(Move::make_quiet(from, to));
-						Bitboard dp = pawn_double_pushes(me, from) & ~occ;
-						if (dp) out->add(Move::make_quiet(from, dp.peek_first_square()));
-					}
-				}
+				Bitboard dp = pawn_double_pushes(me, from) & ~occ;
+				if (dp) out->add(Move::make_quiet(from, dp.peek_first_square()));
 			}
+		}
 
-			if constexpr (K == Move_Kind::ALL || K == Move_Kind::CONVERSIONS)
+		if constexpr (K == Move_Kind::ALL)
+		{
+			Bitboard caps = pawn_attacks(me, from) & m_pieces[piece_occupy(color_opp(me))];
+			while (caps)
 			{
-				Bitboard caps = pawn_attacks(me, from) & opp_bb;
-				while (caps)
-				{
-					const Square to = caps.pop_first_square();
-					add_pawn_moves_with_promos(out, from, to, me);
-				}
+				const Square to = caps.pop_first_square();
+				add_pawn_moves_with_promos(out, from, to, me);
 			}
 		}
 	}
 }
 
 template void Position::gen_pseudo_legal<Position::Move_Kind::ALL>(Out_Param<Move_List>) const;
-template void Position::gen_pseudo_legal<Position::Move_Kind::QUIETS>(Out_Param<Move_List>) const;
-template void Position::gen_pseudo_legal<Position::Move_Kind::CONVERSIONS>(Out_Param<Move_List>) const;
 template void Position::gen_pseudo_legal<Position::Move_Kind::PAWN_PUSHES>(Out_Param<Move_List>) const;
 
 template <bool IncludePawnPushes>

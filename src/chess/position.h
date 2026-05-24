@@ -103,11 +103,8 @@ struct Position
 
 	// Move generator selector. No EP, no castling, no king-in-check filter.
 	//   ALL         — every pseudo-legal move
-	//   QUIETS      — piece quiets only (no pawn pushes; pawn pushes are
-	//                 DTZ-zeroing and live under PAWN_PUSHES)
-	//   CONVERSIONS — caps + promotions (piece caps, pawn caps, push-promos)
-	//   PAWN_PUSHES — non-promo pawn pushes (single + double)
-	enum class Move_Kind : uint8_t { ALL, QUIETS, CONVERSIONS, PAWN_PUSHES };
+	//   PAWN_PUSHES — non-promo pawn pushes (single + double) only
+	enum class Move_Kind : uint8_t { ALL, PAWN_PUSHES };
 	template <Move_Kind K>
 	void gen_pseudo_legal(Out_Param<Move_List> out) const;
 
