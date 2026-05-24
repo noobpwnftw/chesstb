@@ -446,7 +446,7 @@ void DTC_Probe_File::load(const Piece_Config& ps, const std::filesystem::path& p
 	}
 }
 
-const uint8_t* DTC_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
+Const_Span<uint8_t> DTC_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 {
 	for (size_t i = 0; i < pc.live; ++i)
 	{
@@ -648,7 +648,7 @@ void DTM_Probe_File::load(const Piece_Config& ps, const std::filesystem::path& p
 	}
 }
 
-const uint8_t* DTM_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
+Const_Span<uint8_t> DTM_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 {
 	for (size_t i = 0; i < pc.live; ++i)
 	{
