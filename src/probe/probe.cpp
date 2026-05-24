@@ -510,8 +510,10 @@ DTC_Final_Entry DTC_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
 		const uint8_t* block = get_block_locked(pc, block_id);
-		const size_t bsz = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
-			? pc.tail_size : pc.block_size;
+		// Decoded buffer holds positions * sizeof(uint16_t) bytes, not raw decode_sz.
+		const size_t this_positions = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
+			? (pc.tail_size / pc.entry_bytes) : positions_per_block;
+		const size_t bsz = this_positions * sizeof(uint16_t);
 		tl.bytes.assign(block, block + bsz);
 		tl.owner = &pc;
 		tl.block_id = block_id;
@@ -713,8 +715,10 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
 		const uint8_t* block = get_block_locked(pc, block_id);
-		const size_t bsz = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
-			? pc.tail_size : pc.block_size;
+		// Decoded buffer holds positions * sizeof(uint16_t) bytes, not raw decode_sz.
+		const size_t this_positions = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
+			? (pc.tail_size / pc.entry_bytes) : positions_per_block;
+		const size_t bsz = this_positions * sizeof(uint16_t);
 		tl.bytes.assign(block, block + bsz);
 		tl.owner = &pc;
 		tl.block_id = block_id;
