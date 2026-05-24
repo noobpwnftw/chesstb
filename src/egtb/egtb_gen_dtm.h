@@ -111,7 +111,13 @@ private:
 	NODISCARD DTM_Final_Entry read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
 
-	NODISCARD DTM_Any_Entry make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id) const;
+	// Out `worst_loss_dtm` is the largest `sub_e.value()+1` contribution from
+	// cap/promo children when the return is Intermediate; 0 otherwise.
+	// iterate() floors m_max_dtm with it so silent-ply termination can't stop
+	// before check_loss reaches the ply where the cap-path contribution
+	// classifies the cell.
+	NODISCARD DTM_Any_Entry make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id,
+	                                           Out_Param<uint16_t> worst_loss_dtm) const;
 	// Returns the max classified dtm seeded during init (0 if only Intermediates
 	// and ILLEGAL/LOSS(0) were emitted).
 	uint16_t init_entries(In_Out_Param<Thread_Pool> thread_pool);

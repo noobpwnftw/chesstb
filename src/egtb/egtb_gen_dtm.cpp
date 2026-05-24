@@ -232,8 +232,10 @@ DTM_Final_Entry DTM_Generator::effective_opp_dtm_after_dp(const Position_For_Gen
 // Initial classification.
 // =============================================================================
 
-DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id) const
+DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id,
+                                                Out_Param<uint16_t> worst_loss_dtm) const
 {
+	*worst_loss_dtm = 0;
 	if (!pos_gen.is_legal(Position_For_Gen::Legality_Lower_Bound::CHESS_LEGAL))
 		return DTM_Final_Entry::make_illegal();
 
@@ -242,7 +244,6 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 
 	// Seeds derived from sub-DTM values on cap/promo moves.
 	uint16_t best_win_dtm  = std::numeric_limits<uint16_t>::max();
-	uint16_t worst_loss_dtm = 0;
 	bool saw_win  = false;
 	bool saw_draw = false;
 
@@ -272,7 +273,7 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 		else if (sub_e.is_win())
 		{
 			const uint16_t cand = static_cast<uint16_t>(sub_e.value() + 1);
-			if (cand > worst_loss_dtm) worst_loss_dtm = cand;
+			if (cand > *worst_loss_dtm) *worst_loss_dtm = cand;
 		}
 		else
 		{
@@ -295,9 +296,13 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 	{
 		// All cap/promo moves resolve to opp-WIN; no in-material escape; no draw.
 		// Position is forced LOSS at the max sub child dtm + 1.
-		if (worst_loss_dtm > 0)
-			return DTM_Final_Entry::make_loss(worst_loss_dtm);
+		if (*worst_loss_dtm > 0)
+			return DTM_Final_Entry::make_loss(*worst_loss_dtm);
 	}
+	// Mixed in-material + cap/promo Intermediate: leave *worst_loss_dtm as a
+	// lower bound on this cell's eventual LOSS dtm so init_entries can extend
+	// m_max_dtm; otherwise iterate may stop before reaching the ply where
+	// check_loss would classify this cell.
 	return DTM_Intermediate_Entry{};  // unclassified; retrograde will resolve
 }
 
@@ -394,6 +399,7 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 				for (Color us : { WHITE, BLACK })
 				{
 					pos_gen.set_turn(us);
+					uint16_t worst_loss_dtm = 0;
 					std::visit(overload{
 						[&](DTM_Final_Entry entry) {
 							write_dtm(idx, us, entry);
@@ -407,8 +413,9 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 							// DTM_Intermediate_Entry implicit-converts to DTM_Final_Entry
 							// (bit-identical 16-bit storage).
 							write_dtm(idx, us, entry);
+							if (worst_loss_dtm > local_max) local_max = worst_loss_dtm;
 						},
-					}, make_initial_entry(pos_gen, tid));
+					}, make_initial_entry(pos_gen, tid, out_param(worst_loss_dtm)));
 				}
 			}
 			return local_max;
