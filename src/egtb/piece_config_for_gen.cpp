@@ -92,7 +92,6 @@ bool Piece_Config_For_Gen::try_init()
 	if (has_pawns)
 	{
 		m_pawn_slice_manager = std::make_unique<Pawn_Slice_Manager>(
-			*this,
 			m_groups[WHITE_PAWNS],
 			m_groups[BLACK_PAWNS]);
 	}

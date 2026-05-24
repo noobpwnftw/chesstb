@@ -42,9 +42,8 @@ NODISCARD inline bool tb_file_is_full_format(const std::filesystem::path& path, 
 	const bool egtb_table = expected_magic == EGTB_Magic::DTC_MAGIC
 	                     || expected_magic == EGTB_Magic::DTM_MAGIC;
 
-	for (Color c : colors)
+	for (size_t i = 0; i < colors.size(); ++i)
 	{
-		(void)c;
 		if (static_cast<size_t>(s.end() - r.caret()) < 1) return false;
 		const uint8_t flag = r.read<uint8_t>();
 		if (flag & DROPPED_FLAG) return false;

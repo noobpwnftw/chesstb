@@ -78,16 +78,10 @@ public:
 
 	void save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths& paths);
 
-	NODISCARD const EGTB_Info& info() const { return m_info; }
-
 private:
 	std::shared_ptr<DTM_Table> m_table;
 	std::map<Material_Key, std::shared_ptr<DTM_Sub_File_Flat>> m_sub_dtm;
 	const DTM_Sub_File_Flat* m_sub_dtm_by_move[COLOR_NB][PIECE_NB][PIECE_TYPE_NB]{};
-	EGTB_Info m_info;
-
-	std::vector<uint8_t> m_scratch_need[COLOR_NB];
-	std::vector<int32_t> m_scratch_nbrs;
 
 	// Highest classified dtm value ever written to the table (init + retro).
 	// iterate() uses this as the termination floor: a silent ply is only safe

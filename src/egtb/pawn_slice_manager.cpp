@@ -27,11 +27,9 @@ Pawn_Slice_Manager Pawn_Slice_Manager::empty()
 	return m;
 }
 
-Pawn_Slice_Manager::Pawn_Slice_Manager(const Piece_Config& ps,
-                                       const Piece_Group* white_pawns,
+Pawn_Slice_Manager::Pawn_Slice_Manager(const Piece_Group* white_pawns,
                                        const Piece_Group* black_pawns)
 {
-	(void)ps;
 	m_has_pawns = true;
 	m_white_group = white_pawns;
 	m_black_group = black_pawns;

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "chess/chess.h"
-#include "chess/piece_config.h"
 
 #include "egtb/piece_group.h"
 
@@ -13,8 +12,7 @@
 
 struct Pawn_Slice_Manager
 {
-    Pawn_Slice_Manager(const Piece_Config& ps,
-                       const Piece_Group* white_pawns,
+    Pawn_Slice_Manager(const Piece_Group* white_pawns,
                        const Piece_Group* black_pawns);
 
     NODISCARD static Pawn_Slice_Manager empty();

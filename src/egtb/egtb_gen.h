@@ -3,6 +3,7 @@
 #include "egtb/egtb_probe.h"
 #include "egtb/piece_config_for_gen.h"
 #include "egtb/piece_group.h"
+#include "egtb/slice_manager.h"
 #include "egtb/symmetry.h"
 
 #include "chess/chess.h"
@@ -409,14 +410,6 @@ private:
 	Board_Index m_start_idx, m_end_idx;
 	size_t m_chunk_size;
 	std::atomic<size_t> m_current_chunk_index;
-};
-
-struct EGTB_Generation_Info
-{
-	size_t num_positions;
-	size_t uncompressed_size;
-	size_t uncompressed_sub_tb_size;
-	size_t memory_required_for_generation;
 };
 
 // Sliced_EGTB_File_For_Gen: entry storage partitioned into slice-groups, each
@@ -840,6 +833,9 @@ protected:
 
 	bool m_is_symmetric;
 
+	// Histograms + flags written during compress; consumed by save_to_disk.
+	EGTB_Info m_info;
+
 	// Predecessor's Board_Index for a pre-quiet move from gen_pseudo_legal_pre_quiets
 	// (Move(piece_cur_sq, empty_sq) undoes the forward move).
 	NODISCARD Board_Index next_quiet_index(const Position_For_Gen& pos_for_gen, Move move) const;
@@ -882,6 +878,12 @@ protected:
 	// Same set-on-write / clear-on-clean-scan rules, applied at chunk granularity
 	// so run_iter can skip cold chunks within a still-warm group.
 	std::vector<uint8_t> m_iter_chunks[COLOR_NB];
+
+	// Per-color group bitmap reused by apply_working_set callers; rebuilt per
+	// fusion phase.
+	std::vector<uint8_t> m_scratch_need[COLOR_NB];
+	// Reused by King_Slice_Manager::neighbors out-param.
+	King_Slice_Manager::Neighbor_List m_scratch_nbrs;
 
 	// Size per-color, per-group bookkeeping vectors once the table dimensions
 	// are known. Called from each derived ctor.

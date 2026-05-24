@@ -6,6 +6,7 @@
 #include "egtb/piece_config_for_gen.h"
 
 #include "util/defines.h"
+#include "util/fixed_vector.h"
 
 // Forward decl breaks the circular include with symmetry.h; full definition
 // is in symmetry.h, included from slice_manager.cpp.
@@ -51,5 +52,7 @@ struct King_Slice_Manager
 
 	// Slice IDs reachable by moving exactly one king one step. Used for
 	// retrograde planning; predecessors land here or in `slice_id` itself.
-	void neighbors(int32_t slice_id, std::vector<int32_t>& out) const;
+	// Bound: 8 king-attack squares per color, two colors.
+	using Neighbor_List = Fixed_Vector<int32_t, 16>;
+	void neighbors(int32_t slice_id, Neighbor_List& out) const;
 };

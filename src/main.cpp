@@ -7,6 +7,7 @@
 
 #include "util/endian.h"
 #include "util/thread_pool.h"
+#include "util/utility.h"
 
 #include <algorithm>
 #include <chrono>
@@ -396,8 +397,7 @@ int main(int argc, char** argv)
 			}
 
 			const auto t_end = std::chrono::steady_clock::now();
-			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-			std::cout << "  " << ps.name() << " DTC done in " << ms << " ms"
+			std::cout << "  " << ps.name() << " DTC done in " << format_elapsed_time(t_start, t_end)
 			          << "  (WDL " << std::filesystem::file_size(paths.wdl_save_path(ps)) << " B, "
 			          << "DTC " << std::filesystem::file_size(paths.dtc_save_path(ps)) << " B)\n";
 		}
@@ -425,13 +425,11 @@ int main(int argc, char** argv)
 			}
 
 			const auto t_end = std::chrono::steady_clock::now();
-			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-			std::cout << "  " << ps.name() << " DTM done in " << ms << " ms"
+			std::cout << "  " << ps.name() << " DTM done in " << format_elapsed_time(t_start, t_end)
 			          << "  (DTM " << std::filesystem::file_size(paths.dtm_save_path(ps)) << " B)\n";
 		}
 	}
 	const auto t_total_end = std::chrono::steady_clock::now();
-	const auto sec = std::chrono::duration_cast<std::chrono::seconds>(t_total_end - t_total_start).count();
-	std::cout << "All done in " << sec << " s.\n";
+	std::cout << "All done in " << format_elapsed_time(t_total_start, t_total_end) << ".\n";
 	return 0;
 }

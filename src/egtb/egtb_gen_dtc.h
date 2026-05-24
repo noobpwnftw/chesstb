@@ -76,8 +76,6 @@ public:
 
 	void save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths& paths);
 
-	NODISCARD const EGTB_Info& info() const { return m_info; }
-
 	NODISCARD WDL_Entry probe_read_post_move_wdl(const Position_For_Gen& pos_gen, Move move) const
 	{
 		return read_post_move_wdl(pos_gen, move, 0);
@@ -87,10 +85,6 @@ private:
 	std::shared_ptr<DTC_Table> m_table;
 	std::map<Material_Key, std::shared_ptr<WDL_File_For_Probe>> m_sub_wdl;
 	const WDL_File_For_Probe* m_sub_wdl_by_move[COLOR_NB][PIECE_NB][PIECE_TYPE_NB]{};
-	EGTB_Info m_info;
-
-	std::vector<uint8_t> m_scratch_need[COLOR_NB];
-	std::vector<int32_t> m_scratch_nbrs;
 
 	template <typename EntryT = DTC_Final_Entry>
 	NODISCARD INLINE EntryT read_dtc(Board_Index pos, Color stm) const

@@ -7,6 +7,7 @@
 #include "chess/position.h"
 
 #include "util/defines.h"
+#include "util/math.h"
 
 #include <atomic>
 #include <climits>
@@ -375,13 +376,13 @@ Working_Set_Estimate compute_working_set(const Piece_Config& ps, bool include_pu
 	Working_Set_Estimate w{};
 
 	w.num_positions     = epsi.num_positions();
-	// DTC_Final_Entry and DTM_Final_Entry are both 2 bytes (static_asserted on
-	// their definitions), so sizeof(DTC_Final_Entry) stands in as the per-cell
-	// size for both gens. Factor of 2 = one table per side-to-move.
-	w.total_table_bytes = static_cast<size_t>(2) * w.num_positions * sizeof(DTC_Final_Entry);
+	// Both DTC_Final_Entry and DTM_Final_Entry static_assert to a 2-byte
+	// representation, so per-cell sizing uses uint16_t directly. Factor of 2
+	// = one table per side-to-move.
+	w.total_table_bytes = static_cast<size_t>(2) * w.num_positions * sizeof(uint16_t);
 
 	const size_t within = epsi.within_slice_size();
-	w.bytes_per_slice = within * sizeof(DTC_Final_Entry);
+	w.bytes_per_slice = within * sizeof(uint16_t);
 
 	// Mirrors Sliced_EGTB_File_For_Gen::compute_slices_per_group.
 	constexpr size_t MIN_GROUP_BYTES = 64ull * 1024ull * 1024ull;
@@ -414,7 +415,7 @@ Working_Set_Estimate compute_working_set(const Piece_Config& ps, bool include_pu
 		for (size_t g = first_g; g <= last_g; ++g) dst.insert(g);
 	};
 
-	std::vector<int32_t> nbrs;
+	King_Slice_Manager::Neighbor_List nbrs;
 
 	for (const auto& batch : psm.pair_topo_batches())
 	{
@@ -444,8 +445,8 @@ Working_Set_Estimate compute_working_set(const Piece_Config& ps, bool include_pu
 			}
 			const size_t pair_iter = pair_me.size() + opp_pair_iter;
 			const size_t pair_init = pair_me.size() + pair_push.size();
-			if (pair_iter > w.peak_pair_iter_groups) w.peak_pair_iter_groups = pair_iter;
-			if (pair_init > w.peak_pair_init_groups) w.peak_pair_init_groups = pair_init;
+			update_max(w.peak_pair_iter_groups, pair_iter);
+			update_max(w.peak_pair_init_groups, pair_init);
 		}
 
 		size_t opp_batch_iter = batch_me_groups.size();
@@ -457,8 +458,8 @@ Working_Set_Estimate compute_working_set(const Piece_Config& ps, bool include_pu
 		}
 		const size_t batch_iter = batch_me_groups.size() + opp_batch_iter;
 		const size_t batch_init = batch_me_groups.size() + batch_push_groups.size();
-		if (batch_iter > w.peak_batch_iter_groups) w.peak_batch_iter_groups = batch_iter;
-		if (batch_init > w.peak_batch_init_groups) w.peak_batch_init_groups = batch_init;
+		update_max(w.peak_batch_iter_groups, batch_iter);
+		update_max(w.peak_batch_init_groups, batch_init);
 
 		// Per-group peak via a single sample pair from this batch.
 		if (batch.empty()) continue;
@@ -498,8 +499,8 @@ Working_Set_Estimate compute_working_set(const Piece_Config& ps, bool include_pu
 			}
 			const size_t iter_g = 1 + opp_iter;
 			const size_t init_g = 1 + sets.second.size();
-			if (iter_g > w.peak_per_group_iter_groups) w.peak_per_group_iter_groups = iter_g;
-			if (init_g > w.peak_per_group_init_groups) w.peak_per_group_init_groups = init_g;
+			update_max(w.peak_per_group_iter_groups, iter_g);
+			update_max(w.peak_per_group_init_groups, init_g);
 		}
 	}
 

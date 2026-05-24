@@ -39,7 +39,7 @@ struct Checkpoint_File
 	uint8_t  phase = 0;
 	bool     pending_cursed = false;
 	uint16_t finished_ply = 0;
-	uint8_t  _pad2[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	uint8_t  _pad[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 };
 static_assert(sizeof(Checkpoint_File) == 32, "Checkpoint_File size");
 
@@ -131,11 +131,6 @@ WDL_Entry DTC_Generator::read_sub_tb(const Position_For_Gen& pos_gen, Move move,
 	const WDL_File_For_Probe* sub = m_sub_wdl_by_move[parent.turn()][captured][promo];
 
 	return (sub == nullptr) ? WDL_Entry::DRAW : sub->read(sub_color, sub_idx, thread_id);
-}
-
-static INLINE bool is_pawn_double_push(Move m)
-{
-	return std::abs(static_cast<int>(sq_rank(m.to())) - static_cast<int>(sq_rank(m.from()))) == 2;
 }
 
 WDL_Entry DTC_Generator::effective_opp_wdl_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const
@@ -237,7 +232,7 @@ DTC_Any_Entry DTC_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 			case WDL_Entry::WIN:          v = ValueClassicLoss; break;
 			default:                      return;
 		}
-		if (v > best) best = v;
+		update_max(best, v);
 	};
 
 	Move_List ml;
@@ -622,7 +617,7 @@ DTC_Generator::Loss_Verification_Result DTC_Generator::check_loss(
 			if (ce.value() >= ply) return r;
 			contribution = static_cast<uint16_t>(ce.value() + 1);
 		}
-		if (contribution > max_contribution) max_contribution = contribution;
+		update_max(max_contribution, contribution);
 	}
 
 	if (!any_legal) return r;
@@ -735,7 +730,7 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 					else
 					{
 						const uint16_t v = static_cast<uint16_t>(e.value());
-						if (v > chunk.max_classified) chunk.max_classified = v;
+						update_max(chunk.max_classified, v);
 					}
 
 					const Iter_Action action = action_for_entry(e, ply, phase);
@@ -805,7 +800,7 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 				}
 
 				if (chunk.any_intermediate) local.any_intermediate = true;
-				if (chunk.max_classified > local.max_classified) local.max_classified = chunk.max_classified;
+				update_max(local.max_classified, chunk.max_classified);
 
 				// Evict only full-CHUNK_SIZE chunks — head/tail share their bit.
 				if (static_cast<size_t>(chunk_end) - static_cast<size_t>(chunk_start) == CHUNK_SIZE
@@ -819,7 +814,7 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 		for (const Iter_Result& r : rets) {
 			if (r.any) any_global = true;
 			if (r.any_intermediate) any_intermediate = true;
-			if (r.max_classified > max_classified) max_classified = r.max_classified;
+			update_max(max_classified, r.max_classified);
 		}
 		// Evict: no Intermediate cells remain and every classified cell's value
 		// is strictly behind ply-1, so no action_for_entry can fire at this ply

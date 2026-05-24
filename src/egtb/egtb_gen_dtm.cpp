@@ -137,11 +137,6 @@ DTM_Final_Entry DTM_Generator::read_sub_tb(const Position_For_Gen& pos_gen, Move
 	return (sub == nullptr) ? DTM_Final_Entry::make_draw() : sub->read(sub_color, sub_idx, thread_id);
 }
 
-static INLINE bool is_pawn_double_push(Move m)
-{
-	return std::abs(static_cast<int>(sq_rank(m.to())) - static_cast<int>(sq_rank(m.from()))) == 2;
-}
-
 DTM_Final_Entry DTM_Generator::read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const
 {
 	const Position& parent = pos_gen.board_unchecked();
@@ -277,12 +272,12 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 		{
 			saw_win = true;
 			const uint16_t cand = static_cast<uint16_t>(sub_e.value() + 1);
-			if (cand < best_win_dtm) best_win_dtm = cand;
+			update_min(best_win_dtm, cand);
 		}
 		else if (sub_e.is_win())
 		{
 			const uint16_t cand = static_cast<uint16_t>(sub_e.value() + 1);
-			if (cand > *worst_loss_dtm) *worst_loss_dtm = cand;
+			update_max(*worst_loss_dtm, cand);
 		}
 		else
 		{
@@ -431,21 +426,21 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 							if (entry.is_win() || entry.is_loss())
 							{
 								const uint16_t v = static_cast<uint16_t>(entry.value());
-								if (v > local_max) local_max = v;
+								update_max(local_max, v);
 							}
 						},
 						[&](DTM_Intermediate_Entry entry) {
 							// DTM_Intermediate_Entry implicit-converts to DTM_Final_Entry
 							// (bit-identical 16-bit storage).
 							write_dtm(idx, us, entry);
-							if (worst_loss_dtm > local_max) local_max = worst_loss_dtm;
+							update_max(local_max, worst_loss_dtm);
 						},
 					}, make_initial_entry(pos_gen, tid, out_param(worst_loss_dtm)));
 				}
 			}
 			return local_max;
 		});
-		for (uint16_t v : rets) if (v > max_init) max_init = v;
+		for (uint16_t v : rets) update_max(max_init, v);
 	}
 
 	progress_bar.set_finished();
@@ -545,7 +540,7 @@ DTM_Generator::Loss_Verification_Result DTM_Generator::check_loss(
 			if (ce.value() >= ply) return r;
 			contribution = static_cast<uint16_t>(ce.value() + 1);
 		}
-		if (contribution > max_contribution) max_contribution = contribution;
+		update_max(max_contribution, contribution);
 	}
 
 	if (!any_legal) return r;
@@ -642,7 +637,6 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 			Board_Index prev = BOARD_INDEX_NONE;
 			Move_List ml;
 			Iter_Result local;
-			auto bump = [&](uint16_t v) { if (v > local.max_v) local.max_v = v; };
 
 			for (auto [chunk_start, chunk_end] : cell_it.chunks())
 			{
@@ -666,7 +660,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 					else
 					{
 						const uint16_t v = static_cast<uint16_t>(e.value());
-						if (v > chunk.max_classified) chunk.max_classified = v;
+						update_max(chunk.max_classified, v);
 					}
 
 					const Iter_Action action = action_for_entry(e, ply);
@@ -683,7 +677,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 					switch (action)
 					{
 					case Iter_Action::MARK_WIN_IN_1:
-						if (retro_mark_win_in_1(pos_gen, ml, stm)) { local.wrote = true; bump(1); }
+						if (retro_mark_win_in_1(pos_gen, ml, stm)) { local.wrote = true; update_max<uint16_t>(local.max_v, 1); }
 						break;
 					case Iter_Action::MARK_CHANGED:
 						retro_mark_changed(pos_gen, ml, stm);
@@ -692,7 +686,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 					case Iter_Action::MARK_WIN_PREDS:
 					{
 						const uint16_t target = static_cast<uint16_t>(ply + 1);
-						if (retro_mark_wins(pos_gen, ml, stm, target)) { local.wrote = true; bump(target); }
+						if (retro_mark_wins(pos_gen, ml, stm, target)) { local.wrote = true; update_max(local.max_v, target); }
 						break;
 					}
 					case Iter_Action::CHANGE_REVERIFY:
@@ -722,7 +716,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 							if (pawn_marked)
 							{
 								write_dtm(idx, stm, DTM_Final_Entry::make_win(ply));
-								bump(ply);
+								update_max(local.max_v, ply);
 								retro_mark_changed(pos_gen, ml, stm);
 								local.wrote = true;
 								break;
@@ -747,7 +741,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 							break;
 						}
 						write_dtm(idx, stm, DTM_Final_Entry::make_loss(res.loss_dtm));
-						bump(res.loss_dtm + 1);
+						update_max<uint16_t>(local.max_v, res.loss_dtm + 1);
 						(void)retro_mark_wins(pos_gen, ml, stm, res.loss_dtm + 1);
 						local.wrote = true;
 						break;
@@ -758,7 +752,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 				}
 
 				if (chunk.any_intermediate) local.any_intermediate = true;
-				if (chunk.max_classified > local.max_classified) local.max_classified = chunk.max_classified;
+				update_max(local.max_classified, chunk.max_classified);
 
 				// Evict only full-CHUNK_SIZE chunks — head/tail share their bit.
 				if (static_cast<size_t>(chunk_end) - static_cast<size_t>(chunk_start) == CHUNK_SIZE
@@ -771,9 +765,9 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 		uint16_t max_classified = 0;
 		for (const Iter_Result& r : rets) {
 			if (r.wrote) global.wrote = true;
-			if (r.max_v > global.max_v) global.max_v = r.max_v;
+			update_max(global.max_v, r.max_v);
 			if (r.any_intermediate) any_intermediate = true;
-			if (r.max_classified > max_classified) max_classified = r.max_classified;
+			update_max(max_classified, r.max_classified);
 		}
 		// Evict: no Intermediate cells remain and every classified cell's value
 		// is strictly behind ply-1, so no action_for_entry can fire at this ply
@@ -803,8 +797,8 @@ void DTM_Generator::iterate(In_Out_Param<Thread_Pool> thread_pool, uint16_t fini
 		std::printf("  iterate %4u\r", finished_ply); std::fflush(stdout);
 		const Iter_Result rw = run_iter(thread_pool, WHITE, finished_ply);
 		const Iter_Result rb = run_iter(thread_pool, BLACK, finished_ply);
-		if (rw.max_v > m_max_dtm) m_max_dtm = rw.max_v;
-		if (rb.max_v > m_max_dtm) m_max_dtm = rb.max_v;
+		update_max(m_max_dtm, rw.max_v);
+		update_max(m_max_dtm, rb.max_v);
 		// A silent ply is only a safe stop AFTER we've passed every classified
 		// dtm value. Init-seeded WIN(d) (from cap/promo to opp-LOSE with deep
 		// sub-DTM) sits dormant until ply hits d-1, so we cannot terminate
@@ -966,12 +960,12 @@ void DTM_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths&
 			if (is_resume_fusion)
 			{
 				start_ply = resume_finished_ply;
-				if (resume_max_dtm > m_max_dtm) m_max_dtm = resume_max_dtm;
+				update_max(m_max_dtm, resume_max_dtm);
 			}
 			else
 			{
 				const uint16_t init_max = init_entries(thread_pool);
-				if (init_max > m_max_dtm) m_max_dtm = init_max;
+				update_max(m_max_dtm, init_max);
 			}
 
 			try

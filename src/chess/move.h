@@ -58,6 +58,15 @@ private:
 };
 static_assert(sizeof(Move) == 2);
 
+// Square-only predicate: returns true iff the move spans exactly two ranks.
+// Only meaningful for pawn pushes (the caller already knows the moving piece);
+// for non-pawn moves it has no chess interpretation.
+NODISCARD INLINE constexpr bool is_pawn_double_push(Move m)
+{
+	const int dr = static_cast<int>(sq_rank(m.to())) - static_cast<int>(sq_rank(m.from()));
+	return dr == 2 || dr == -2;
+}
+
 // Stack-allocated move list. Chess max pseudo-legal moves in a single position
 // is bounded by ~218 (theoretical), but the realistic cap for TB-relevant
 // positions is well under 100. We keep CAPACITY at 218 to be safe.

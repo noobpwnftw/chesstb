@@ -107,7 +107,7 @@ King_Slice_Manager::King_Slice_Manager(Symmetry_Group s) : sym(s)
 	}
 }
 
-void King_Slice_Manager::neighbors(int32_t slice_id, std::vector<int32_t>& out) const
+void King_Slice_Manager::neighbors(int32_t slice_id, Neighbor_List& out) const
 {
 	out.clear();
 	if (slice_id < 0 || static_cast<size_t>(slice_id) >= num_slices) return;
@@ -134,5 +134,6 @@ void King_Slice_Manager::neighbors(int32_t slice_id, std::vector<int32_t>& out) 
 	}
 
 	std::sort(out.begin(), out.end());
-	out.erase(std::unique(out.begin(), out.end()), out.end());
+	const auto last = std::unique(out.begin(), out.end());
+	out.resize(static_cast<size_t>(last - out.begin()));
 }
