@@ -98,7 +98,9 @@ DTM_Generator::DTM_Generator(
 	const size_t total_bytes = bytes_per_color * 2;
 	if (m_paging_budget_bytes >= total_bytes) m_paging_budget_bytes = 0;
 
-	init_group_state(m_table->m_dtm[WHITE].num_groups());
+	init_group_state(
+		m_table->m_dtm[WHITE].num_groups(),
+		m_table->m_dtm[WHITE].num_entries());
 
 	for (Color c : { WHITE, BLACK })
 	for (Piece captured = PIECE_NONE; captured < PIECE_NB; captured = static_cast<Piece>(captured + 1))
@@ -621,6 +623,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 {
 	const size_t spg = m_table->m_dtm[stm].slices_per_group();
 	const auto& pid_in_pair = m_pid_in_pair;
+	const bool has_pawns = m_epsi.pawn_slice_manager().has_pawns();
 
 	Iter_Result global;
 
@@ -639,113 +642,130 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 			Iter_Result local;
 			auto bump = [&](uint16_t v) { if (v > local.max_v) local.max_v = v; };
 
-			for (const Board_Index idx : cell_it.indices())
+			for (auto [chunk_start, chunk_end] : cell_it.chunks())
 			{
-				const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
-				if (!pid_in_pair[pid_of_idx]) continue;
+				const size_t cid = static_cast<size_t>(chunk_start) / CHUNK_SIZE;
+				if (!m_iter_chunks[stm][cid]) continue;
 
-				const DTM_Final_Entry e = read_dtm(idx, stm);
-				if (e.is_illegal()) continue;
+				Iter_Result chunk;
 
-				if (e.is_draw()) local.any_intermediate = true;
-				else
+				for (Board_Index idx = chunk_start; idx != chunk_end;
+				     idx = static_cast<Board_Index>(static_cast<size_t>(idx) + 1))
 				{
-					const uint16_t v = static_cast<uint16_t>(e.value());
-					if (v > local.max_classified) local.max_classified = v;
-				}
+					const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
+					if (!pid_in_pair[pid_of_idx]) continue;
 
-				const Iter_Action action = action_for_entry(e, ply);
-				if (action == Iter_Action::SKIP) continue;
+					const DTM_Final_Entry e = read_dtm(idx, stm);
+					if (e.is_illegal()) continue;
 
-				if (prev != BOARD_INDEX_NONE
-				    && static_cast<size_t>(idx) == static_cast<size_t>(prev) + 1)
-					++pos_gen;
-				else
-					pos_gen.set_board_index(idx);
-				prev = idx;
-				pos_gen.set_turn(stm);
-
-				switch (action)
-				{
-				case Iter_Action::MARK_WIN_IN_1:
-					if (retro_mark_win_in_1(pos_gen, ml, stm)) { local.wrote = true; bump(1); }
-					break;
-				case Iter_Action::MARK_CHANGED:
-					retro_mark_changed(pos_gen, ml, stm);
-					local.wrote = true;
-					break;
-				case Iter_Action::MARK_WIN_PREDS:
-				{
-					const uint16_t target = static_cast<uint16_t>(ply + 1);
-					if (retro_mark_wins(pos_gen, ml, stm, target)) { local.wrote = true; bump(target); }
-					break;
-				}
-				case Iter_Action::CHANGE_REVERIFY:
-				case Iter_Action::PAWN_EVAL:
-				{
-					// Pawnful: try a forward pawn-WIN first. A push that reaches
-					// opp-LOSS(ply-1) classifies the cell as WIN(ply); if e is
-					// a stale WIN(value > ply) this strictly improves it.
-					bool pawn_marked = false;
-					if (m_epsi.pawn_slice_manager().has_pawns())
+					if (e.is_draw()) chunk.any_intermediate = true;
+					else
 					{
-						Position& pos = pos_gen.board();
-						pos.gen_pseudo_legal_pawn_pushes(out_param(ml));
-						for (size_t i = 0; i < ml.size(); ++i)
+						const uint16_t v = static_cast<uint16_t>(e.value());
+						if (v > chunk.max_classified) chunk.max_classified = v;
+					}
+
+					const Iter_Action action = action_for_entry(e, ply);
+					if (action == Iter_Action::SKIP) continue;
+
+					if (prev != BOARD_INDEX_NONE
+					    && static_cast<size_t>(idx) == static_cast<size_t>(prev) + 1)
+						++pos_gen;
+					else
+						pos_gen.set_board_index(idx);
+					prev = idx;
+					pos_gen.set_turn(stm);
+
+					switch (action)
+					{
+					case Iter_Action::MARK_WIN_IN_1:
+						if (retro_mark_win_in_1(pos_gen, ml, stm)) { local.wrote = true; bump(1); }
+						break;
+					case Iter_Action::MARK_CHANGED:
+						retro_mark_changed(pos_gen, ml, stm);
+						local.wrote = true;
+						break;
+					case Iter_Action::MARK_WIN_PREDS:
+					{
+						const uint16_t target = static_cast<uint16_t>(ply + 1);
+						if (retro_mark_wins(pos_gen, ml, stm, target)) { local.wrote = true; bump(target); }
+						break;
+					}
+					case Iter_Action::CHANGE_REVERIFY:
+					case Iter_Action::PAWN_EVAL:
+					{
+						// Pawnful: try a forward pawn-WIN first. A push that reaches
+						// opp-LOSS(ply-1) classifies the cell as WIN(ply); if e is
+						// a stale WIN(value > ply) this strictly improves it.
+						bool pawn_marked = false;
+						if (has_pawns)
 						{
-							const Move m = ml[i];
-							if (!pos.is_pseudo_legal_move_legal(m)) continue;
-							const DTM_Final_Entry opp_e = is_pawn_double_push(m)
-								? effective_opp_dtm_after_dp(pos_gen, m, tid)
-								: read_post_move_dtm(pos_gen, m, tid);
-							if (opp_e.is_loss()
-							    && static_cast<uint16_t>(opp_e.value()) + 1 == ply)
+							Position& pos = pos_gen.board();
+							pos.gen_pseudo_legal_pawn_pushes(out_param(ml));
+							for (size_t i = 0; i < ml.size(); ++i)
 							{
-								pawn_marked = true;
+								const Move m = ml[i];
+								if (!pos.is_pseudo_legal_move_legal(m)) continue;
+								const DTM_Final_Entry opp_e = is_pawn_double_push(m)
+									? effective_opp_dtm_after_dp(pos_gen, m, tid)
+									: read_post_move_dtm(pos_gen, m, tid);
+								if (opp_e.is_loss()
+								    && static_cast<uint16_t>(opp_e.value()) + 1 == ply)
+								{
+									pawn_marked = true;
+									break;
+								}
+							}
+							if (pawn_marked)
+							{
+								write_dtm(idx, stm, DTM_Final_Entry::make_win(ply));
+								bump(ply);
+								retro_mark_changed(pos_gen, ml, stm);
+								local.wrote = true;
 								break;
 							}
 						}
-						if (pawn_marked)
+
+						// Stale-WIN improvement attempt failed → leave cell alone.
+						if (!e.is_draw()) break;
+
+						// Intermediate fallback: run check_loss. Handles both the
+						// CHANGE_REVERIFY case (CHANGE bit set by a non-pawn pred)
+						// and the pawnful PAWN_EVAL case (no CHANGE bit, but a
+						// pawn-pred may have just settled).
+						const auto res = check_loss(pos_gen, ml, ply, tid);
+						if (!res.is_loss)
 						{
-							write_dtm(idx, stm, DTM_Final_Entry::make_win(ply));
-							bump(ply);
-							retro_mark_changed(pos_gen, ml, stm);
-							local.wrote = true;
+							// CHANGE-flagged: clear flag, counts as a write so the
+							// iterate loop keeps going one more ply.
+							// PAWN_EVAL (no CHANGE): nothing actually changes — do
+							// NOT set wrote, or iterate never sees a silent ply
+							// for pawnful materials and runs way past max_dtm.
+							if (e.has_change())
+							{
+								write_dtm(idx, stm, e.without_change());
+								local.wrote = true;
+							}
 							break;
 						}
-					}
-
-					// Stale-WIN improvement attempt failed → leave cell alone.
-					if (!e.is_draw()) break;
-
-					// Intermediate fallback: run check_loss. Handles both the
-					// CHANGE_REVERIFY case (CHANGE bit set by a non-pawn pred)
-					// and the pawnful PAWN_EVAL case (no CHANGE bit, but a
-					// pawn-pred may have just settled).
-					const auto res = check_loss(pos_gen, ml, ply, tid);
-					if (!res.is_loss)
-					{
-						// CHANGE-flagged: clear flag, counts as a write so the
-						// iterate loop keeps going one more ply.
-						// PAWN_EVAL (no CHANGE): nothing actually changes — do
-						// NOT set wrote, or iterate never sees a silent ply
-						// for pawnful materials and runs way past max_dtm.
-						if (e.has_change())
-						{
-							write_dtm(idx, stm, e.without_change());
-							local.wrote = true;
-						}
+						write_dtm(idx, stm, DTM_Final_Entry::make_loss(res.loss_dtm));
+						bump(res.loss_dtm + 1);
+						(void)retro_mark_wins(pos_gen, ml, stm, res.loss_dtm + 1);
+						local.wrote = true;
 						break;
 					}
-					write_dtm(idx, stm, DTM_Final_Entry::make_loss(res.loss_dtm));
-					bump(res.loss_dtm + 1);
-					(void)retro_mark_wins(pos_gen, ml, stm, res.loss_dtm + 1);
-					local.wrote = true;
-					break;
+					default:
+						break;
+					}
 				}
-				default:
-					break;
-				}
+
+				if (chunk.any_intermediate) local.any_intermediate = true;
+				if (chunk.max_classified > local.max_classified) local.max_classified = chunk.max_classified;
+
+				// Evict only full-CHUNK_SIZE chunks — head/tail share their bit.
+				if (static_cast<size_t>(chunk_end) - static_cast<size_t>(chunk_start) == CHUNK_SIZE
+				    && !chunk.any_intermediate && chunk.max_classified + 1 < ply)
+					m_iter_chunks[stm][cid] = 0;
 			}
 			return local;
 		});

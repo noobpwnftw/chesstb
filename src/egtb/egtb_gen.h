@@ -371,9 +371,28 @@ public:
 	NODISCARD std::pair<Board_Index, Board_Index> next_range()
 	{
 		const size_t chunk_index = m_current_chunk_index.fetch_add(1);
-		const Board_Index chunk_start = static_cast<Board_Index>(std::min(static_cast<size_t>(m_start_idx) + chunk_index * m_chunk_size, static_cast<size_t>(m_end_idx)));
-		const Board_Index chunk_end   = static_cast<Board_Index>(std::min(static_cast<size_t>(chunk_start) + m_chunk_size,             static_cast<size_t>(m_end_idx)));
-		return { chunk_start, chunk_end };
+		const size_t start = static_cast<size_t>(m_start_idx);
+		const size_t end   = static_cast<size_t>(m_end_idx);
+		// Emit globally m_chunk_size-aligned chunks: first chunk is the
+		// unaligned head (if any), then boundary-aligned full chunks, then
+		// an unaligned tail (if any). Lets per-chunk consumers know that a
+		// chunk fully covers a m_chunk_size-wide bit just by checking
+		// cs % m_chunk_size == 0 && ce - cs == m_chunk_size.
+		const size_t aligned_start = (start + m_chunk_size - 1) / m_chunk_size * m_chunk_size;
+		const size_t has_head = (start < aligned_start) ? 1 : 0;
+		size_t chunk_start, chunk_end;
+		if (chunk_index == 0 && has_head)
+		{
+			chunk_start = start;
+			chunk_end = std::min(aligned_start, end);
+		}
+		else
+		{
+			const size_t k = chunk_index - has_head;
+			chunk_start = std::min(aligned_start + k * m_chunk_size, end);
+			chunk_end = std::min(chunk_start + m_chunk_size, end);
+		}
+		return { static_cast<Board_Index>(chunk_start), static_cast<Board_Index>(chunk_end) };
 	}
 
 	NODISCARD Chunk_Iterator chunks() { return Chunk_Iterator(*this); }
@@ -485,7 +504,7 @@ struct Sliced_EGTB_File_For_Gen
 	NODISCARD std::enable_if_t<N == 1, MainEntryT> read(Board_Index pos) const
 	{
 		const size_t p = static_cast<size_t>(pos);
-		ASSERT(p < m_num_slices * m_within);
+		ASSERT(p < num_entries());
 		MainEntryT e;
 		const auto [s, off] = split(p);
 		std::memcpy(&e, slice_data(s) + off, sizeof(MainEntryT));
@@ -498,7 +517,7 @@ struct Sliced_EGTB_File_For_Gen
 		static_assert(   std::is_same_v<T, MainEntryT> || (std::is_same_v<T, OtherEntryTs> || ...)
 		              || std::is_base_of_v<T, MainEntryT> || (std::is_base_of_v<T, OtherEntryTs> || ...));
 		const size_t p = static_cast<size_t>(pos);
-		ASSERT(p < m_num_slices * m_within);
+		ASSERT(p < num_entries());
 		T e;
 		const auto [s, off] = split(p);
 		std::memcpy(&e, slice_data(s) + off, sizeof(T));
@@ -510,7 +529,7 @@ struct Sliced_EGTB_File_For_Gen
 	{
 		static_assert(std::is_same_v<T, MainEntryT> || (std::is_same_v<T, OtherEntryTs> || ...));
 		const size_t p = static_cast<size_t>(pos);
-		ASSERT(p < m_num_slices * m_within);
+		ASSERT(p < num_entries());
 		const auto [s, off] = split(p);
 		std::memcpy(slice_data(s) + off, &tt, sizeof(T));
 		mark_dirty(s);
@@ -522,7 +541,7 @@ struct Sliced_EGTB_File_For_Gen
 		static_assert(sizeof(T) == sizeof(Underlying_Entry_Type));
 		static_assert(MainEntryT::template is_allowed_flag_type<T> || (OtherEntryTs::template is_allowed_flag_type<T> || ...));
 		const size_t p = static_cast<size_t>(pos);
-		ASSERT(p < m_num_slices * m_within);
+		ASSERT(p < num_entries());
 		const auto [s, off] = split(p);
 		atomic_fetch_or(slice_data(s) + off, flags);
 		mark_dirty(s);
@@ -534,7 +553,7 @@ struct Sliced_EGTB_File_For_Gen
 		static_assert(sizeof(T) == sizeof(Underlying_Entry_Type));
 		static_assert(MainEntryT::template is_allowed_flag_type<T> || (OtherEntryTs::template is_allowed_flag_type<T> || ...));
 		const size_t p = static_cast<size_t>(pos);
-		ASSERT(p < m_num_slices * m_within);
+		ASSERT(p < num_entries());
 		const auto [s, off] = split(p);
 		slice_data(s)[off] |= static_cast<Underlying_Entry_Type>(flags);
 		mark_dirty(s);
@@ -572,6 +591,7 @@ struct Sliced_EGTB_File_For_Gen
 
 	NODISCARD size_t num_slices() const { return m_num_slices; }
 	NODISCARD size_t within_slice_size() const { return m_within; }
+	NODISCARD size_t num_entries() const { return m_num_slices * m_within; }
 
 	void mark_dirty(size_t slice_id) { m_dirty[group_id_of(slice_id)] = true; }
 
@@ -858,26 +878,34 @@ protected:
 	// fire. A subsequent write reinstates the bit.
 	std::vector<uint8_t> m_iter_groups[COLOR_NB];
 
+	// Finer-grained companion to m_iter_groups, indexed by pos / CHUNK_SIZE.
+	// Same set-on-write / clear-on-clean-scan rules, applied at chunk granularity
+	// so run_iter can skip cold chunks within a still-warm group.
+	std::vector<uint8_t> m_iter_chunks[COLOR_NB];
+
 	// Size per-color, per-group bookkeeping vectors once the table dimensions
 	// are known. Called from each derived ctor.
-	void init_group_state(size_t num_groups)
+	void init_group_state(size_t num_groups, size_t total_index_space)
 	{
+		const size_t num_chunks = (total_index_space + CHUNK_SIZE - 1) / CHUNK_SIZE;
 		for (Color c : { WHITE, BLACK })
 		{
 			m_last_used[c].assign(num_groups, 0);
 			m_iter_groups[c].assign(num_groups, 0);
+			m_iter_chunks[c].assign(num_chunks, 0);
 		}
 	}
 
-	// Per-fusion seed: every group in m_pair_group_ids enters the next run_iter
-	// marked; first sweep is full-scan, eviction tightens from there.
+	// Per-fusion seed: first sweep is full-scan, eviction tightens from there.
+	// Non-pair groups/chunks are never visited (run_iter only walks
+	// m_pair_group_ids), so over-marking them is harmless.
 	void seed_iter_groups()
 	{
 		for (Color c : { WHITE, BLACK })
-			std::fill(m_iter_groups[c].begin(), m_iter_groups[c].end(), 0);
-		for (size_t g : m_pair_group_ids)
-			for (Color c : { WHITE, BLACK })
-				m_iter_groups[c][g] = 1;
+		{
+			std::fill(m_iter_groups[c].begin(), m_iter_groups[c].end(), 1);
+			std::fill(m_iter_chunks[c].begin(), m_iter_chunks[c].end(), 1);
+		}
 	}
 
 	template <typename EntryT>
@@ -885,6 +913,7 @@ protected:
 	                      const Sliced_EGTB_File_For_Gen<EntryT>& f)
 	{
 		m_iter_groups[c][f.group_id_of(f.slice_id_of(static_cast<size_t>(pos)))] = 1;
+		m_iter_chunks[c][static_cast<size_t>(pos) / CHUNK_SIZE] = 1;
 	}
 
 	template <typename EntryT>

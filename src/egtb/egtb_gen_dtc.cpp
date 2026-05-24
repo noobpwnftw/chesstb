@@ -99,7 +99,9 @@ DTC_Generator::DTC_Generator(
 	const size_t total_bytes = bytes_per_color * 2;
 	if (m_paging_budget_bytes >= total_bytes) m_paging_budget_bytes = 0;
 
-	init_group_state(m_table->m_dtc[WHITE].num_groups());
+	init_group_state(
+		m_table->m_dtc[WHITE].num_groups(),
+		m_table->m_dtc[WHITE].num_entries());
 
 	for (Color c : { WHITE, BLACK })
 	for (Piece captured = PIECE_NONE; captured < PIECE_NB; captured = static_cast<Piece>(captured + 1))
@@ -693,7 +695,7 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 
 	bool any_global = false;
 
-	struct Local { bool any; bool any_intermediate; uint16_t max_classified; };
+	struct Iter_Result { bool any = false; bool any_intermediate = false; uint16_t max_classified = 0; };
 
 	for (size_t g : m_pair_group_ids)
 	{
@@ -703,98 +705,118 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 
 		Shared_Board_Index_Iterator cell_it = make_slice_group_iterator(g, spg);
 
-		const auto rets = thread_pool->run_sync_task_on_all_threads([&](size_t tid) -> Local {
+		const auto rets = thread_pool->run_sync_task_on_all_threads([&](size_t tid) -> Iter_Result {
 			Position_For_Gen pos_gen(m_epsi, BOARD_INDEX_ZERO, stm);
 			Board_Index prev = BOARD_INDEX_NONE;
 			Move_List ml;
-			Local local{ false, false, 0 };
+			Iter_Result local;
 
-			for (const Board_Index idx : cell_it.indices())
+			for (auto [chunk_start, chunk_end] : cell_it.chunks())
 			{
-				const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
-				if (!pid_in_pair[pid_of_idx])
-					continue;
+				const size_t cid = static_cast<size_t>(chunk_start) / CHUNK_SIZE;
+				if (!m_iter_chunks[stm][cid]) continue;
 
-				const DTC_Final_Entry e = read_dtc(idx, stm);
-				if (e.is_illegal()) continue;
+				Iter_Result chunk;
 
-				if (e.is_draw()) local.any_intermediate = true;
-				else
+				for (Board_Index idx = chunk_start; idx != chunk_end;
+				     idx = static_cast<Board_Index>(static_cast<size_t>(idx) + 1))
 				{
-					const uint16_t v = static_cast<uint16_t>(e.value());
-					if (v > local.max_classified) local.max_classified = v;
-				}
+					const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
+					if (!pid_in_pair[pid_of_idx])
+						continue;
 
-				const Iter_Action action = action_for_entry(e, ply, phase);
+					const DTC_Final_Entry e = read_dtc(idx, stm);
+					if (e.is_illegal()) continue;
 
-				if (action == Iter_Action::SKIP) continue;
-
-				if (prev != BOARD_INDEX_NONE
-				    && static_cast<size_t>(idx) == static_cast<size_t>(prev) + 1)
-					++pos_gen;
-				else
-					pos_gen.set_board_index(idx);
-				prev = idx;
-				pos_gen.set_turn(stm);
-
-				switch (action)
-				{
-				case Iter_Action::MARK_WIN_IN_1:
-					retro_mark_win_in_1(pos_gen, ml, stm);
-					local.any = true;
-					break;
-				case Iter_Action::MARK_CHANGED:
-					retro_mark_changed(pos_gen, ml, stm);
-					local.any = true;
-					break;
-				case Iter_Action::PROMOTE_CWIN:
-					write_dtc(idx, stm,
-						DTC_Final_Entry::make_win(ply).with_cap_cwin());
-					retro_mark_changed(pos_gen, ml, stm);
-					local.any = true;
-					break;
-				case Iter_Action::MARK_WIN_PREDS:
-				{
-					const bool cursed = is_cursed_class_entry(e)
-					                    || phase == Iter_Phase::CURSED;
-					retro_mark_wins(pos_gen, ml, stm,
-					                static_cast<uint16_t>(ply + 1), cursed);
-					local.any = true;
-					break;
-				}
-				case Iter_Action::CHANGE_REVERIFY:
-				case Iter_Action::CAPT_CLOSS_REVERIFY:
-				{
-					const auto res = check_loss(pos_gen, ml, ply, phase, tid);
-					if (!res.is_loss)
+					// Only flagged Intermediates (CHANGE | CAP_CWIN | CAP_CLOSS) can
+					// fire a future action; bare DRAW will never become actionable
+					// unless a write reinstates the bit via mark_iter.
+					if (e.is_draw()) { if (e.has_any_flags()) chunk.any_intermediate = true; }
+					else
 					{
-						// Failed verify: clear CHANGE only, preserve CAP_*.
-						write_dtc(idx, stm, e.without_change());
+						const uint16_t v = static_cast<uint16_t>(e.value());
+						if (v > chunk.max_classified) chunk.max_classified = v;
+					}
+
+					const Iter_Action action = action_for_entry(e, ply, phase);
+
+					if (action == Iter_Action::SKIP) continue;
+
+					if (prev != BOARD_INDEX_NONE
+					    && static_cast<size_t>(idx) == static_cast<size_t>(prev) + 1)
+						++pos_gen;
+					else
+						pos_gen.set_board_index(idx);
+					prev = idx;
+					pos_gen.set_turn(stm);
+
+					switch (action)
+					{
+					case Iter_Action::MARK_WIN_IN_1:
+						retro_mark_win_in_1(pos_gen, ml, stm);
+						local.any = true;
+						break;
+					case Iter_Action::MARK_CHANGED:
+						retro_mark_changed(pos_gen, ml, stm);
+						local.any = true;
+						break;
+					case Iter_Action::PROMOTE_CWIN:
+						write_dtc(idx, stm,
+							DTC_Final_Entry::make_win(ply).with_cap_cwin());
+						retro_mark_changed(pos_gen, ml, stm);
+						local.any = true;
+						break;
+					case Iter_Action::MARK_WIN_PREDS:
+					{
+						const bool cursed = is_cursed_class_entry(e)
+						                    || phase == Iter_Phase::CURSED;
+						retro_mark_wins(pos_gen, ml, stm,
+						                static_cast<uint16_t>(ply + 1), cursed);
+						local.any = true;
 						break;
 					}
-					uint16_t loss_dtz = res.loss_dtz;
-					const bool cursed = res.cursed || phase == Iter_Phase::CURSED;
-					if (action == Iter_Action::CAPT_CLOSS_REVERIFY
-					    && loss_dtz < DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
-						loss_dtz = DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1;
-					DTC_Final_Entry new_e = DTC_Final_Entry::make_loss(loss_dtz);
-					if (cursed) new_e = new_e.with_cap_closs();
-					write_dtc(idx, stm, new_e);
-					retro_mark_wins(pos_gen, ml, stm,
-					                static_cast<uint16_t>(loss_dtz + 1),
-					                cursed);
-					local.any = true;
-					break;
+					case Iter_Action::CHANGE_REVERIFY:
+					case Iter_Action::CAPT_CLOSS_REVERIFY:
+					{
+						const auto res = check_loss(pos_gen, ml, ply, phase, tid);
+						if (!res.is_loss)
+						{
+							// Failed verify: clear CHANGE only, preserve CAP_*.
+							write_dtc(idx, stm, e.without_change());
+							break;
+						}
+						uint16_t loss_dtz = res.loss_dtz;
+						const bool cursed = res.cursed || phase == Iter_Phase::CURSED;
+						if (action == Iter_Action::CAPT_CLOSS_REVERIFY
+						    && loss_dtz < DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
+							loss_dtz = DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1;
+						DTC_Final_Entry new_e = DTC_Final_Entry::make_loss(loss_dtz);
+						if (cursed) new_e = new_e.with_cap_closs();
+						write_dtc(idx, stm, new_e);
+						retro_mark_wins(pos_gen, ml, stm,
+						                static_cast<uint16_t>(loss_dtz + 1),
+						                cursed);
+						local.any = true;
+						break;
+					}
+					default:
+						break;
+					}
 				}
-				default:
-					break;
-				}
+
+				if (chunk.any_intermediate) local.any_intermediate = true;
+				if (chunk.max_classified > local.max_classified) local.max_classified = chunk.max_classified;
+
+				// Evict only full-CHUNK_SIZE chunks — head/tail share their bit.
+				if (static_cast<size_t>(chunk_end) - static_cast<size_t>(chunk_start) == CHUNK_SIZE
+				    && !chunk.any_intermediate && chunk.max_classified + 1 < ply)
+					m_iter_chunks[stm][cid] = 0;
 			}
 			return local;
 		});
 		bool any_intermediate = false;
 		uint16_t max_classified = 0;
-		for (const Local& r : rets) {
+		for (const Iter_Result& r : rets) {
 			if (r.any) any_global = true;
 			if (r.any_intermediate) any_intermediate = true;
 			if (r.max_classified > max_classified) max_classified = r.max_classified;
