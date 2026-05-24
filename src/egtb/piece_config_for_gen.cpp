@@ -271,9 +271,11 @@ Piece_Config_For_Gen::Piece_Config_For_Gen(const Piece_Config& ps, std::nothrow_
 
 template <bool ASSUME_LEGAL>
 bool Piece_Config_For_Gen::fill_board(
-	const Decomposed_Board_Index& index, Out_Param<Position> board) const
+	const Decomposed_Board_Index& index, Out_Param<Position> board,
+	Out_Param<std::array<Piece_Group::Placement, PIECE_CLASS_NB>> placements) const
 {
 	board->clear();
+	for (auto& p : *placements) p = Piece_Group::Placement{};
 
 	const King_Slice_Manager& sm = slice_manager();
 	if constexpr (!ASSUME_LEGAL)
@@ -285,6 +287,8 @@ bool Piece_Config_For_Gen::fill_board(
 	const auto [wk, bk] = sm.kings_of_slice[index.king_slice_id];
 	board->put_piece(WHITE_KING, wk);
 	board->put_piece(BLACK_KING, bk);
+	(*placements)[WHITE_KINGS].add(wk);
+	(*placements)[BLACK_KINGS].add(bk);
 
 	const Pawn_Slice_Manager& psm = pawn_slice_manager();
 	if (psm.has_pawns())
@@ -294,6 +298,7 @@ bool Piece_Config_For_Gen::fill_board(
 			if (!is_populated(c)) return true;
 			const Piece_Group& g = group(c);
 			const auto& placement = g.squares(idx);
+			(*placements)[c] = placement;
 			const Piece pc = g.piece();
 			for (size_t k = 0; k < placement.size(); ++k)
 			{
@@ -313,6 +318,7 @@ bool Piece_Config_For_Gen::fill_board(
 		const Piece_Class c = m_populated_classes[i];
 		const Piece_Group& g = group(c);
 		const auto& placement = g.squares(index.within[c]);
+		(*placements)[c] = placement;
 		const Piece pc = g.piece();
 		for (size_t k = 0; k < placement.size(); ++k)
 		{
@@ -327,6 +333,8 @@ bool Piece_Config_For_Gen::fill_board(
 }
 
 template bool Piece_Config_For_Gen::fill_board<false>(
-	const Decomposed_Board_Index&, Out_Param<Position>) const;
+	const Decomposed_Board_Index&, Out_Param<Position>,
+	Out_Param<std::array<Piece_Group::Placement, PIECE_CLASS_NB>>) const;
 template bool Piece_Config_For_Gen::fill_board<true>(
-	const Decomposed_Board_Index&, Out_Param<Position>) const;
+	const Decomposed_Board_Index&, Out_Param<Position>,
+	Out_Param<std::array<Piece_Group::Placement, PIECE_CLASS_NB>>) const;

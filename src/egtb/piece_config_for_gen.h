@@ -179,8 +179,11 @@ public:
 
 	// Materialise the Position at `index`. ASSUME_LEGAL=true skips overlap and
 	// slice-range checks and always returns true; =false returns false on conflict.
+	// Also populates the canonical-frame placements array (unpopulated classes get
+	// a default-constructed empty Placement).
 	template <bool ASSUME_LEGAL>
-	bool fill_board(const Decomposed_Board_Index& index, Out_Param<Position> board) const;
+	bool fill_board(const Decomposed_Board_Index& index, Out_Param<Position> board,
+	                Out_Param<std::array<Piece_Group::Placement, PIECE_CLASS_NB>> placements) const;
 
 	void decompose_board_index(Board_Index pos, Out_Param<Decomposed_Board_Index> idx) const
 	{

@@ -61,38 +61,6 @@ struct Position_For_Gen
 		m_epsi->decompose_board_index(pos, out_param(m_index));
 	}
 
-	// Successor of `parent` after a quiet move. PRECONDITION: `move` took
-	// next_quiet_index's fast path (no king/pawn move, no self-stabilizer
-	// slice) so canonical orientation is preserved. Use the (epsi, idx, turn)
-	// ctor on next_ix for orientation-changing moves.
-	Position_For_Gen(const Position_For_Gen& parent, Move move, Board_Index next_ix,
-	                 Color turn = WHITE) :
-		m_epsi(parent.m_epsi),
-		m_board_index(next_ix),
-		m_turn(turn),
-		m_index(parent.m_index),
-		m_cached_board_index(BOARD_INDEX_NONE),
-		m_legal(false)
-	{
-		// Only the moved piece's class within[] changes; king/pawn slices preserved.
-		const Piece mover = parent.m_board.piece_at(move.from());
-		ASSERT(mover != PIECE_NONE);
-		const Piece_Class cls = piece_class(mover);
-		m_index.within[cls] = m_epsi->group(cls).compound_index_after_quiet_move(
-			parent.m_index.within[cls], move.from(), move.to());
-
-		// Inherit + apply move only if parent's board cache is fresh; else lazy-rebuild.
-		if (parent.m_cached_board_index == parent.m_board_index)
-		{
-			m_board = parent.m_board;
-			m_board.remove_piece(move.from());
-			m_board.put_piece(mover, move.to());
-			m_board.set_turn(m_turn);
-			m_legal = true;
-			m_cached_board_index = m_board_index;
-		}
-	}
-
 	INLINE Position_For_Gen& operator++()
 	{
 		m_board_index = static_cast<Board_Index>(static_cast<size_t>(m_board_index) + 1);
@@ -132,6 +100,18 @@ struct Position_For_Gen
 	}
 
 	NODISCARD const Decomposed_Board_Index& index() const { return m_index; }
+
+	// Canonical-frame placements, lazily filled alongside m_board.
+	NODISCARD const std::array<Piece_Group::Placement, PIECE_CLASS_NB>& placements() const
+	{
+		init_board<false>();
+		return m_placements;
+	}
+	NODISCARD const std::array<Piece_Group::Placement, PIECE_CLASS_NB>& placements_unchecked() const
+	{
+		init_board<true>();
+		return m_placements;
+	}
 
 	void get_fen(Span<char> out) const
 	{
@@ -175,13 +155,15 @@ private:
 
 	mutable Board_Index m_cached_board_index;
 	mutable Position m_board;
+	mutable std::array<Piece_Group::Placement, PIECE_CLASS_NB> m_placements{};
 	mutable bool m_legal;
 
 	template <bool ASSUME_LEGAL>
 	void init_board() const
 	{
 		if (m_cached_board_index == m_board_index) return;
-		m_legal = m_epsi->template fill_board<ASSUME_LEGAL>(m_index, out_param(m_board));
+		m_legal = m_epsi->template fill_board<ASSUME_LEGAL>(
+			m_index, out_param(m_board), out_param(m_placements));
 		if (m_legal) m_board.set_turn(m_turn);
 		m_cached_board_index = m_board_index;
 	}

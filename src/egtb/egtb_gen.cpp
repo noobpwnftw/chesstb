@@ -112,22 +112,34 @@ Board_Index next_quiet_index(const Piece_Config_For_Gen& epsi,
 	ASSERT(board.is_empty(to));
 
 	auto fallback = [&]() {
-		Position p = board;
-		p.remove_piece(from);
-		p.put_piece(mover, to);
-		return board_index_of_position(epsi, p);
+		// board_unchecked() above also populated m_placements; reuse them and
+		// patch the moved class instead of re-scanning bitboards.
+		auto placements = pos_gen.placements_unchecked();
+		const Piece_Class cls = piece_class(mover);
+		placements[cls] = placements[cls].with_moved_square(from, to);
+		return canonical_board_index(epsi, placements);
 	};
 
-	// King moves can change king_slice_id and the symmetry transform.
 	if (piece_type(mover) == KING) return fallback();
 
-	// Pawn moves change pawn_slice_id (and promotions exit the material).
-	if (piece_type(mover) == PAWN) return fallback();
-
-	// Self-stabilizer slices apply a diag tiebreak depending on all non-king
-	// placements; a non-king move can flip which orientation wins.
 	if (epsi.slice_manager().slice_has_stabilizer[pos_gen.index().king_slice_id])
 		return fallback();
+
+	if (piece_type(mover) == PAWN)
+	{
+		// Quiet pawn move is a same-file push: file-mirror orientation preserved
+		// and kings unchanged, so only pawn_slice_id needs recomputing.
+		auto placements = pos_gen.placements_unchecked();
+		placements[piece_class(mover)] =
+			placements[piece_class(mover)].with_moved_square(from, to);
+		Decomposed_Board_Index dix = pos_gen.index();
+		const auto& w_pl = placements[WHITE_PAWNS];
+		const auto& b_pl = placements[BLACK_PAWNS];
+		dix.pawn_slice_id = epsi.pawn_slice_manager().lookup_from_squares(
+			Const_Span<Square>(w_pl.begin(), w_pl.size()),
+			Const_Span<Square>(b_pl.begin(), b_pl.size()));
+		return epsi.compose_board_index(dix);
+	}
 
 	const Piece_Class cls = piece_class(mover);
 	Decomposed_Board_Index dix = pos_gen.index();
