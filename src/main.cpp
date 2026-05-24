@@ -74,7 +74,15 @@ static bool parse_args(int argc, char** argv, Options& out)
 				if (!s.empty()) out.materials.push_back(s);
 		}
 		else if (const char* v = take("--list")) out.list_file = v;
-		else if (const char* v = take("-t"))     out.num_threads = std::atoi(v);
+		else if (const char* v = take("-t")) {
+			char* end = nullptr;
+			const long long n = std::strtoll(v, &end, 10);
+			if (end == v || *end != '\0' || n <= 0) {
+				std::cerr << "-t needs a positive integer (got \"" << v << "\")\n";
+				return false;
+			}
+			out.num_threads = static_cast<size_t>(n);
+		}
 		else if (const char* v = take("--wdl"))  out.wdl_dir = v;
 		else if (const char* v = take("--dtc"))  out.dtc_dir = v;
 		else if (const char* v = take("--dtm"))  out.dtm_dir = v;

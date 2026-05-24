@@ -53,9 +53,11 @@ static WDL_Entry fathom_to_wdl(unsigned r)
 	return WDL_Entry::ILLEGAL;
 }
 
+static size_t g_num_threads = std::max(1u, std::thread::hardware_concurrency());
+
 static Thread_Pool& global_pool()
 {
-	static Thread_Pool pool(std::max(1u, std::thread::hardware_concurrency()));
+	static Thread_Pool pool(g_num_threads);
 	return pool;
 }
 
@@ -299,14 +301,23 @@ int main(int argc, char** argv)
 	std::vector<std::string> materials;
 	for (int i = 1; i < argc; ++i) {
 		std::string a = argv[i];
-		if (a == "--list" && i + 1 < argc) {
+		if (a == "-t" && i + 1 < argc) {
+			const char* v = argv[++i];
+			char* end = nullptr;
+			const long long n = std::strtoll(v, &end, 10);
+			if (end == v || *end != '\0' || n <= 0) {
+				std::fprintf(stderr, "-t needs a positive integer (got \"%s\")\n", v);
+				return 1;
+			}
+			g_num_threads = static_cast<size_t>(n);
+		} else if (a == "--list" && i + 1 < argc) {
 			auto more = read_list_file(argv[++i]);
 			materials.insert(materials.end(), more.begin(), more.end());
 		} else if (a == "--enumerate" && i + 1 < argc) {
 			auto more = enumerate_materials(std::strtoull(argv[++i], nullptr, 10));
 			materials.insert(materials.end(), more.begin(), more.end());
 		} else if (a == "-h" || a == "--help") {
-			std::printf("Usage: %s [MATERIAL...] [--list FILE] [--enumerate N]\n", argv[0]);
+			std::printf("Usage: %s [-t N] [MATERIAL...] [--list FILE] [--enumerate N]\n", argv[0]);
 			return 0;
 		} else {
 			materials.push_back(a);

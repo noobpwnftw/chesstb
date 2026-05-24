@@ -378,9 +378,11 @@ DTC_Derived derive_dtc_from_children(Probe_Tables& tables, const Position& pos)
 	return { best_wdl, best, missing };
 }
 
+size_t g_num_threads = std::max(1u, std::thread::hardware_concurrency());
+
 Thread_Pool& global_pool()
 {
-	static Thread_Pool pool(std::max(1u, std::thread::hardware_concurrency()));
+	static Thread_Pool pool(g_num_threads);
 	return pool;
 }
 
@@ -699,6 +701,17 @@ int main(int argc, char** argv)
 	for (int i = 1; i < argc; ++i)
 	{
 		std::string a = argv[i];
+		if (a == "-t" && i + 1 < argc) {
+			const char* v = argv[++i];
+			char* end = nullptr;
+			const long long n = std::strtoll(v, &end, 10);
+			if (end == v || *end != '\0' || n <= 0) {
+				std::fprintf(stderr, "-t needs a positive integer (got \"%s\")\n", v);
+				return 1;
+			}
+			g_num_threads = static_cast<size_t>(n);
+			continue;
+		}
 		if (a == "--wdl" && i + 1 < argc)   { opt.wdl_dir = argv[++i]; continue; }
 		if (a == "--dtc-dir" && i + 1 < argc) { opt.dtc_dir = argv[++i]; continue; }
 		if (a == "--dtm-dir" && i + 1 < argc) { opt.dtm_dir = argv[++i]; continue; }
@@ -719,6 +732,7 @@ int main(int argc, char** argv)
 			std::printf(
 				"Usage: %s [options] MATERIAL...\n"
 				"Options:\n"
+				"  -t N             worker threads (default: hardware_concurrency)\n"
 				"  --dtm            check DTM only (can be combined with --dtc)\n"
 				"  --dtc, --dtz     check DTC only (can be combined with --dtm)\n"
 				"  --list FILE      newline-separated material names\n"
