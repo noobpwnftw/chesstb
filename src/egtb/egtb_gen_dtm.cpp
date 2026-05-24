@@ -30,7 +30,7 @@ namespace {
 
 struct Checkpoint_File
 {
-	static constexpr uint64_t MAGIC = 0x4B4D544454434843ull;
+	static constexpr uint64_t MAGIC = 0x4B4D5444544D4843ull;  // 'CHMTDTMK'
 	static constexpr uint32_t VERSION = 1;
 	uint64_t magic = MAGIC;
 	uint32_t version = VERSION;

@@ -31,7 +31,7 @@ namespace {
 struct Checkpoint_File
 {
 	static constexpr uint64_t MAGIC = 0x4B43544454434843ull;  // 'CHCTDTCK'
-	static constexpr uint32_t VERSION = 3;
+	static constexpr uint32_t VERSION = 1;
 	uint64_t magic = MAGIC;
 	uint32_t version = VERSION;
 	uint32_t batch_idx = 0;
