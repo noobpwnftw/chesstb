@@ -251,9 +251,10 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 	bool saw_draw = false;
 
 	Move_List ml;
-	pos.gen_pseudo_legal_moves(out_param(ml));
+	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
 	bool any_legal = false;
 	bool any_in_material = false;
+	bool any_pawn_eval = false;
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Move m = ml[i];
@@ -263,8 +264,13 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 		if (!is_cap && !m.is_promotion())
 		{
 			any_in_material = true;
+			// Pawn push crosses pawn slices — post-push child lives in an
+			// already-built slice that doesn't iterate, so retro can't bridge.
+			if (piece_type(pos.piece_at(m.from())) == PAWN)
+				any_pawn_eval = true;
 			continue;
 		}
+		any_pawn_eval = true;
 		const DTM_Final_Entry sub_e = read_sub_tb(pos_gen, m, thread_id);
 		if (sub_e.is_illegal()) continue;
 		if (sub_e.is_loss())
@@ -302,11 +308,11 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 		if (*worst_loss_dtm > 0)
 			return DTM_Final_Entry::make_loss(*worst_loss_dtm);
 	}
-	// Mixed in-material + cap/promo Intermediate: leave *worst_loss_dtm as a
-	// lower bound on this cell's eventual LOSS dtm so init_entries can extend
-	// m_max_dtm; otherwise iterate may stop before reaching the ply where
-	// check_loss would classify this cell.
-	return DTM_Intermediate_Entry{};  // unclassified; retrograde will resolve
+	// Intermediate; *worst_loss_dtm seeds m_max_dtm so iterate runs long enough
+	// for check_loss to fire at the cap/promo-driven classification ply.
+	return any_pawn_eval
+		? DTM_Intermediate_Entry::make_pawn_eval()
+		: DTM_Intermediate_Entry{};
 }
 
 uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
@@ -460,12 +466,8 @@ DTM_Generator::Iter_Action DTM_Generator::action_for_entry(DTM_Final_Entry e, ui
 	if (e.is_draw())
 	{
 		if (e.has_change()) return Iter_Action::CHANGE_REVERIFY;
-		// pre_quiets omits BOTH pawn pushes and conversion edges (caps/promos),
-		// so Intermediate cells whose controlling LOSS contribution comes from
-		// either a pawn-pred (pawnful) or a sub-TB cap/promo edge (any material
-		// with possible captures) never get CHANGE-flagged. Visit every ply so
-		// PAWN_EVAL's check_loss fallback can pick them up.
-		if (ply > 0) return Iter_Action::PAWN_EVAL;
+		// PAWN_EVAL: forward-read for retro-blind edges (cap/promo + pawn push).
+		if (ply > 0 && e.has_pawn_eval()) return Iter_Action::PAWN_EVAL;
 		return Iter_Action::SKIP;
 	}
 
@@ -501,7 +503,7 @@ DTM_Generator::Loss_Verification_Result DTM_Generator::check_loss(
 {
 	Position& pos = pos_gen.board_unchecked();
 	const Color opp = color_opp(pos.turn());
-	pos.gen_pseudo_legal_moves(out_param(ml));
+	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
 
 	Loss_Verification_Result r;
 	bool any_legal = false;
@@ -558,7 +560,7 @@ bool DTM_Generator::retro_mark_win_in_1(Position_For_Gen& pos_gen,
                                         Move_List& ml, Color stm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
 	bool wrote = false;
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
@@ -578,7 +580,7 @@ void DTM_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
                                        Move_List& ml, Color stm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
@@ -597,7 +599,7 @@ bool DTM_Generator::retro_mark_wins(Position_For_Gen& pos_gen,
                                     uint16_t target_dtm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
 	const DTM_Final_Entry new_e = DTM_Final_Entry::make_win(target_dtm);
 	bool wrote = false;
 	for (size_t i = 0; i < ml.size(); ++i)
@@ -658,7 +660,9 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 					const DTM_Final_Entry e = read_dtm(idx, stm);
 					if (e.is_illegal()) continue;
 
-					if (e.is_draw()) chunk.any_intermediate = true;
+					// Only flagged Intermediates revisit; bare DRAW SKIPs forever.
+					if (e.is_draw() && (e.has_change() || e.has_pawn_eval()))
+						chunk.any_intermediate = true;
 					else
 					{
 						const uint16_t v = static_cast<uint16_t>(e.value());
@@ -694,14 +698,13 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 					case Iter_Action::CHANGE_REVERIFY:
 					case Iter_Action::PAWN_EVAL:
 					{
-						// Pawnful: try a forward pawn-WIN first. A push that reaches
-						// opp-LOSS(ply-1) classifies the cell as WIN(ply); if e is
-						// a stale WIN(value > ply) this strictly improves it.
+						// Forward pawn-WIN: a push reaching opp-LOSS(ply-1) makes
+						// this cell WIN(ply); also improves stale WIN(value > ply).
 						bool pawn_marked = false;
 						if (has_pawns)
 						{
 							Position& pos = pos_gen.board();
-							pos.gen_pseudo_legal_pawn_pushes(out_param(ml));
+							pos.gen_pseudo_legal<Position::Move_Kind::PAWN_PUSHES>(out_param(ml));
 							for (size_t i = 0; i < ml.size(); ++i)
 							{
 								const Move m = ml[i];
@@ -726,21 +729,16 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 							}
 						}
 
-						// Stale-WIN improvement attempt failed → leave cell alone.
-						if (!e.is_draw()) break;
+						if (!e.is_draw()) break;  // stale-WIN path; nothing else to try
 
-						// Intermediate fallback: run check_loss. Handles both the
-						// CHANGE_REVERIFY case (CHANGE bit set by a non-pawn pred)
-						// and the pawnful PAWN_EVAL case (no CHANGE bit, but a
-						// pawn-pred may have just settled).
+						// Intermediate fallback: check_loss for both CHANGE_REVERIFY
+						// and PAWN_EVAL (forward edge may have just settled).
 						const auto res = check_loss(pos_gen, ml, ply, tid);
 						if (!res.is_loss)
 						{
-							// CHANGE-flagged: clear flag, counts as a write so the
-							// iterate loop keeps going one more ply.
-							// PAWN_EVAL (no CHANGE): nothing actually changes — do
-							// NOT set wrote, or iterate never sees a silent ply
-							// for pawnful materials and runs way past max_dtm.
+							// Only the CHANGE path counts as a write — clearing the
+							// flag keeps iterate alive for one more ply. PAWN_EVAL
+							// with no change can't bump wrote or iterate overshoots.
 							if (e.has_change())
 							{
 								write_dtm(idx, stm, e.without_change());

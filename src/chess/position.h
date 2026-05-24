@@ -101,35 +101,20 @@ struct Position
 	Piece do_move(Move m);
 	void  undo_move(Move m, Piece captured);
 
-	// Generate all pseudo-legal moves for side-to-move into `out`.
-	// Does NOT filter for own-king-in-check; caller can apply is_pseudo_legal_move_legal.
-	// Does NOT generate ep captures or castling.
-	void gen_pseudo_legal_moves(Out_Param<Move_List> out) const;
+	// Move generator selector. No EP, no castling, no king-in-check filter.
+	//   ALL         — every pseudo-legal move
+	//   QUIETS      — piece quiets only (no pawn pushes; pawn pushes are
+	//                 DTZ-zeroing and live under PAWN_PUSHES)
+	//   CONVERSIONS — caps + promotions (piece caps, pawn caps, push-promos)
+	//   PAWN_PUSHES — non-promo pawn pushes (single + double)
+	enum class Move_Kind : uint8_t { ALL, QUIETS, CONVERSIONS, PAWN_PUSHES };
+	template <Move_Kind K>
+	void gen_pseudo_legal(Out_Param<Move_List> out) const;
 
-	// Split variants for the DTC retrograde fast path. The DTC contract treats
-	// captures and promotions as conversion edges (handled via sub-TB probe)
-	// and quiet moves as same-material edges (handled via index lookup), so
-	// callers that need only one side of the split avoid generating the other
-	// and avoid per-move is-conversion classification.
-	//   - quiets: non-capturing, non-promoting moves (single pushes, double
-	//     pushes, knight/sliding/king moves to empty squares). EP not emitted.
-	//   - conversions: captures (including capture-promotions) and promotion
-	//     pushes. EP not emitted here either — EP is overlay-handled.
-	void gen_pseudo_legal_quiets(Out_Param<Move_List> out) const;
-	void gen_pseudo_legal_conversions(Out_Param<Move_List> out) const;
-	// Non-promoting pawn pushes (single + DP). Zeroing moves under DTZ — kept
-	// separate from quiets so same-material retrograde BFS sees only edges
-	// that stay inside one outer pawn-slice.
-	void gen_pseudo_legal_pawn_pushes(Out_Param<Move_List> out) const;
-
-	// Pre-quiet moves: generates moves of the side WHOSE TURN JUST ENDED
-	// (= opp(m_turn)). Move convention follows xiangqi's:
-	//   Move::from() = the piece's CURRENT square in this position
-	//   Move::to()   = a candidate previous (now-empty) square the piece could have come from
-	// Includes king and piece pre-edges only — non-pawn-push, non-promotion,
-	// non-capture. Pawn-push pre-edges are NOT emitted: pawn pushes cross
-	// outer pawn-slice boundaries and are handled by the forward pawn-move
-	// pass in init_entries, not by same-material retrograde.
+	// Pre-edges (inverted: Move::from() = current square, Move::to() = source).
+	// Generates moves of opp(m_turn). IncludePawnPushes=false for DTC
+	// (pawn pushes are DTZ-zeroing, not same-material retrograde edges).
+	template <bool IncludePawnPushes>
 	void gen_pseudo_legal_pre_quiets(Out_Param<Move_List> out) const;
 
 	NODISCARD bool is_pseudo_legal_move_legal(Move m) const;

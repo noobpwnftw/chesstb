@@ -329,9 +329,10 @@ ENUM_ENABLE_OPERATOR_INC(DTM_Score);
 ENUM_ENABLE_OPERATOR_ADD(DTM_Score);
 
 enum DTM_Entry_Flag : uint16_t {
-	DTM_FLAG_WIN    = 0x0800u,
-	DTM_FLAG_LOSS   = 0x1000u,
-	DTM_FLAG_CHANGE = 0x8000u,
+	DTM_FLAG_WIN       = 0x0800u,
+	DTM_FLAG_LOSS      = 0x1000u,
+	DTM_FLAG_PAWN_EVAL = 0x2000u,
+	DTM_FLAG_CHANGE    = 0x4000u,
 };
 
 struct DTM_Intermediate_Entry;
@@ -383,7 +384,8 @@ struct DTM_Final_Entry
 	NODISCARD constexpr bool is_win()     const { return (m_data & DTM_FLAG_WIN)  != 0; }
 	NODISCARD constexpr bool is_loss()    const { return (m_data & DTM_FLAG_LOSS) != 0; }
 	NODISCARD constexpr bool is_draw()    const { return is_legal() && !is_win() && !is_loss() && value() == DTM_SCORE_ZERO; }
-	NODISCARD constexpr bool has_change() const { return (m_data & DTM_FLAG_CHANGE) != 0; }
+	NODISCARD constexpr bool has_change()       const { return (m_data & DTM_FLAG_CHANGE)       != 0; }
+	NODISCARD constexpr bool has_pawn_eval()    const { return (m_data & DTM_FLAG_PAWN_EVAL)    != 0; }
 
 	NODISCARD constexpr WDL_Entry wdl() const
 	{
@@ -448,6 +450,13 @@ struct DTM_Intermediate_Entry
 	constexpr DTM_Intermediate_Entry() : m_data(0) {}
 
 	constexpr explicit DTM_Intermediate_Entry(DTM_Final_Entry f) : m_data(f.m_data) {}
+
+	NODISCARD static constexpr DTM_Intermediate_Entry make_pawn_eval()
+	{
+		DTM_Intermediate_Entry e;
+		e.m_data = DTM_FLAG_PAWN_EVAL;
+		return e;
+	}
 
 	NODISCARD constexpr operator DTM_Final_Entry() const
 	{

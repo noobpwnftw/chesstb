@@ -128,11 +128,10 @@ private:
 		MARK_WIN_PREDS,
 		MARK_CHANGED,
 		CHANGE_REVERIFY,
-		// Pawnful-only: forward pawn-move eval at this cell, since
-		// gen_pseudo_legal_pre_quiets omits pawn pushes and the reverse-mark
-		// pipeline can't propagate dtm through them. Fires for any Intermediate
-		// without CHANGE (LOSS-verify candidates) or stale WIN(value > ply)
-		// (improvement candidates). Folded with CHANGE_REVERIFY in run_iter.
+		// Forward-read fallback for retro-blind edges: cap/promo (sub-tb is
+		// static) and pawn pushes (post-push child lives in an already-built,
+		// non-iterating slice). Also fires for stale WIN(value > ply) so a
+		// faster pawn-push mate can improve. Folded with CHANGE_REVERIFY.
 		PAWN_EVAL,
 	};
 

@@ -112,225 +112,115 @@ INLINE void add_pawn_moves_with_promos(Out_Param<Move_List> out, Square from, Sq
 
 }  // namespace
 
-void Position::gen_pseudo_legal_moves(Out_Param<Move_List> out) const
+template <Position::Move_Kind K>
+void Position::gen_pseudo_legal(Out_Param<Move_List> out) const
 {
 	out->clear();
 	const Color me = m_turn;
 	const Color opp = color_opp(me);
-	const Bitboard occ = m_occupied;
-	const Bitboard own = m_pieces[piece_occupy(me)];
-	const Bitboard opp_bb = m_pieces[piece_occupy(opp)];
-	const Bitboard not_own = ~own;
-
-	// Knights.
-	{
-		Bitboard b = m_pieces[piece_make(me, KNIGHT)];
-		while (b)
-		{
-			const Square from = b.pop_first_square();
-			Bitboard moves = knight_attacks(from) & not_own;
-			while (moves)
-				out->add(Move::make_quiet(from, moves.pop_first_square()));
-		}
-	}
-
-	// Bishops, rooks, queens.
-	for (Piece_Type pt : { BISHOP, ROOK, QUEEN })
-	{
-		Bitboard b = m_pieces[piece_make(me, pt)];
-		while (b)
-		{
-			const Square from = b.pop_first_square();
-			Bitboard moves =
-				(pt == BISHOP ? bishop_attacks(from, occ)
-				 : pt == ROOK ? rook_attacks(from, occ)
-				 :              queen_attacks(from, occ));
-			moves &= not_own;
-			while (moves)
-				out->add(Move::make_quiet(from, moves.pop_first_square()));
-		}
-	}
-
-	// King.
-	{
-		const Square from = king_square(me);
-		Bitboard moves = king_attacks(from) & not_own;
-		while (moves)
-			out->add(Move::make_quiet(from, moves.pop_first_square()));
-	}
-
-	// Pawns. Pushes, double-pushes, captures, promotions.
-	{
-		Bitboard b = m_pieces[piece_make(me, PAWN)];
-		while (b)
-		{
-			const Square from = b.pop_first_square();
-			// Single push.
-			Bitboard push = pawn_pushes(me, from) & ~occ;
-			if (push)
-			{
-				const Square to = push.peek_first_square();
-				add_pawn_moves_with_promos(out, from, to, me);
-				// Double push: legal only if the single-push square was also empty.
-				Bitboard dp = pawn_double_pushes(me, from) & ~occ;
-				if (dp)
-					out->add(Move::make_quiet(from, dp.peek_first_square()));
-			}
-			// Captures.
-			Bitboard caps = pawn_attacks(me, from) & opp_bb;
-			while (caps)
-			{
-				const Square to = caps.pop_first_square();
-				add_pawn_moves_with_promos(out, from, to, me);
-			}
-		}
-	}
-
-	// EP captures are NOT generated here. The DTC/WDL table is keyed by
-	// (placement, stm) only — no EP dimension. EP is a transient overlay
-	// handled at retrograde write sites via effective_opp_wdl_after_dp.
-}
-
-void Position::gen_pseudo_legal_quiets(Out_Param<Move_List> out) const
-{
-	out->clear();
-	const Color me = m_turn;
 	const Bitboard occ = m_occupied;
 	const Bitboard empty = ~occ;
-
-	{
-		Bitboard b = m_pieces[piece_make(me, KNIGHT)];
-		while (b)
-		{
-			const Square from = b.pop_first_square();
-			Bitboard moves = knight_attacks(from) & empty;
-			while (moves)
-				out->add(Move::make_quiet(from, moves.pop_first_square()));
-		}
-	}
-
-	for (Piece_Type pt : { BISHOP, ROOK, QUEEN })
-	{
-		Bitboard b = m_pieces[piece_make(me, pt)];
-		while (b)
-		{
-			const Square from = b.pop_first_square();
-			Bitboard moves =
-				(pt == BISHOP ? bishop_attacks(from, occ)
-				 : pt == ROOK ? rook_attacks(from, occ)
-				 :              queen_attacks(from, occ));
-			moves &= empty;
-			while (moves)
-				out->add(Move::make_quiet(from, moves.pop_first_square()));
-		}
-	}
-
-	{
-		const Square from = king_square(me);
-		Bitboard moves = king_attacks(from) & empty;
-		while (moves)
-			out->add(Move::make_quiet(from, moves.pop_first_square()));
-	}
-
-	// Non-promoting pawn pushes are NOT emitted here. Under DTZ semantics
-	// they are zeroing moves: they live in their own forward pass
-	// (gen_pseudo_legal_pawn_pushes) which init_entries consults, and they
-	// never participate in same-material retrograde BFS.
-}
-
-void Position::gen_pseudo_legal_pawn_pushes(Out_Param<Move_List> out) const
-{
-	out->clear();
-	const Color me = m_turn;
-	const Bitboard occ = m_occupied;
-	const Rank promo_rank = (me == WHITE) ? RANK_8 : RANK_1;
-	Bitboard b = m_pieces[piece_make(me, PAWN)];
-	while (b)
-	{
-		const Square from = b.pop_first_square();
-		Bitboard push = pawn_pushes(me, from) & ~occ;
-		if (!push) continue;
-		const Square to = push.peek_first_square();
-		if (sq_rank(to) == promo_rank) continue;  // promotion → conversion, see gen_pseudo_legal_conversions
-		out->add(Move::make_quiet(from, to));
-		Bitboard dp = pawn_double_pushes(me, from) & ~occ;
-		if (dp)
-			out->add(Move::make_quiet(from, dp.peek_first_square()));
-	}
-}
-
-void Position::gen_pseudo_legal_conversions(Out_Param<Move_List> out) const
-{
-	out->clear();
-	const Color me = m_turn;
-	const Color opp = color_opp(me);
-	const Bitboard occ = m_occupied;
 	const Bitboard opp_bb = m_pieces[piece_occupy(opp)];
 
+	// Knight / sliding / king (skip for PAWN_PUSHES; target depends on kind).
+	if constexpr (K != Move_Kind::PAWN_PUSHES)
 	{
-		Bitboard b = m_pieces[piece_make(me, KNIGHT)];
-		while (b)
+		const Bitboard target =
+			(K == Move_Kind::ALL)         ? ~m_pieces[piece_occupy(me)] :
+			(K == Move_Kind::QUIETS)      ? empty :
+			/* CONVERSIONS */                opp_bb;
+
+		Bitboard knights = m_pieces[piece_make(me, KNIGHT)];
+		while (knights)
 		{
-			const Square from = b.pop_first_square();
-			Bitboard caps = knight_attacks(from) & opp_bb;
-			while (caps)
-				out->add(Move::make_quiet(from, caps.pop_first_square()));
+			const Square from = knights.pop_first_square();
+			Bitboard moves = knight_attacks(from) & target;
+			while (moves)
+				out->add(Move::make_quiet(from, moves.pop_first_square()));
 		}
-	}
 
-	for (Piece_Type pt : { BISHOP, ROOK, QUEEN })
-	{
-		Bitboard b = m_pieces[piece_make(me, pt)];
-		while (b)
+		for (Piece_Type pt : { BISHOP, ROOK, QUEEN })
 		{
-			const Square from = b.pop_first_square();
-			Bitboard caps =
-				(pt == BISHOP ? bishop_attacks(from, occ)
-				 : pt == ROOK ? rook_attacks(from, occ)
-				 :              queen_attacks(from, occ));
-			caps &= opp_bb;
-			while (caps)
-				out->add(Move::make_quiet(from, caps.pop_first_square()));
+			Bitboard b = m_pieces[piece_make(me, pt)];
+			while (b)
+			{
+				const Square from = b.pop_first_square();
+				Bitboard moves =
+					(pt == BISHOP ? bishop_attacks(from, occ)
+					 : pt == ROOK ? rook_attacks(from, occ)
+					 :              queen_attacks(from, occ));
+				moves &= target;
+				while (moves)
+					out->add(Move::make_quiet(from, moves.pop_first_square()));
+			}
 		}
+
+		const Square ksq = king_square(me);
+		Bitboard kmoves = king_attacks(ksq) & target;
+		while (kmoves)
+			out->add(Move::make_quiet(ksq, kmoves.pop_first_square()));
 	}
 
-	{
-		const Square from = king_square(me);
-		Bitboard caps = king_attacks(from) & opp_bb;
-		while (caps)
-			out->add(Move::make_quiet(from, caps.pop_first_square()));
-	}
-
+	// Pawns (skip for QUIETS; pushes / push-promos / caps gated by kind).
+	if constexpr (K != Move_Kind::QUIETS)
 	{
 		const Rank promo_rank = (me == WHITE) ? RANK_8 : RANK_1;
-		Bitboard b = m_pieces[piece_make(me, PAWN)];
-		while (b)
+		Bitboard pawns = m_pieces[piece_make(me, PAWN)];
+		while (pawns)
 		{
-			const Square from = b.pop_first_square();
+			const Square from = pawns.pop_first_square();
+
 			Bitboard push = pawn_pushes(me, from) & ~occ;
 			if (push)
 			{
 				const Square to = push.peek_first_square();
-				if (sq_rank(to) == promo_rank)
+				const bool is_promo = sq_rank(to) == promo_rank;
+				if constexpr (K == Move_Kind::ALL)
+				{
 					add_pawn_moves_with_promos(out, from, to, me);
-				// Non-promo pushes are same-material → emitted by quiets, not here.
+					if (!is_promo)
+					{
+						Bitboard dp = pawn_double_pushes(me, from) & ~occ;
+						if (dp) out->add(Move::make_quiet(from, dp.peek_first_square()));
+					}
+				}
+				else if constexpr (K == Move_Kind::CONVERSIONS)
+				{
+					if (is_promo) add_pawn_moves_with_promos(out, from, to, me);
+				}
+				else if constexpr (K == Move_Kind::PAWN_PUSHES)
+				{
+					if (!is_promo)
+					{
+						out->add(Move::make_quiet(from, to));
+						Bitboard dp = pawn_double_pushes(me, from) & ~occ;
+						if (dp) out->add(Move::make_quiet(from, dp.peek_first_square()));
+					}
+				}
 			}
-			Bitboard caps = pawn_attacks(me, from) & opp_bb;
-			while (caps)
+
+			if constexpr (K == Move_Kind::ALL || K == Move_Kind::CONVERSIONS)
 			{
-				const Square to = caps.pop_first_square();
-				add_pawn_moves_with_promos(out, from, to, me);
+				Bitboard caps = pawn_attacks(me, from) & opp_bb;
+				while (caps)
+				{
+					const Square to = caps.pop_first_square();
+					add_pawn_moves_with_promos(out, from, to, me);
+				}
 			}
 		}
 	}
 }
 
+template void Position::gen_pseudo_legal<Position::Move_Kind::ALL>(Out_Param<Move_List>) const;
+template void Position::gen_pseudo_legal<Position::Move_Kind::QUIETS>(Out_Param<Move_List>) const;
+template void Position::gen_pseudo_legal<Position::Move_Kind::CONVERSIONS>(Out_Param<Move_List>) const;
+template void Position::gen_pseudo_legal<Position::Move_Kind::PAWN_PUSHES>(Out_Param<Move_List>) const;
+
+template <bool IncludePawnPushes>
 void Position::gen_pseudo_legal_pre_quiets(Out_Param<Move_List> out) const
 {
-	// We enumerate the moves of the side that *just moved*, i.e. opp(m_turn).
-	// Move convention: Move::from() = piece's CURRENT square, Move::to() = an
-	// empty square the piece could have come from. This is the inverted shape
-	// used by retrograde predecessor enumeration (per xiangqi's design).
+	// Inverted moves of opp(m_turn): from=current, to=where-they-came-from.
 	out->clear();
 	const Color mover = color_opp(m_turn);
 	const Bitboard occ = m_occupied;
@@ -373,10 +263,52 @@ void Position::gen_pseudo_legal_pre_quiets(Out_Param<Move_List> out) const
 			out->add(Move::make_quiet(from_cur, candidates.pop_first_square()));
 	}
 
-	// Pawn-push pre-edges are NOT emitted here. Pawn pushes are zeroing
-	// (cross-slice in DTZ semantics) and handled by the dedicated forward
-	// pass in init_entries — never as retrograde predecessor edges.
+	if constexpr (IncludePawnPushes)
+	{
+		Bitboard pawns = m_pieces[piece_make(mover, PAWN)];
+		while (pawns)
+		{
+			const Square from_cur = pawns.pop_first_square();
+			const Rank r = sq_rank(from_cur);
+			const File f = sq_file(from_cur);
+			if (mover == WHITE)
+			{
+				if (r >= RANK_3)
+				{
+					const Square prev1 = sq_make(static_cast<Rank>(r - 1), f);
+					if (empty & square_bb(prev1))
+						out->add(Move::make_quiet(from_cur, prev1));
+				}
+				if (r == RANK_4)
+				{
+					const Square inter = sq_make(RANK_3, f);
+					const Square prev2 = sq_make(RANK_2, f);
+					if ((empty & square_bb(inter)) && (empty & square_bb(prev2)))
+						out->add(Move::make_quiet(from_cur, prev2));
+				}
+			}
+			else
+			{
+				if (r <= RANK_6)
+				{
+					const Square prev1 = sq_make(static_cast<Rank>(r + 1), f);
+					if (empty & square_bb(prev1))
+						out->add(Move::make_quiet(from_cur, prev1));
+				}
+				if (r == RANK_5)
+				{
+					const Square inter = sq_make(RANK_6, f);
+					const Square prev2 = sq_make(RANK_7, f);
+					if ((empty & square_bb(inter)) && (empty & square_bb(prev2)))
+						out->add(Move::make_quiet(from_cur, prev2));
+				}
+			}
+		}
+	}
 }
+
+template void Position::gen_pseudo_legal_pre_quiets<false>(Out_Param<Move_List>) const;
+template void Position::gen_pseudo_legal_pre_quiets<true>(Out_Param<Move_List>) const;
 
 bool Position::is_pseudo_legal_move_legal(Move m) const
 {

@@ -241,7 +241,7 @@ DTC_Any_Entry DTC_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 	};
 
 	Move_List ml;
-	pos.gen_pseudo_legal_moves(out_param(ml));
+	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
 	bool any_legal = false;
 	bool any_quiet_legal = false;
 	Value best = ValueNone;
@@ -560,7 +560,7 @@ DTC_Generator::Loss_Verification_Result DTC_Generator::check_loss(
 	const bool cursed_phase = (phase == Iter_Phase::CURSED);
 	Position& pos = pos_gen.board_unchecked();
 	const Color opp = color_opp(pos.turn());
-	pos.gen_pseudo_legal_moves(out_param(ml));
+	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
 
 	Loss_Verification_Result r;
 	bool any_legal = false;
@@ -640,7 +640,7 @@ void DTC_Generator::retro_mark_win_in_1(Position_For_Gen& pos_gen,
                                         Move_List& ml, Color stm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<false>(out_param(ml));
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
@@ -655,7 +655,7 @@ void DTC_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
                                        Move_List& ml, Color stm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<false>(out_param(ml));
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
@@ -674,7 +674,7 @@ void DTC_Generator::retro_mark_wins(Position_For_Gen& pos_gen,
                                     uint16_t target_dtz, bool cursed)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<false>(out_param(ml));
 	DTC_Final_Entry new_e = DTC_Final_Entry::make_win(target_dtz);
 	if (cursed) new_e = new_e.with_cap_cwin();
 	for (size_t i = 0; i < ml.size(); ++i)
