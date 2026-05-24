@@ -111,19 +111,20 @@ static bool compare_material(const char* name)
 	Probe_Tables tables;
 	tables.add_wdl_path("./wdl/");
 	tables.add_dtc_path("./dtc/");
-	auto shards = global_pool().run_sync_task_on_all_threads(
-		[&](size_t tid) -> Shard {
-			const size_t W = global_pool().num_workers();
-			const size_t lo = (N * tid) / W;
-			const size_t hi = (N * (tid + 1)) / W;
-			Shard s;
-			for (Color stm : { WHITE, BLACK })
-			{
-				if (symmetric && stm == BLACK) break;
-				for (size_t i = lo; i < hi; ++i)
-				{
-					const Board_Index idx = Board_Index(i);
 
+	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
+	Shared_Board_Index_Iterator iter(
+		BOARD_INDEX_ZERO, static_cast<Board_Index>(N), CHUNK_SIZE);
+
+	auto shards = global_pool().run_sync_task_on_all_threads(
+		[&](size_t) -> Shard {
+			Shard s;
+			for (const Board_Index idx : iter.indices())
+			{
+				const size_t i = static_cast<size_t>(idx);
+				for (Color stm : { WHITE, BLACK })
+				{
+					if (symmetric && stm == BLACK) break;
 					Position_For_Gen pfg(epsi, idx, stm);
 					if (!pfg.is_legal(
 					        Position_For_Gen::Legality_Lower_Bound::CHESS_LEGAL))

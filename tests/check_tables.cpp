@@ -144,19 +144,20 @@ bool check_material(const Options& opt, const std::string& name)
 	tables.add_dtc_path(opt.dtc_dir);
 	tables.add_dtm_path(opt.dtm_dir);
 
+	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
+	Shared_Board_Index_Iterator iter(
+		BOARD_INDEX_ZERO, static_cast<Board_Index>(N), CHUNK_SIZE);
+
 	auto shards = global_pool().run_sync_task_on_all_threads(
-		[&](size_t tid) -> Shard
+		[&](size_t) -> Shard
 	{
-		const size_t W = global_pool().num_workers();
-		const size_t lo = (N * tid) / W;
-		const size_t hi = (N * (tid + 1)) / W;
 		Shard s;
-		for (Color stm : { WHITE, BLACK })
+		for (const Board_Index idx : iter.indices())
 		{
-			if (symmetric && stm == BLACK) break;
-			for (size_t i = lo; i < hi; ++i)
+			const size_t i = static_cast<size_t>(idx);
+			for (Color stm : { WHITE, BLACK })
 			{
-				const Board_Index idx = static_cast<Board_Index>(i);
+				if (symmetric && stm == BLACK) break;
 				Position_For_Gen pfg(epsi, idx, stm);
 				if (!pfg.is_legal(Position_For_Gen::Legality_Lower_Bound::CHESS_LEGAL))
 					continue;
