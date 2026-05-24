@@ -843,9 +843,7 @@ void add_ep_moves(const Position& pos, Square ep_square, Move_List& ml)
 		const Square cap_sq = sq_make(pawn_rank, target_file);
 		if (pos.piece_at(cap_sq) != piece_make(color_opp(me), PAWN)) continue;
 
-		const Move ep_move = Move::make_ep_capture(from, ep_square);
-		if (pos.is_pseudo_legal_move_legal(ep_move))
-			ml.add(ep_move);
+		ml.add(Move::make_ep_capture(from, ep_square));
 	}
 }
 
@@ -1139,7 +1137,7 @@ WDL_Entry Probe_Tables::Impl::derive_wdl(const Piece_Config& ps, const Position&
 	if (depth >= MAX_DERIVE_DEPTH) return WDL_Entry::ILLEGAL;
 
 	Move_List ml;
-	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 
 	bool any_legal = false;
 	bool have_candidate = false;
@@ -1172,7 +1170,7 @@ DTC_Final_Entry Probe_Tables::Impl::derive_dtc(const Piece_Config& ps, const Pos
 	if (depth >= MAX_DERIVE_DEPTH) return DTC_Final_Entry::make_illegal();
 
 	Move_List ml;
-	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 
 	bool any_legal = false;
 	bool have_candidate = false;
@@ -1231,7 +1229,7 @@ DTM_Final_Entry Probe_Tables::Impl::derive_dtm(const Piece_Config& ps, const Pos
 	if (depth >= MAX_DERIVE_DEPTH) return DTM_Final_Entry::make_illegal();
 
 	Move_List ml;
-	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 
 	bool any_legal = false;
 	bool have_candidate = false;
@@ -1343,6 +1341,7 @@ Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
 
 	for (size_t i = 0; i < eps.size(); ++i)
 	{
+		if (!root.is_pseudo_legal_move_legal(eps[i])) continue;
 		Child_Pos child = make_child(root, eps[i]);
 		Probe_Result cr;
 		if (child.is_kk)
@@ -1567,7 +1566,7 @@ std::vector<Root_Move> Probe_Tables::probe_root_dtz(
 	const Position& probe_pos = root.pos;
 
 	Move_List ml;
-	probe_pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	probe_pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 	add_ep_moves(probe_pos, root.ep_square, ml);
 
 	const int bound = use_rule50 ? 900 : 1;
@@ -1610,7 +1609,7 @@ std::vector<Root_Move> Probe_Tables::probe_root_dtz(
 		if (v == 2 && c.pos.is_in_check())
 		{
 			Move_List cml;
-			c.pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(cml));
+			c.pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(cml));
 			bool any = false;
 			for (size_t j = 0; j < cml.size(); ++j)
 				if (c.pos.is_pseudo_legal_move_legal(cml[j])) { any = true; break; }
@@ -1656,7 +1655,7 @@ std::vector<Root_Move> Probe_Tables::probe_root_wdl(
 	const Position& probe_pos = root.pos;
 
 	Move_List ml;
-	probe_pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	probe_pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 	add_ep_moves(probe_pos, root.ep_square, ml);
 
 	for (size_t i = 0; i < ml.size(); ++i)

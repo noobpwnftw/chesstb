@@ -69,7 +69,7 @@ bool position_is_checkmate(const Position& pos)
 	if (!pos.is_in_check()) return false;
 	Position copy = pos;
 	Move_List ml;
-	copy.gen_pseudo_legal_moves(out_param(ml));
+	copy.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 	for (size_t i = 0; i < ml.size(); ++i)
 		if (copy.is_pseudo_legal_move_legal(ml[i])) return false;
 	return true;

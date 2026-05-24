@@ -226,7 +226,7 @@ Child_DTM effective_child_dtm_after_move(Probe_Tables& tables, const Position& p
 DTM_Derived derive_dtm_from_children(Probe_Tables& tables, const Position& pos)
 {
 	Move_List ml;
-	pos.gen_pseudo_legal_moves(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 
 	bool any_legal = false;
 	bool have = false;
@@ -326,7 +326,7 @@ Child_DTC effective_child_dtc_after_move(Probe_Tables& tables, const Position& p
 DTC_Derived derive_dtc_from_children(Probe_Tables& tables, const Position& pos)
 {
 	Move_List ml;
-	pos.gen_pseudo_legal_moves(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 
 	bool any_legal = false;
 	bool have = false;

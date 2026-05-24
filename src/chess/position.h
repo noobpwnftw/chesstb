@@ -106,7 +106,7 @@ struct Position
 	//   PAWN_PUSHES — non-promo pawn pushes (single + double) only
 	enum class Move_Kind : uint8_t { ALL, PAWN_PUSHES };
 	template <Move_Kind K>
-	void gen_pseudo_legal(Out_Param<Move_List> out) const;
+	void gen_pseudo_legal_moves(Out_Param<Move_List> out) const;
 
 	// Pre-edges (inverted: Move::from() = current square, Move::to() = source).
 	// Generates moves of opp(m_turn). IncludePawnPushes=false for DTC

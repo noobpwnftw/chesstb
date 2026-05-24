@@ -251,7 +251,7 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 	bool saw_draw = false;
 
 	Move_List ml;
-	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 	bool any_legal = false;
 	bool any_in_material = false;
 	bool any_pawn_eval = false;
@@ -503,7 +503,7 @@ DTM_Generator::Loss_Verification_Result DTM_Generator::check_loss(
 {
 	Position& pos = pos_gen.board_unchecked();
 	const Color opp = color_opp(pos.turn());
-	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 
 	Loss_Verification_Result r;
 	bool any_legal = false;
@@ -704,7 +704,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 						if (has_pawns)
 						{
 							Position& pos = pos_gen.board();
-							pos.gen_pseudo_legal<Position::Move_Kind::PAWN_PUSHES>(out_param(ml));
+							pos.gen_pseudo_legal_moves<Position::Move_Kind::PAWN_PUSHES>(out_param(ml));
 							for (size_t i = 0; i < ml.size(); ++i)
 							{
 								const Move m = ml[i];

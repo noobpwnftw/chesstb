@@ -113,7 +113,7 @@ INLINE void add_pawn_moves_with_promos(Out_Param<Move_List> out, Square from, Sq
 }  // namespace
 
 template <Position::Move_Kind K>
-void Position::gen_pseudo_legal(Out_Param<Move_List> out) const
+void Position::gen_pseudo_legal_moves(Out_Param<Move_List> out) const
 {
 	out->clear();
 	const Color me = m_turn;
@@ -188,8 +188,8 @@ void Position::gen_pseudo_legal(Out_Param<Move_List> out) const
 	}
 }
 
-template void Position::gen_pseudo_legal<Position::Move_Kind::ALL>(Out_Param<Move_List>) const;
-template void Position::gen_pseudo_legal<Position::Move_Kind::PAWN_PUSHES>(Out_Param<Move_List>) const;
+template void Position::gen_pseudo_legal_moves<Position::Move_Kind::ALL>(Out_Param<Move_List>) const;
+template void Position::gen_pseudo_legal_moves<Position::Move_Kind::PAWN_PUSHES>(Out_Param<Move_List>) const;
 
 template <bool IncludePawnPushes>
 void Position::gen_pseudo_legal_pre_quiets(Out_Param<Move_List> out) const

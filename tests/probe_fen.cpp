@@ -161,57 +161,47 @@ void print_probe_result(const Probe_Result& r, const char* prefix)
 	std::printf("\n");
 }
 
-// Display-only; Probe_Tables applies the en-passant overlay.
-size_t count_legal_ep_moves(const Position& pos, Square ep_square)
+// Local copy of probe.cpp's same-named helper.
+void add_ep_moves(const Position& pos, Square ep_square, Move_List& ml)
 {
-	if (ep_square == SQ_END) return 0;
+	if (ep_square == SQ_END) return;
 	const Color me = pos.turn();
 	const Rank target_rank = (me == WHITE) ? RANK_6 : RANK_3;
 	const Rank pawn_rank   = (me == WHITE) ? RANK_5 : RANK_4;
-	if (sq_rank(ep_square) != target_rank) return 0;
+	if (sq_rank(ep_square) != target_rank) return;
+
 	const File target_file = sq_file(ep_square);
-	size_t n = 0;
 	for (int df : { -1, +1 })
 	{
 		const int f = static_cast<int>(target_file) + df;
 		if (f < 0 || f >= 8) continue;
 		const Square from = sq_make(pawn_rank, static_cast<File>(f));
 		if (pos.piece_at(from) != piece_make(me, PAWN)) continue;
+
 		const Square cap_sq = sq_make(pawn_rank, target_file);
 		if (pos.piece_at(cap_sq) != piece_make(color_opp(me), PAWN)) continue;
-		const Move ep_move = Move::make_ep_capture(from, ep_square);
-		if (pos.is_pseudo_legal_move_legal(ep_move)) ++n;
+
+		ml.add(Move::make_ep_capture(from, ep_square));
 	}
+}
+
+// Display-only; Probe_Tables applies the en-passant overlay.
+size_t count_legal_ep_moves(const Position& pos, Square ep_square)
+{
+	Move_List ml;
+	add_ep_moves(pos, ep_square, ml);
+	size_t n = 0;
+	for (size_t i = 0; i < ml.size(); ++i)
+		if (pos.is_pseudo_legal_move_legal(ml[i])) ++n;
 	return n;
 }
 
 void dump_children(const Options& opt, Probe_Tables* tables,
                    const Position& root, const Piece_Config& root_ps, Square ep_square)
 {
-	// gen_pseudo_legal_moves does not emit en-passant moves.
 	Move_List ml;
-	root.gen_pseudo_legal_moves(out_param(ml));
-	if (ep_square != SQ_END)
-	{
-		const Color me = root.turn();
-		const Rank target_rank = (me == WHITE) ? RANK_6 : RANK_3;
-		const Rank pawn_rank   = (me == WHITE) ? RANK_5 : RANK_4;
-		if (sq_rank(ep_square) == target_rank)
-		{
-			const File target_file = sq_file(ep_square);
-			for (int df : { -1, +1 })
-			{
-				const int f = static_cast<int>(target_file) + df;
-				if (f < 0 || f >= 8) continue;
-				const Square from = sq_make(pawn_rank, static_cast<File>(f));
-				if (root.piece_at(from) != piece_make(me, PAWN)) continue;
-				const Square cap_sq = sq_make(pawn_rank, target_file);
-				if (root.piece_at(cap_sq) != piece_make(color_opp(me), PAWN)) continue;
-				const Move ep_move = Move::make_ep_capture(from, ep_square);
-				if (root.is_pseudo_legal_move_legal(ep_move)) ml.add(ep_move);
-			}
-		}
-	}
+	root.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
+	add_ep_moves(root, ep_square, ml);
 
 	size_t printed = 0;
 	for (size_t i = 0; i < ml.size(); ++i)

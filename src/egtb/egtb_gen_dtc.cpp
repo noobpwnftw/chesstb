@@ -241,7 +241,7 @@ DTC_Any_Entry DTC_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 	};
 
 	Move_List ml;
-	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 	bool any_legal = false;
 	bool any_quiet_legal = false;
 	Value best = ValueNone;
@@ -560,7 +560,7 @@ DTC_Generator::Loss_Verification_Result DTC_Generator::check_loss(
 	const bool cursed_phase = (phase == Iter_Phase::CURSED);
 	Position& pos = pos_gen.board_unchecked();
 	const Color opp = color_opp(pos.turn());
-	pos.gen_pseudo_legal<Position::Move_Kind::ALL>(out_param(ml));
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 
 	Loss_Verification_Result r;
 	bool any_legal = false;
