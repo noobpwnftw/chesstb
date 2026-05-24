@@ -11,6 +11,7 @@
 
 #include "util/defines.h"
 #include "util/math.h"
+#include "util/progress_bar.h"
 #include "util/utility.h"
 
 #include <algorithm>
@@ -349,6 +350,18 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 		apply_working_set(thread_pool, &m_table->m_dtm[WHITE], &m_table->m_dtm[BLACK], m_scratch_need[WHITE], m_scratch_need[BLACK]);
 	};
 
+	const size_t wss = m_epsi.within_slice_size();
+	size_t total_indices = 0;
+	for (size_t g : m_pair_group_ids)
+	{
+		const size_t g_start_slice = g * spg;
+		const size_t g_end_slice = std::min(g_start_slice + spg, ntotal);
+		total_indices += (g_end_slice - g_start_slice) * wss;
+	}
+
+	const size_t PRINT_PERIOD = thread_pool->num_workers() * (1 << 20);
+	Concurrent_Progress_Bar progress_bar(total_indices, PRINT_PERIOD, "init_entries");
+
 	uint16_t max_init = 0;
 	for (size_t g : m_pair_group_ids)
 	{
@@ -356,12 +369,16 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 		Shared_Board_Index_Iterator group_it = make_slice_group_iterator(g, spg);
 
 		const auto rets = thread_pool->run_sync_task_on_all_threads([&](size_t tid) -> uint16_t {
+			constexpr size_t PROGRESS_BAR_UPDATE_PERIOD = 64 * 64;
 			Position_For_Gen pos_gen(m_epsi, BOARD_INDEX_ZERO, WHITE);
 			Board_Index prev = BOARD_INDEX_NONE;
 			uint16_t local_max = 0;
+			size_t local_progress = 0;
 			const auto& slice_has_stab = m_epsi.slice_manager().slice_has_stabilizer;
 			for (const Board_Index idx : group_it.indices())
 			{
+				if (++local_progress % PROGRESS_BAR_UPDATE_PERIOD == 0)
+					progress_bar += PROGRESS_BAR_UPDATE_PERIOD;
 				const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
 				if (!pid_in_pair[pid_of_idx])
 				{
@@ -422,6 +439,9 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 		});
 		for (uint16_t v : rets) if (v > max_init) max_init = v;
 	}
+
+	progress_bar.set_finished();
+
 	return max_init;
 }
 
