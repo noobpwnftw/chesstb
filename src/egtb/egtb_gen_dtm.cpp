@@ -711,10 +711,8 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 						break;
 					}
 					write_dtm(idx, stm, DTM_Final_Entry::make_loss(res.loss_dtm));
-					bump(res.loss_dtm);
-					const uint16_t target = static_cast<uint16_t>(res.loss_dtm + 1);
-					(void)retro_mark_wins(pos_gen, ml, stm, target);
-					bump(target);
+					bump(res.loss_dtm + 1);
+					(void)retro_mark_wins(pos_gen, ml, stm, res.loss_dtm + 1);
 					local.wrote = true;
 					break;
 				}
