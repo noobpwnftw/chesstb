@@ -33,31 +33,22 @@ namespace {
 // Enough slots to avoid thrashing during derive_dropped child probes.
 constexpr size_t BLOCK_CACHE_SLOTS = 32;
 
-// Globally-unique id stamped onto each Per_Color at construction. Used by the
-// per-thread last-block cache below so that heap-address reuse (e.g. when a
-// Probe_Tables instance is destroyed and the next one reuses the same memory)
-// does not produce a spurious cache hit pointing at a destroyed object.
+// Identifies a Per_Color across heap-address reuse for the TL cache key.
 inline uint64_t next_probe_epoch()
 {
 	static std::atomic<uint64_t> ctr{0};
 	return ctr.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-// Decoded blocks are reference-counted so the shared cache can hand them out
-// without bulk-copying the bytes into per-thread storage. Once published, a
-// Block is immutable; eviction from the shared cache just drops the
-// shared_ptr — any thread still holding a copy keeps the bytes alive.
 using Block_Ptr = std::shared_ptr<const std::vector<uint8_t>>;
 
-// Per-thread last-block cache for Probe_File::read(). Workers iterate
-// Board_Indexes sequentially, so consecutive probes hit the same decoded
-// block; serving them from a thread-local handle to the shared block avoids
-// both the mutex and the bulk memcpy that would otherwise dominate misses.
-struct TL_Block_Slot
+struct TL_Block_FIFO
 {
-	uint64_t  epoch    = 0;          // 0 means empty; Per_Color::epoch is always > 0
-	size_t    block_id = SIZE_MAX;
-	Block_Ptr bytes;
+	static constexpr size_t N = 8;   // power of two
+	uint64_t  epoch[N]    = {};
+	size_t    block_id[N] = {};
+	Block_Ptr bytes[N];
+	size_t    next = 0;
 };
 
 // File-format constants shared with egtb_compress.cpp.
@@ -321,16 +312,23 @@ WDL_Entry WDL_Probe_File::read(Color c, Board_Index pos)
 	if (pc.index[block_id].comp_size == 0)
 		return WDL_Entry::ILLEGAL;
 
-	thread_local TL_Block_Slot tl;
-	if (tl.epoch != pc.epoch || tl.block_id != block_id)
+	thread_local TL_Block_FIFO tl;
+	const uint8_t* data = nullptr;
+	for (size_t i = 0; i < TL_Block_FIFO::N; ++i)
+		if (tl.epoch[i] == pc.epoch && tl.block_id[i] == block_id)
+			{ data = tl.bytes[i]->data(); break; }
+	if (!data)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
-		tl.bytes = get_block_locked(pc, block_id);
-		tl.epoch = pc.epoch;
-		tl.block_id = block_id;
+		Block_Ptr blk = get_block_locked(pc, block_id);
+		const size_t s = (tl.next++) & (TL_Block_FIFO::N - 1);
+		tl.epoch[s]    = pc.epoch;
+		tl.block_id[s] = block_id;
+		tl.bytes[s]    = blk;
+		data = blk->data();
 	}
 	Packed_WDL_Entries entry;
-	std::memcpy(&entry, tl.bytes->data() + in_block, sizeof(entry));
+	std::memcpy(&entry, data + in_block, sizeof(entry));
 	return get_wdl_value(entry, static_cast<size_t>(pos) % WDL_ENTRY_PACK_RATIO);
 }
 
@@ -521,16 +519,23 @@ DTC_Final_Entry DTC_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	if ((dso & 0xFFFFF) == 0)
 		return DTC_Final_Entry::make_illegal();
 
-	thread_local TL_Block_Slot tl;
-	if (tl.epoch != pc.epoch || tl.block_id != block_id)
+	thread_local TL_Block_FIFO tl;
+	const uint8_t* data = nullptr;
+	for (size_t i = 0; i < TL_Block_FIFO::N; ++i)
+		if (tl.epoch[i] == pc.epoch && tl.block_id[i] == block_id)
+			{ data = tl.bytes[i]->data(); break; }
+	if (!data)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
-		tl.bytes = get_block_locked(pc, block_id);
-		tl.epoch = pc.epoch;
-		tl.block_id = block_id;
+		Block_Ptr blk = get_block_locked(pc, block_id);
+		const size_t s = (tl.next++) & (TL_Block_FIFO::N - 1);
+		tl.epoch[s]    = pc.epoch;
+		tl.block_id[s] = block_id;
+		tl.bytes[s]    = blk;
+		data = blk->data();
 	}
 	DTC_Final_Entry stored;
-	std::memcpy(&stored, tl.bytes->data() + in_block_pos * sizeof(uint16_t), sizeof(stored));
+	std::memcpy(&stored, data + in_block_pos * sizeof(uint16_t), sizeof(stored));
 	return dtc_entry_from_storage(stored, wdl, pc.entry_bytes);
 }
 
@@ -722,16 +727,23 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	if ((dso & 0xFFFFF) == 0)
 		return DTM_Final_Entry::make_illegal();
 
-	thread_local TL_Block_Slot tl;
-	if (tl.epoch != pc.epoch || tl.block_id != block_id)
+	thread_local TL_Block_FIFO tl;
+	const uint8_t* data = nullptr;
+	for (size_t i = 0; i < TL_Block_FIFO::N; ++i)
+		if (tl.epoch[i] == pc.epoch && tl.block_id[i] == block_id)
+			{ data = tl.bytes[i]->data(); break; }
+	if (!data)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
-		tl.bytes = get_block_locked(pc, block_id);
-		tl.epoch = pc.epoch;
-		tl.block_id = block_id;
+		Block_Ptr blk = get_block_locked(pc, block_id);
+		const size_t s = (tl.next++) & (TL_Block_FIFO::N - 1);
+		tl.epoch[s]    = pc.epoch;
+		tl.block_id[s] = block_id;
+		tl.bytes[s]    = blk;
+		data = blk->data();
 	}
 	uint16_t stored;
-	std::memcpy(&stored, tl.bytes->data() + in_block_pos * sizeof(uint16_t), sizeof(stored));
+	std::memcpy(&stored, data + in_block_pos * sizeof(uint16_t), sizeof(stored));
 	return dtm_entry_from_storage(stored, wdl);
 }
 
@@ -837,14 +849,11 @@ void add_ep_moves(const Position& pos, Square ep_square, Move_List& ml)
 	}
 }
 
-// Per-thread L1 cache in front of the shared cache maps. Avoids the
-// pthread_rwlock_rdlock cacheline ping-pong that dominated probe profiles
-// when many workers probed the same material in a tight loop.
 template <typename T>
 struct TL_Probe_Cache
 {
 	static constexpr size_t N = 4;
-	uint64_t    epoch[N] = {};   // 0 = empty slot; live Impl epochs are > 0
+	uint64_t    epoch[N] = {};
 	uint32_t    key  [N] = {};
 	T*          val  [N] = {};
 	size_t      rr       = 0;
