@@ -33,6 +33,17 @@ namespace {
 // Enough slots to avoid thrashing during derive_dropped child probes.
 constexpr size_t BLOCK_CACHE_SLOTS = 32;
 
+// Per-thread last-block cache for Probe_File::read(). Workers iterate
+// Board_Indexes sequentially, so consecutive probes hit the same decoded
+// block; serving them from a thread-local copy avoids serializing on
+// Per_Color::mu and its shared LZ4 decompressor.
+struct TL_Block_Slot
+{
+	const void* owner = nullptr;
+	size_t      block_id = SIZE_MAX;
+	std::vector<uint8_t> bytes;
+};
+
 // File-format constants shared with egtb_compress.cpp.
 constexpr uint8_t SINGULAR_FLAG = 0x80;
 constexpr uint8_t DROPPED_FLAG  = 0x40;
@@ -292,10 +303,19 @@ WDL_Entry WDL_Probe_File::read(Color c, Board_Index pos)
 	if (pc.index[block_id].comp_size == 0)
 		return WDL_Entry::ILLEGAL;
 
-	std::lock_guard<std::mutex> lk(pc.mu);
-	const uint8_t* block = get_block_locked(pc, block_id);
+	thread_local TL_Block_Slot tl;
+	if (tl.owner != &pc || tl.block_id != block_id)
+	{
+		std::lock_guard<std::mutex> lk(pc.mu);
+		const uint8_t* block = get_block_locked(pc, block_id);
+		const size_t bsz = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
+			? pc.tail_size : pc.block_size;
+		tl.bytes.assign(block, block + bsz);
+		tl.owner = &pc;
+		tl.block_id = block_id;
+	}
 	Packed_WDL_Entries entry;
-	std::memcpy(&entry, block + in_block, sizeof(entry));
+	std::memcpy(&entry, tl.bytes.data() + in_block, sizeof(entry));
 	return get_wdl_value(entry, static_cast<size_t>(pos) % WDL_ENTRY_PACK_RATIO);
 }
 
@@ -485,10 +505,19 @@ DTC_Final_Entry DTC_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	if ((dso & 0xFFFFF) == 0)
 		return DTC_Final_Entry::make_illegal();
 
-	std::lock_guard<std::mutex> lk(pc.mu);
-	const uint8_t* block = get_block_locked(pc, block_id);
+	thread_local TL_Block_Slot tl;
+	if (tl.owner != &pc || tl.block_id != block_id)
+	{
+		std::lock_guard<std::mutex> lk(pc.mu);
+		const uint8_t* block = get_block_locked(pc, block_id);
+		const size_t bsz = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
+			? pc.tail_size : pc.block_size;
+		tl.bytes.assign(block, block + bsz);
+		tl.owner = &pc;
+		tl.block_id = block_id;
+	}
 	DTC_Final_Entry stored;
-	std::memcpy(&stored, block + in_block_pos * sizeof(uint16_t), sizeof(stored));
+	std::memcpy(&stored, tl.bytes.data() + in_block_pos * sizeof(uint16_t), sizeof(stored));
 	return dtc_entry_from_storage(stored, wdl, pc.entry_bytes);
 }
 
@@ -679,10 +708,19 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	if ((dso & 0xFFFFF) == 0)
 		return DTM_Final_Entry::make_illegal();
 
-	std::lock_guard<std::mutex> lk(pc.mu);
-	const uint8_t* block = get_block_locked(pc, block_id);
+	thread_local TL_Block_Slot tl;
+	if (tl.owner != &pc || tl.block_id != block_id)
+	{
+		std::lock_guard<std::mutex> lk(pc.mu);
+		const uint8_t* block = get_block_locked(pc, block_id);
+		const size_t bsz = (block_id == pc.block_cnt - 1 && pc.tail_size != 0)
+			? pc.tail_size : pc.block_size;
+		tl.bytes.assign(block, block + bsz);
+		tl.owner = &pc;
+		tl.block_id = block_id;
+	}
 	uint16_t stored;
-	std::memcpy(&stored, block + in_block_pos * sizeof(uint16_t), sizeof(stored));
+	std::memcpy(&stored, tl.bytes.data() + in_block_pos * sizeof(uint16_t), sizeof(stored));
 	return dtm_entry_from_storage(stored, wdl);
 }
 
@@ -788,6 +826,36 @@ void add_ep_moves(const Position& pos, Square ep_square, Move_List& ml)
 	}
 }
 
+// Per-thread L1 cache in front of the shared cache maps. Avoids the
+// pthread_rwlock_rdlock cacheline ping-pong that dominated probe profiles
+// when many workers probed the same material in a tight loop.
+template <typename T>
+struct TL_Probe_Cache
+{
+	static constexpr size_t N = 4;
+	const void* inst[N] = {};
+	uint32_t    key [N] = {};
+	T*          val [N] = {};
+	bool        live[N] = {};
+	size_t      rr      = 0;
+
+	bool lookup(const void* impl, uint32_t k, T*& out) const
+	{
+		for (size_t i = 0; i < N; ++i)
+			if (live[i] && inst[i] == impl && key[i] == k)
+				{ out = val[i]; return true; }
+		return false;
+	}
+	void insert(const void* impl, uint32_t k, T* v)
+	{
+		for (size_t i = 0; i < N; ++i)
+			if (live[i] && inst[i] == impl && key[i] == k)
+				{ val[i] = v; return; }
+		const size_t i = (rr++) & (N - 1);
+		inst[i] = impl; key[i] = k; val[i] = v; live[i] = true;
+	}
+};
+
 }  // namespace
 
 struct Probe_Tables::Impl
@@ -811,25 +879,34 @@ struct Probe_Tables::Impl
 	NODISCARD const Piece_Config_For_Gen& get_epsi(const Piece_Config& ps)
 	{
 		const uint32_t k = ps.min_material_key().value();
+		thread_local TL_Probe_Cache<const Piece_Config_For_Gen> tl;
+		const Piece_Config_For_Gen* hit;
+		if (tl.lookup(this, k, hit)) return *hit;
 		{
 			std::shared_lock rlk(epsi_mu);
 			auto it = epsi_cache.find(k);
-			if (it != epsi_cache.end()) return *it->second;
+			if (it != epsi_cache.end())
+				{ tl.insert(this, k, it->second.get()); return *it->second; }
 		}
 		auto e = std::make_unique<Piece_Config_For_Gen>(ps);
-		const auto* raw = e.get();
 		std::unique_lock wlk(epsi_mu);
 		auto [it, inserted] = epsi_cache.try_emplace(k, std::move(e));
-		return inserted ? *raw : *it->second;
+		const Piece_Config_For_Gen* raw = it->second.get();
+		tl.insert(this, k, raw);
+		return *raw;
 	}
 
 	NODISCARD WDL_Probe_File* open_wdl(const Piece_Config& ps)
 	{
 		const uint32_t k = ps.min_material_key().value();
+		thread_local TL_Probe_Cache<WDL_Probe_File> tl;
+		WDL_Probe_File* hit;
+		if (tl.lookup(this, k, hit)) return hit;
 		{
 			std::shared_lock rlk(wdl_mu);
 			auto it = wdl_cache.find(k);
-			if (it != wdl_cache.end()) return it->second.get();
+			if (it != wdl_cache.end())
+				{ tl.insert(this, k, it->second.get()); return it->second.get(); }
 		}
 		std::filesystem::path path;
 		std::unique_ptr<WDL_Probe_File> f;
@@ -840,16 +917,22 @@ struct Probe_Tables::Impl
 		}
 		std::unique_lock wlk(wdl_mu);
 		auto [it, inserted] = wdl_cache.try_emplace(k, std::move(f));
-		return it->second.get();
+		WDL_Probe_File* raw = it->second.get();
+		tl.insert(this, k, raw);
+		return raw;
 	}
 
 	NODISCARD DTC_Probe_File* open_dtc(const Piece_Config& ps)
 	{
 		const uint32_t k = ps.min_material_key().value();
+		thread_local TL_Probe_Cache<DTC_Probe_File> tl;
+		DTC_Probe_File* hit;
+		if (tl.lookup(this, k, hit)) return hit;
 		{
 			std::shared_lock rlk(dtc_mu);
 			auto it = dtc_cache.find(k);
-			if (it != dtc_cache.end()) return it->second.get();
+			if (it != dtc_cache.end())
+				{ tl.insert(this, k, it->second.get()); return it->second.get(); }
 		}
 		std::filesystem::path path;
 		std::unique_ptr<DTC_Probe_File> f;
@@ -860,16 +943,22 @@ struct Probe_Tables::Impl
 		}
 		std::unique_lock wlk(dtc_mu);
 		auto [it, inserted] = dtc_cache.try_emplace(k, std::move(f));
-		return it->second.get();
+		DTC_Probe_File* raw = it->second.get();
+		tl.insert(this, k, raw);
+		return raw;
 	}
 
 	NODISCARD DTM_Probe_File* open_dtm(const Piece_Config& ps)
 	{
 		const uint32_t k = ps.min_material_key().value();
+		thread_local TL_Probe_Cache<DTM_Probe_File> tl;
+		DTM_Probe_File* hit;
+		if (tl.lookup(this, k, hit)) return hit;
 		{
 			std::shared_lock rlk(dtm_mu);
 			auto it = dtm_cache.find(k);
-			if (it != dtm_cache.end()) return it->second.get();
+			if (it != dtm_cache.end())
+				{ tl.insert(this, k, it->second.get()); return it->second.get(); }
 		}
 		std::filesystem::path path;
 		std::unique_ptr<DTM_Probe_File> f;
@@ -880,7 +969,9 @@ struct Probe_Tables::Impl
 		}
 		std::unique_lock wlk(dtm_mu);
 		auto [it, inserted] = dtm_cache.try_emplace(k, std::move(f));
-		return it->second.get();
+		DTM_Probe_File* raw = it->second.get();
+		tl.insert(this, k, raw);
+		return raw;
 	}
 
 	NODISCARD Probe_Result   probe_impl(const Piece_Config& ps, const Position& pos, int depth);
