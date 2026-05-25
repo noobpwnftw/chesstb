@@ -601,6 +601,15 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 		}
 	}
 
+	// Hand off to save_to_disk with bounded memory: only layer 0 (saved first)
+	// stays resident; layers 1..99 spill to disk and reload on demand from the
+	// per-layer save cache.
+	for (size_t h = 1; h < DTM50_HMC_COUNT; ++h)
+	{
+		m_table->m_dtm[WHITE][h].evict_all(*thread_pool);
+		m_table->m_dtm[BLACK][h].evict_all(*thread_pool);
+	}
+
 	const auto t_total_end = std::chrono::steady_clock::now();
 	std::printf("  gen (%zu hmc layers): done in %s (%zu pawn-slice pairs in %zu batches, %zu fusion groups)\n",
 		DTM50_HMC_COUNT,
@@ -869,14 +878,16 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 
 		std::ofstream fp(paths.dtm50_info_save_path(m_epsi, hmc), std::ios::binary | std::ios::trunc);
 		fp.write(reinterpret_cast<const char*>(&m_info), sizeof(EGTB_Info));
+
+		// Layer h is done — drop its scratch files and in-memory groups before
+		// the next iteration loads layer h+1 from disk.
+		m_table->m_dtm[WHITE][hmc].remove_disk_files();
+		m_table->m_dtm[BLACK][hmc].remove_disk_files();
+		m_table->m_dtm[WHITE][hmc].close();
+		m_table->m_dtm[BLACK][hmc].close();
 	}
 
 	remove_checkpoint(paths.dtm50_checkpoint_path(m_epsi));
-	for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
-	{
-		m_table->m_dtm[WHITE][h].remove_disk_files();
-		m_table->m_dtm[BLACK][h].remove_disk_files();
-	}
 
 	const auto t_save_end = std::chrono::steady_clock::now();
 	std::printf("  save_to_disk: done in %s\n",
