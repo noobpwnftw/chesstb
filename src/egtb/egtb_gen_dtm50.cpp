@@ -1048,6 +1048,7 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 	// top-down. hmc=0 leads so k>0 sees a finalized opp[hmc=0] for zeroing edges.
 	auto build_one_layer = [&](uint16_t hmc) {
 		m_current_hmc = hmc;
+		m_max_dtm = 0;
 
 		// Unbounded budget: pre-load this layer plus the read-only layers it
 		// consumes (opp hmc=0 for in-M push, opp hmc=k+1 for quiet). At hmc=0
@@ -1125,7 +1126,6 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 				refresh_active_metadata(cur_layer(WHITE));
 
 				seed_iter_groups();
-				m_max_dtm = 0;
 
 				uint16_t start_ply = 0;
 				if (is_resume_fusion)
