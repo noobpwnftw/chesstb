@@ -900,15 +900,11 @@ void load_dtm_sub_flat(
 
 		if (is_singular[i])
 		{
-			// Singular DTM ⇒ DRAW everywhere WDL says legal, ILLEGAL elsewhere.
-			// (DTC's WDL is the source of legality info; DTM doesn't carry its own.)
-			for (size_t k = 0; k < num_positions; ++k)
-			{
-				const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(k), 0);
-				out[k] = (w == WDL_Entry::ILLEGAL)
-					? DTM_Final_Entry::make_illegal()
-					: DTM_Final_Entry::make_draw();
-			}
+			// Singular DTM ⇒ DRAW everywhere. ILLEGAL cells are allocated but
+			// never probed (sub-TB callers always resolve to a legal child idx),
+			// so just blank-fill DRAW. DTM_Final_Entry's default 0 == DRAW;
+			// memset is equivalent to per-cell make_draw() but constant-time.
+			std::memset(out, 0, file_bytes);
 		}
 		else
 		{
@@ -973,6 +969,188 @@ void load_dtm_sub_flat(
 							const uint16_t stored = r2v[in[k]];
 							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
 							out[pos + k] = dtm_entry_from_storage(stored, w);
+						}
+					}
+				}
+			});
+		}
+
+		flat->m_files[i] = std::move(out_map);
+	}
+}
+
+// DTM50 layer-0 variant of load_dtm_sub_flat. Same eager-decompress-to-tmp-mmap
+// shape; differs only in the file it opens (dtm50/<name>/h0.lzdtm50), the
+// magic it checks (DTM50_MAGIC), the tmp output path (dtm50_sub_flat_path),
+// and the value/class reconstruction (dtm50_entry_from_storage folds
+// CURSED_WIN/BLESSED_LOSS → DRAW because layer-0 already collapsed those
+// cells during the build).
+void load_dtm50_sub_flat(
+	Out_Param<DTM50_Sub_File_Flat> flat,
+	const EGTB_Paths& egtb_files,
+	const Piece_Config& ps,
+	In_Out_Param<Thread_Pool> thread_pool
+)
+{
+	std::filesystem::path dtm_path;
+	if (!egtb_files.find_dtm50_file(ps, &dtm_path, /*hmc=*/0))
+		throw std::runtime_error("Could not find a DTM50 hmc=0 file for " + ps.name());
+	std::filesystem::path wdl_path;
+	if (!egtb_files.find_wdl_file(ps, &wdl_path))
+		throw std::runtime_error("Could not find a WDL file for " + ps.name()
+			+ " (DTM50 consumes DTC's wdl/ output for class disambiguation)");
+
+	const WDL_File_For_Probe wdl(egtb_files, ps, thread_pool);
+
+	Memory_Mapped_File map_file;
+	if (!map_file.open_readonly(dtm_path.c_str()))
+		throw std::runtime_error("Could not open DTM50 file trying to load " + dtm_path.string());
+
+	const Const_Span<uint8_t> input = map_file.data_span();
+	if ((input.size() & 63) != 8)
+		throw std::runtime_error("Invalid DTM50 file size trying to load " + dtm_path.string());
+
+	Serial_Memory_Reader reader(input);
+	if (!reader.is_end_checksum_ok(static_cast<uint64_t>(EGTB_CHECKSUM_INIT_VALUE)))
+		throw std::runtime_error("Invalid DTM50 file checksum trying to load " + dtm_path.string());
+
+	const uint32_t magic = reader.read<uint32_t>();
+	if (magic != narrowing_static_cast<uint32_t>(EGTB_Magic::DTM50_MAGIC))
+		throw std::runtime_error("Invalid DTM50 file magic trying to load " + dtm_path.string());
+
+	const uint32_t key_and_table_num = reader.read<uint32_t>();
+	const Material_Key key = static_cast<Material_Key>(key_and_table_num >> 2u);
+	if (key != ps.min_material_key())
+		throw std::runtime_error("Wrong material key in DTM50 file " + dtm_path.string());
+
+	const size_t table_num = key_and_table_num & 3;
+	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+
+	size_t entry_bytes[COLOR_NB]{ 0, 0 };
+	size_t tail_size[COLOR_NB]{ 0, 0 };
+	size_t block_size[COLOR_NB]{ 0, 0 };
+	size_t block_cnt[COLOR_NB]{ 0, 0 };
+	size_t data_size[COLOR_NB]{ 0, 0 };
+	bool is_singular[COLOR_NB]{ false, false };
+	std::vector<uint16_t> rank_to_value[COLOR_NB];
+	const uint8_t* offset_tb[COLOR_NB]{ nullptr, nullptr };
+	const uint8_t* data[COLOR_NB]{ nullptr, nullptr };
+
+	for (const Color i : table_colors)
+	{
+		const uint8_t flag = reader.read<uint8_t>();
+		if (flag & EGTB_SINGULAR_FLAG)
+		{
+			is_singular[i] = true;
+			reader.advance(1);
+		}
+		else
+		{
+			entry_bytes[i] = reader.read<uint8_t>();
+			if (entry_bytes[i] != sizeof(DTM_Final_Entry) && entry_bytes[i] != 1)
+				throw std::runtime_error("Bad DTM50 entry_bytes in " + dtm_path.string());
+			tail_size[i]  = reader.read<uint32_t>();
+			block_size[i] = reader.read<uint32_t>();
+			block_cnt[i]  = reader.read<uint32_t>();
+			data_size[i]  = reader.read<uint64_t>();
+
+			const size_t num_ranks = reader.read<uint16_t>();
+			rank_to_value[i].resize(num_ranks);
+			for (size_t r = 0; r < num_ranks; ++r)
+				rank_to_value[i][r] = reader.read<uint16_t>();
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (is_singular[i]) continue;
+		offset_tb[i] = reader.caret();
+		reader.advance(block_cnt[i] * 8);
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (is_singular[i]) continue;
+		reader.align(64);
+		data[i] = reader.caret();
+		reader.advance(data_size[i]);
+	}
+
+	const size_t num_positions = Piece_Config_For_Gen(ps).num_positions();
+	const size_t file_bytes = num_positions * sizeof(DTM_Final_Entry);
+
+	for (const Color i : table_colors)
+	{
+		const auto tmp_path = egtb_files.dtm50_sub_flat_path(ps, i);
+		flat->m_tmp_files.track_path(tmp_path);
+
+		Memory_Mapped_File out_map(Memory_Mapped_File::Access_Advice::RANDOM);
+		if (!out_map.create(tmp_path.c_str(), file_bytes))
+			throw std::runtime_error("Could not create flat sub-DTM50 at " + tmp_path.string());
+		DTM_Final_Entry* out = reinterpret_cast<DTM_Final_Entry*>(out_map.data());
+
+		if (is_singular[i])
+		{
+			// Singular DTM50 ⇒ DRAW everywhere; see note in load_dtm_sub_flat.
+			std::memset(out, 0, file_bytes);
+		}
+		else
+		{
+			const size_t num_full = tail_size[i] != 0 ? block_cnt[i] - 1 : block_cnt[i];
+			const size_t src_sz   = block_size[i] * num_full + tail_size[i];
+			if (src_sz != num_positions * entry_bytes[i])
+				throw std::runtime_error("DTM50 decompressed size mismatch " + dtm_path.string());
+
+			const auto& r2v = rank_to_value[i];
+			const size_t blocks = block_cnt[i];
+			const size_t positions_per_block = block_size[i] / entry_bytes[i];
+			std::atomic<size_t> next_block(0);
+
+			thread_pool->run_sync_task_on_all_threads([&](size_t thread_id) {
+				LZMA_Decompress_Helper dc_helper(block_size[i]);
+
+				for (;;)
+				{
+					const size_t idx = next_block.fetch_add(1, std::memory_order_relaxed);
+					if (idx >= blocks) return;
+
+					const uint8_t* offset = offset_tb[i] + idx * 8;
+					const uint64_t dso = reinterpret_cast<const uint64_t*>(offset)[0];
+					const size_t dsz  = dso & 0xFFFFF;
+					const size_t doff = dso >> 20;
+
+					const size_t decode_sz =
+						(idx == blocks - 1 && tail_size[i] != 0) ? tail_size[i] : block_size[i];
+					const size_t positions = decode_sz / entry_bytes[i];
+					const size_t pos = idx * positions_per_block;
+
+					if (dsz == 0)
+					{
+						for (size_t k = 0; k < positions; ++k)
+							out[pos + k] = DTM_Final_Entry::make_illegal();
+						continue;
+					}
+
+					const Const_Span<uint8_t> raw = dc_helper.decompress(
+						Const_Span<uint8_t>(data[i] + doff, dsz), decode_sz);
+
+					if (entry_bytes[i] == 1)
+					{
+						for (size_t k = 0; k < positions; ++k)
+						{
+							const uint16_t stored = r2v[raw[k]];
+							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
+							out[pos + k] = dtm50_entry_from_storage(stored, w);
+						}
+					}
+					else
+					{
+						const uint16_t* in = reinterpret_cast<const uint16_t*>(raw.data());
+						for (size_t k = 0; k < positions; ++k)
+						{
+							const uint16_t stored = r2v[in[k]];
+							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
+							out[pos + k] = dtm50_entry_from_storage(stored, w);
 						}
 					}
 				}

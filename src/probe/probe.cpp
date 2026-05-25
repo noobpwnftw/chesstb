@@ -59,6 +59,29 @@ constexpr uint64_t CHECKSUM_INIT = 0xf0f0f0f0f0f0;
 constexpr const char* WDL_EXT = ".lzw";
 constexpr const char* DTC_EXT = ".lzdtc";
 constexpr const char* DTM_EXT = ".lzdtm";
+constexpr const char* DTM50_EXT = ".lzdtm50";
+constexpr size_t DTM50_HMC_COUNT = 100;
+// Sentinel for internal probe_impl callers that don't want DTM50 populated
+// (root probers using DTZ-only ordering). Public probe() defaults rule50 to
+// 0 so default callers still get the fresh-window DTM50 layer.
+constexpr unsigned PROBE_IMPL_SKIP_DTM50 = ~0u;
+
+bool find_dtm50_in_dirs(const Piece_Config& ps, uint16_t hmc,
+                        const std::vector<std::filesystem::path>& dirs,
+                        std::filesystem::path* out)
+{
+	const std::string fn = "h" + std::to_string(hmc) + DTM50_EXT;
+	for (const auto& d : dirs)
+	{
+		const auto p = d / ps.name() / fn;
+		if (std::filesystem::exists(p))
+		{
+			if (out) *out = p;
+			return true;
+		}
+	}
+	return false;
+}
 
 bool find_in_dirs(const Piece_Config& ps, const char* ext,
                   const std::vector<std::filesystem::path>& dirs,
@@ -747,6 +770,203 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	return dtm_entry_from_storage(stored, wdl);
 }
 
+// DTM50 layer file. Same container as DTM_Probe_File; differs only in the
+// magic and the storage→entry mapping (layer-aware: dispatches by m_hmc).
+struct DTM50_Probe_File
+{
+	struct Per_Color
+	{
+		size_t entry_bytes = 0;
+		size_t block_size = 0;
+		size_t tail_size = 0;
+		size_t block_cnt = 0;
+		const uint8_t* offset_tb = nullptr;
+		const uint8_t* compressed_data = nullptr;
+		std::vector<uint16_t> rank_to_value;
+
+		const uint64_t epoch = next_probe_epoch();
+		mutable std::mutex mu;
+		std::array<size_t, BLOCK_CACHE_SLOTS> block_id{};
+		std::array<Block_Ptr, BLOCK_CACHE_SLOTS> data;
+		size_t next_slot = 0;
+		size_t live = 0;
+		std::unique_ptr<LZMA_Decompress_Helper> decomp;
+	};
+
+	bool is_singular[COLOR_NB] = { false, false };
+	bool is_dropped[COLOR_NB]  = { false, false };
+	Per_Color per_color[COLOR_NB];
+	Memory_Mapped_File mapped;
+	// hmc this file represents; chooses the decode variant (hmc=0 vs k>0).
+	uint16_t m_hmc = 0;
+
+	void load(const Piece_Config& ps, const std::filesystem::path& path);
+	NODISCARD DTM_Final_Entry read(Color c, Board_Index pos, WDL_Entry wdl);
+
+private:
+	NODISCARD Block_Ptr get_block_locked(Per_Color& pc, size_t block_id);
+};
+
+void DTM50_Probe_File::load(const Piece_Config& ps, const std::filesystem::path& path)
+{
+	if (!mapped.open_readonly(path.c_str()))
+		throw std::runtime_error("Cannot open DTM50 file " + path.string());
+
+	const Const_Span<uint8_t> input = mapped.data_span();
+	if ((input.size() & 63) != 8)
+		throw std::runtime_error("Invalid DTM50 file size " + path.string());
+
+	Serial_Memory_Reader reader(input);
+	if (!reader.is_end_checksum_ok(CHECKSUM_INIT))
+		throw std::runtime_error("Invalid DTM50 checksum " + path.string());
+
+	const uint32_t magic = reader.read<uint32_t>();
+	if (magic != static_cast<uint32_t>(EGTB_Magic::DTM50_MAGIC))
+		throw std::runtime_error("Invalid DTM50 magic " + path.string());
+
+	const uint32_t key_and_table_num = reader.read<uint32_t>();
+	const Material_Key key = Material_Key(key_and_table_num >> 2);
+	if (key != ps.min_material_key())
+		throw std::runtime_error("Wrong material key in DTM50 " + path.string());
+
+	const size_t table_num = key_and_table_num & 3;
+	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+
+	size_t data_size[COLOR_NB]{};
+
+	for (Color i : table_colors)
+	{
+		const uint8_t flag = reader.read<uint8_t>();
+		if (flag & SINGULAR_FLAG)
+		{
+			is_singular[i] = true;
+			const WDL_Entry sv = static_cast<WDL_Entry>(reader.read<uint8_t>());
+			if (sv != WDL_Entry::DRAW)
+				throw std::runtime_error("DTM50 singular value must be DRAW");
+		}
+		else if (flag & DROPPED_FLAG)
+		{
+			is_dropped[i] = true;
+		}
+		else
+		{
+			Per_Color& pc = per_color[i];
+			pc.entry_bytes = reader.read<uint8_t>();
+			if (pc.entry_bytes != 1 && pc.entry_bytes != sizeof(DTM_Final_Entry))
+				throw std::runtime_error("Bad DTM50 entry_bytes " + path.string());
+			pc.tail_size  = reader.read<uint32_t>();
+			pc.block_size = reader.read<uint32_t>();
+			pc.block_cnt  = reader.read<uint32_t>();
+			data_size[i]  = reader.read<uint64_t>();
+
+			const size_t num_ranks = reader.read<uint16_t>();
+			pc.rank_to_value.resize(num_ranks);
+			for (size_t r = 0; r < num_ranks; ++r)
+				pc.rank_to_value[r] = reader.read<uint16_t>();
+		}
+	}
+
+	for (Color i : table_colors)
+	{
+		if (is_singular[i] || is_dropped[i]) continue;
+		per_color[i].offset_tb = reader.caret();
+		reader.advance(per_color[i].block_cnt * 8);
+	}
+	for (Color i : table_colors)
+	{
+		if (is_singular[i] || is_dropped[i]) continue;
+		reader.align(64);
+		per_color[i].compressed_data = reader.caret();
+		reader.advance(data_size[i]);
+	}
+
+	const size_t num_positions = Piece_Config_For_Gen(ps).num_positions();
+	for (Color i : table_colors)
+	{
+		if (is_singular[i] || is_dropped[i]) continue;
+		Per_Color& pc = per_color[i];
+		const size_t num_full = pc.tail_size != 0 ? pc.block_cnt - 1 : pc.block_cnt;
+		const size_t src_sz   = pc.block_size * num_full + pc.tail_size;
+		if (src_sz != num_positions * pc.entry_bytes)
+			throw std::runtime_error("DTM50 decompressed size mismatch " + path.string());
+	}
+}
+
+Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
+{
+	for (size_t i = 0; i < pc.live; ++i)
+		if (pc.block_id[i] == block_id) return pc.data[i];
+
+	const size_t decode_sz =
+		(block_id == pc.block_cnt - 1 && pc.tail_size != 0) ? pc.tail_size : pc.block_size;
+	const size_t positions = decode_sz / pc.entry_bytes;
+
+	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
+	const size_t dsz  = dso & 0xFFFFF;
+	const size_t doff = dso >> 20;
+
+	size_t slot;
+	if (pc.live < BLOCK_CACHE_SLOTS) { slot = pc.live++; }
+	else { slot = pc.next_slot; pc.next_slot = (pc.next_slot + 1) % BLOCK_CACHE_SLOTS; }
+	pc.block_id[slot] = block_id;
+	auto buf = std::make_shared<std::vector<uint8_t>>(positions * sizeof(uint16_t), 0);
+
+	if (dsz != 0)
+	{
+		if (!pc.decomp) pc.decomp = std::make_unique<LZMA_Decompress_Helper>(pc.block_size);
+		const Const_Span<uint8_t> raw = pc.decomp->decompress(
+			Const_Span(pc.compressed_data + doff, dsz), decode_sz);
+
+		const auto& r2v = pc.rank_to_value;
+		uint16_t* out = reinterpret_cast<uint16_t*>(buf->data());
+		if (pc.entry_bytes == 1)
+			for (size_t k = 0; k < positions; ++k) out[k] = r2v[raw[k]];
+		else
+		{
+			const uint16_t* in = reinterpret_cast<const uint16_t*>(raw.data());
+			for (size_t k = 0; k < positions; ++k) out[k] = r2v[in[k]];
+		}
+	}
+	pc.data[slot] = buf;
+	return pc.data[slot];
+}
+
+DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
+{
+	if (is_singular[c]) return DTM_Final_Entry::make_draw();
+	// is_dropped is handled by probe_dtm50_internal — callers must check first.
+	ASSERT(!is_dropped[c]);
+
+	Per_Color& pc = per_color[c];
+	const size_t positions_per_block = pc.block_size / pc.entry_bytes;
+	const size_t block_id = static_cast<size_t>(pos) / positions_per_block;
+	const size_t in_block_pos = static_cast<size_t>(pos) % positions_per_block;
+
+	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
+	if ((dso & 0xFFFFF) == 0) return DTM_Final_Entry::make_illegal();
+
+	thread_local TL_Block_FIFO tl;
+	const uint8_t* data = nullptr;
+	for (size_t i = 0; i < TL_Block_FIFO::N; ++i)
+		if (tl.epoch[i] == pc.epoch && tl.block_id[i] == block_id)
+			{ data = tl.bytes[i]->data(); break; }
+	if (!data)
+	{
+		std::lock_guard<std::mutex> lk(pc.mu);
+		Block_Ptr blk = get_block_locked(pc, block_id);
+		const size_t s = (tl.next++) & (TL_Block_FIFO::N - 1);
+		tl.epoch[s]    = pc.epoch;
+		tl.block_id[s] = block_id;
+		tl.bytes[s]    = blk;
+		data = blk->data();
+	}
+	uint16_t stored;
+	std::memcpy(&stored, data + in_block_pos * sizeof(uint16_t), sizeof(stored));
+	return m_hmc == 0
+		? dtm50_entry_from_storage(stored, wdl)
+		: dtm50_layered_entry_from_storage(stored, wdl);
+}
+
 constexpr int MAX_DERIVE_DEPTH = 16;
 
 NODISCARD WDL_Entry invert_wdl(WDL_Entry w)
@@ -767,6 +987,14 @@ NODISCARD WDL_Entry fold_dtm_wdl(WDL_Entry w)
 {
 	if (w == WDL_Entry::CURSED_WIN) return WDL_Entry::WIN;
 	if (w == WDL_Entry::BLESSED_LOSS) return WDL_Entry::LOSE;
+	return w;
+}
+
+// 5-class WDL → DTM50's 3-class: cursed/blessed are unreachable under 50MR.
+NODISCARD WDL_Entry fold_dtm50_wdl(WDL_Entry w)
+{
+	if (w == WDL_Entry::CURSED_WIN)   return WDL_Entry::DRAW;
+	if (w == WDL_Entry::BLESSED_LOSS) return WDL_Entry::DRAW;
 	return w;
 }
 
@@ -847,23 +1075,23 @@ void add_ep_moves(const Position& pos, Square ep_square, Move_List& ml)
 	}
 }
 
-template <typename T>
+template <typename T, typename K = uint32_t>
 struct TL_Probe_Cache
 {
 	static constexpr size_t N = 4;
 	uint64_t    epoch[N] = {};
-	uint32_t    key  [N] = {};
+	K           key  [N] = {};
 	T*          val  [N] = {};
 	size_t      rr       = 0;
 
-	bool lookup(uint64_t impl_epoch, uint32_t k, T*& out) const
+	bool lookup(uint64_t impl_epoch, K k, T*& out) const
 	{
 		for (size_t i = 0; i < N; ++i)
 			if (epoch[i] == impl_epoch && key[i] == k)
 				{ out = val[i]; return true; }
 		return false;
 	}
-	void insert(uint64_t impl_epoch, uint32_t k, T* v)
+	void insert(uint64_t impl_epoch, K k, T* v)
 	{
 		for (size_t i = 0; i < N; ++i)
 			if (epoch[i] == impl_epoch && key[i] == k)
@@ -881,6 +1109,7 @@ struct Probe_Tables::Impl
 	std::vector<std::filesystem::path> wdl_dirs = { "./wdl/" };
 	std::vector<std::filesystem::path> dtc_dirs = { "./dtc/" };
 	std::vector<std::filesystem::path> dtm_dirs = { "./dtm/" };
+	std::vector<std::filesystem::path> dtm50_dirs = { "./dtm50/" };
 
 	// Use material-key integers to avoid per-probe string hashing.
 	mutable std::shared_mutex                                 wdl_mu;
@@ -889,6 +1118,10 @@ struct Probe_Tables::Impl
 	std::unordered_map<uint32_t, std::unique_ptr<DTC_Probe_File>> dtc_cache;
 	mutable std::shared_mutex                                 dtm_mu;
 	std::unordered_map<uint32_t, std::unique_ptr<DTM_Probe_File>> dtm_cache;
+	// DTM50 cache key is (material_key << 8 | hmc) — one DTM50_Probe_File per
+	// (material, layer) since each layer lives in its own .lzdtm50 file.
+	mutable std::shared_mutex                                 dtm50_mu;
+	std::unordered_map<uint64_t, std::unique_ptr<DTM50_Probe_File>> dtm50_cache;
 	mutable std::shared_mutex                                 epsi_mu;
 	std::unordered_map<uint32_t, std::unique_ptr<Piece_Config_For_Gen>> epsi_cache;
 
@@ -992,13 +1225,43 @@ struct Probe_Tables::Impl
 		return raw;
 	}
 
-	NODISCARD Probe_Result   probe_impl(const Piece_Config& ps, const Position& pos, int depth);
+	NODISCARD DTM50_Probe_File* open_dtm50(const Piece_Config& ps, uint16_t hmc)
+	{
+		const uint64_t k = (static_cast<uint64_t>(ps.min_material_key().value()) << 8) | hmc;
+		thread_local TL_Probe_Cache<DTM50_Probe_File, uint64_t> tl;
+		DTM50_Probe_File* hit;
+		if (tl.lookup(epoch, k, hit)) return hit;
+		{
+			std::shared_lock rlk(dtm50_mu);
+			auto it = dtm50_cache.find(k);
+			if (it != dtm50_cache.end())
+				{ tl.insert(epoch, k, it->second.get()); return it->second.get(); }
+		}
+		std::filesystem::path path;
+		std::unique_ptr<DTM50_Probe_File> f;
+		if (find_dtm50_in_dirs(ps, hmc, dtm50_dirs, &path))
+		{
+			f = std::make_unique<DTM50_Probe_File>();
+			f->load(ps, path);
+			f->m_hmc = hmc;
+		}
+		std::unique_lock wlk(dtm50_mu);
+		auto [it, inserted] = dtm50_cache.try_emplace(k, std::move(f));
+		DTM50_Probe_File* raw = it->second.get();
+		tl.insert(epoch, k, raw);
+		return raw;
+	}
+
+	NODISCARD Probe_Result   probe_impl(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
 	NODISCARD WDL_Entry      probe_wdl_internal (const Piece_Config& ps, const Position& pos, int depth);
 	NODISCARD DTC_Final_Entry probe_dtc_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth);
 	NODISCARD DTM_Final_Entry probe_dtm_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth);
+	NODISCARD DTM_Final_Entry probe_dtm50_internal(const Piece_Config& ps, const Position& pos,
+	                                                WDL_Entry wdl, unsigned rule50, int depth);
 	NODISCARD WDL_Entry      derive_wdl(const Piece_Config& ps, const Position& pos, int depth);
 	NODISCARD DTC_Final_Entry derive_dtc(const Piece_Config& ps, const Position& pos, int depth);
 	NODISCARD DTM_Final_Entry derive_dtm(const Piece_Config& ps, const Position& pos, int depth);
+	NODISCARD DTM_Final_Entry derive_dtm50(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
 
 	Probe_Result apply_ep_overlay(const Position& root, const Probe_Result& no_ep, Square ep_square);
 
@@ -1282,16 +1545,21 @@ DTM_Final_Entry Probe_Tables::Impl::derive_dtm(const Piece_Config& ps, const Pos
 	return DTM_Final_Entry::make_draw();
 }
 
-Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Position& pos, int depth)
+Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth)
 {
 	if (pos.turn() == BLACK && is_symmetric_material(ps))
-		return probe_impl(ps, mirror_symmetric_black_stm(pos), depth);
+		return probe_impl(ps, mirror_symmetric_black_stm(pos), rule50, depth);
 
 	Probe_Result r;
 	WDL_Probe_File* w = open_wdl(ps);
 	DTC_Probe_File* d = open_dtc(ps);
 	DTM_Probe_File* m = open_dtm(ps);
-	if (!w && !d && !m) return r;
+	// rule50 ≥ 100 ⇒ auto-50MR DRAW (no layer to read). Other tables unaffected.
+	const bool rule50_drawn = rule50 != PROBE_IMPL_SKIP_DTM50 && rule50 >= DTM50_HMC_COUNT;
+	DTM50_Probe_File* m50 = nullptr;
+	if (rule50 != PROBE_IMPL_SKIP_DTM50 && !rule50_drawn)
+		m50 = open_dtm50(ps, static_cast<uint16_t>(rule50));
+	if (!w && !d && !m && !m50 && !rule50_drawn) return r;
 
 	const Piece_Config_For_Gen& epsi = get_epsi(ps);
 	const Board_Index idx = board_index_of_position(epsi, pos);
@@ -1319,6 +1587,16 @@ Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Positi
 		r.dtm = probe_dtm_internal(ps, pos, r.wdl, depth);
 		r.has_dtm = !r.dtm.is_illegal();
 	}
+	if (rule50_drawn)
+	{
+		r.dtm50 = DTM_Final_Entry::make_draw();
+		r.has_dtm50 = true;
+	}
+	else if (m50 && w)
+	{
+		r.dtm50 = probe_dtm50_internal(ps, pos, r.wdl, rule50, depth);
+		r.has_dtm50 = !r.dtm50.is_illegal();
+	}
 	return r;
 }
 
@@ -1338,6 +1616,8 @@ Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
 	uint16_t  best_dtc     = no_ep.has_dtc ? static_cast<uint16_t>(no_ep.dtc.value()) : 0;
 	WDL_Entry best_dtm_wdl = fold_dtm_wdl(no_ep.wdl);
 	uint16_t  best_dtm     = no_ep.has_dtm ? static_cast<uint16_t>(no_ep.dtm.value()) : 0;
+	WDL_Entry best_dtm50_wdl = fold_dtm50_wdl(no_ep.wdl);
+	uint16_t  best_dtm50     = no_ep.has_dtm50 ? static_cast<uint16_t>(no_ep.dtm50.value()) : 0;
 
 	for (size_t i = 0; i < eps.size(); ++i)
 	{
@@ -1352,10 +1632,12 @@ Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
 			cr.dtc = DTC_Final_Entry::make_draw();
 			cr.has_dtm = best.has_dtm;
 			cr.dtm = DTM_Final_Entry::make_draw();
+			cr.has_dtm50 = best.has_dtm50;
+			cr.dtm50 = DTM_Final_Entry::make_draw();
 		}
 		else
 		{
-			cr = probe_impl(child.ps, child.pos, 0);
+			cr = probe_impl(child.ps, child.pos, 0, 0);  // EP is zeroing
 		}
 		if (cr.status != Probe_Result::Status::OK || cr.wdl == WDL_Entry::ILLEGAL)
 			continue;
@@ -1389,6 +1671,23 @@ Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
 					best.dtm = DTM_Final_Entry::make_loss(my_dtm);
 				else
 					best.dtm = DTM_Final_Entry::make_draw();
+			}
+		}
+
+		if (best.has_dtm50 && cr.has_dtm50)
+		{
+			const WDL_Entry my_dtm50_wdl = fold_dtm50_wdl(my_wdl);
+			const uint16_t my_dtm50 = static_cast<uint16_t>(1u + static_cast<uint16_t>(cr.dtm50.value()));
+			if (prefer_new(my_dtm50_wdl, my_dtm50, best_dtm50_wdl, best_dtm50))
+			{
+				best_dtm50_wdl = my_dtm50_wdl;
+				best_dtm50 = my_dtm50;
+				if (my_dtm50_wdl == WDL_Entry::WIN)
+					best.dtm50 = DTM_Final_Entry::make_win(my_dtm50);
+				else if (my_dtm50_wdl == WDL_Entry::LOSE)
+					best.dtm50 = DTM_Final_Entry::make_loss(my_dtm50);
+				else
+					best.dtm50 = DTM_Final_Entry::make_draw();
 			}
 		}
 	}
@@ -1430,6 +1729,21 @@ void Probe_Tables::Impl::scan_paths()
 	for (const auto& d : wdl_dirs) scan_dir(d, WDL_EXT);
 	for (const auto& d : dtc_dirs) scan_dir(d, DTC_EXT);
 	for (const auto& d : dtm_dirs) scan_dir(d, DTM_EXT);
+	// DTM50 lives in per-material subfolders; the material name is the folder
+	// name itself rather than the file basename.
+	auto scan_dtm50_dir = [&](const std::filesystem::path& dir) {
+		std::error_code ec;
+		if (!std::filesystem::is_directory(dir, ec)) return;
+		for (auto& e : std::filesystem::directory_iterator(dir, ec))
+		{
+			if (ec) break;
+			if (!e.is_directory(ec)) continue;
+			const std::string n = e.path().filename().string();
+			const size_t cnt = count_pieces_from_filename(n + ".");
+			if (cnt > lg) lg = cnt;
+		}
+	};
+	for (const auto& d : dtm50_dirs) scan_dtm50_dir(d);
 	largest_pieces.store(lg, std::memory_order_release);
 }
 
@@ -1441,6 +1755,7 @@ Probe_Tables& Probe_Tables::operator=(Probe_Tables&&) noexcept = default;
 void Probe_Tables::add_wdl_path(std::filesystem::path dir) { m_impl->wdl_dirs.emplace_back(std::move(dir)); }
 void Probe_Tables::add_dtc_path(std::filesystem::path dir) { m_impl->dtc_dirs.emplace_back(std::move(dir)); }
 void Probe_Tables::add_dtm_path(std::filesystem::path dir) { m_impl->dtm_dirs.emplace_back(std::move(dir)); }
+void Probe_Tables::add_dtm50_path(std::filesystem::path dir) { m_impl->dtm50_dirs.emplace_back(std::move(dir)); }
 
 bool Probe_Tables::init(const std::filesystem::path& dir)
 {
@@ -1452,6 +1767,7 @@ bool Probe_Tables::init(const std::filesystem::path& dir)
 	m_impl->wdl_dirs.push_back(try_sub("wdl"));
 	m_impl->dtc_dirs.push_back(try_sub("dtc"));
 	m_impl->dtm_dirs.push_back(try_sub("dtm"));
+	m_impl->dtm50_dirs.push_back(try_sub("dtm50"));
 	m_impl->scan_paths();
 	return m_impl->largest_pieces.load(std::memory_order_acquire) > 0;
 }
@@ -1463,31 +1779,31 @@ size_t Probe_Tables::largest() const
 
 void Probe_Tables::rescan() { m_impl->scan_paths(); }
 
-Probe_Result Probe_Tables::probe(const Position& pos)
+Probe_Result Probe_Tables::probe(const Position& pos, unsigned rule50)
 {
 	const Canonical_Root root = canonical_root_from_position(pos, SQ_END);
-	return m_impl->probe_impl(root.ps, root.pos, 0);
+	return m_impl->probe_impl(root.ps, root.pos, rule50, 0);
 }
 
-Probe_Result Probe_Tables::probe(const Position& pos, Square ep_square)
+Probe_Result Probe_Tables::probe(const Position& pos, Square ep_square, unsigned rule50)
 {
 	const Canonical_Root root = canonical_root_from_position(pos, ep_square);
-	const Probe_Result base = m_impl->probe_impl(root.ps, root.pos, 0);
+	const Probe_Result base = m_impl->probe_impl(root.ps, root.pos, rule50, 0);
 	return m_impl->apply_ep_overlay(root.pos, base, root.ep_square);
 }
 
-Probe_Result Probe_Tables::probe(const Piece_Config& ps, const Position& pos)
+Probe_Result Probe_Tables::probe(const Piece_Config& ps, const Position& pos, unsigned rule50)
 {
 	const std::optional<Canonical_Root> root = canonical_root_from_config(ps, pos, SQ_END);
 	if (!root) return illegal_probe_result();
-	return m_impl->probe_impl(root->ps, root->pos, 0);
+	return m_impl->probe_impl(root->ps, root->pos, rule50, 0);
 }
 
-Probe_Result Probe_Tables::probe(const Piece_Config& ps, const Position& pos, Square ep_square)
+Probe_Result Probe_Tables::probe(const Piece_Config& ps, const Position& pos, Square ep_square, unsigned rule50)
 {
 	const std::optional<Canonical_Root> root = canonical_root_from_config(ps, pos, ep_square);
 	if (!root) return illegal_probe_result();
-	const Probe_Result base = m_impl->probe_impl(root->ps, root->pos, 0);
+	const Probe_Result base = m_impl->probe_impl(root->ps, root->pos, rule50, 0);
 	return m_impl->apply_ep_overlay(root->pos, base, root->ep_square);
 }
 
@@ -1496,6 +1812,151 @@ WDL_Entry Probe_Tables::probe_wdl(const Position& pos, Square ep_square, unsigne
 	if (rule50 != 0) return WDL_Entry::ILLEGAL;
 	const Probe_Result r = probe(pos, ep_square);
 	return r.status == Probe_Result::Status::OK ? r.wdl : WDL_Entry::ILLEGAL;
+}
+
+namespace {
+
+// Recover WIN(1)/LOSS(0) that the layered decoder collapsed to DRAW at hmc>0.
+// WDL=WIN: scan STM moves for a mating one. WDL=LOSE: STM mated iff in check
+// with no legal moves.
+NODISCARD DTM_Final_Entry recover_mate_at_hmc(const Position& pos, WDL_Entry wdl)
+{
+	if (wdl == WDL_Entry::WIN)
+	{
+		Position p = pos;
+		Move_List ml;
+		p.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
+		for (size_t i = 0; i < ml.size(); ++i)
+		{
+			if (!p.is_pseudo_legal_move_legal(ml[i])) continue;
+			Position child = p;
+			(void)child.do_move(ml[i]);
+			if (!child.is_in_check(child.turn())) continue;
+			Move_List cml;
+			child.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(cml));
+			bool any_legal = false;
+			for (size_t j = 0; j < cml.size() && !any_legal; ++j)
+				if (child.is_pseudo_legal_move_legal(cml[j])) any_legal = true;
+			if (!any_legal) return DTM_Final_Entry::make_win(1);
+		}
+		return DTM_Final_Entry::make_draw();
+	}
+	if (wdl == WDL_Entry::LOSE)
+	{
+		Position p = pos;
+		if (!p.is_in_check(p.turn())) return DTM_Final_Entry::make_draw();
+		Move_List ml;
+		p.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
+		for (size_t i = 0; i < ml.size(); ++i)
+			if (p.is_pseudo_legal_move_legal(ml[i])) return DTM_Final_Entry::make_draw();
+		return DTM_Final_Entry::make_loss(0);
+	}
+	return DTM_Final_Entry::make_draw();
+}
+
+}  // namespace
+
+DTM_Final_Entry Probe_Tables::Impl::probe_dtm50_internal(
+	const Piece_Config& ps, const Position& pos, WDL_Entry wdl, unsigned rule50, int depth)
+{
+	// Auto-50MR draw: no DTM50 layer applies.
+	if (rule50 >= DTM50_HMC_COUNT) return DTM_Final_Entry::make_draw();
+	const uint16_t hmc = static_cast<uint16_t>(rule50);
+	DTM50_Probe_File* m = open_dtm50(ps, hmc);
+	if (!m) return DTM_Final_Entry::make_illegal();
+
+	const Piece_Config_For_Gen& epsi = get_epsi(ps);
+	const Board_Index idx = board_index_of_position(epsi, pos);
+	if (idx == BOARD_INDEX_NONE) return DTM_Final_Entry::make_illegal();
+
+	const Color stm = pos.turn();
+	const DTM_Final_Entry e = m->is_dropped[stm]
+		? derive_dtm50(ps, pos, rule50, depth)
+		: m->read(stm, idx, wdl);
+
+	// Recover mate-in-≤1 if the layered decoder collapsed it to DRAW.
+	if (hmc > 0 && e.is_draw() && (wdl == WDL_Entry::WIN || wdl == WDL_Entry::LOSE))
+		return recover_mate_at_hmc(pos, wdl);
+	return e;
+}
+
+// rule50-aware derive: each child tracks its own hmc (zeroing resets, quiet
+// increments; ≥100 caps to DRAW unless the move is mate).
+DTM_Final_Entry Probe_Tables::Impl::derive_dtm50(
+	const Piece_Config& ps, const Position& pos, unsigned rule50, int depth)
+{
+	if (depth >= MAX_DERIVE_DEPTH) return DTM_Final_Entry::make_illegal();
+
+	Move_List ml;
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
+
+	bool any_legal = false;
+	bool have_candidate = false;
+	WDL_Entry best_wdl = WDL_Entry::LOSE;
+	uint16_t  best_dtm = 0;
+
+	for (size_t i = 0; i < ml.size(); ++i)
+	{
+		const Move m = ml[i];
+		if (!pos.is_pseudo_legal_move_legal(m)) continue;
+		any_legal = true;
+
+		Child_Pos c = make_child(pos, m);
+		const unsigned child_rule50 = c.is_zeroing ? 0u : (rule50 + 1u);
+
+		WDL_Entry cw;
+		DTM_Final_Entry cd;
+		if (c.is_kk)
+		{
+			cw = WDL_Entry::DRAW;
+			cd = DTM_Final_Entry::make_draw();
+		}
+		else if (child_rule50 >= DTM50_HMC_COUNT)
+		{
+			// Quiet move past the 50MR window: DRAW unless the move is mate.
+			Position& cb = c.pos;
+			bool is_mate = false;
+			if (cb.is_in_check(cb.turn()))
+			{
+				Move_List cml;
+				cb.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(cml));
+				bool any_legal = false;
+				for (size_t j = 0; j < cml.size() && !any_legal; ++j)
+					if (cb.is_pseudo_legal_move_legal(cml[j])) any_legal = true;
+				is_mate = !any_legal;
+			}
+			if (is_mate) { cw = WDL_Entry::LOSE; cd = DTM_Final_Entry::make_loss(0); }
+			else         { cw = WDL_Entry::DRAW; cd = DTM_Final_Entry::make_draw(); }
+		}
+		else
+		{
+			cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
+			if (cw == WDL_Entry::ILLEGAL) continue;
+			cd = probe_dtm50_internal(c.ps, c.pos, cw, child_rule50, depth + 1);
+			if (cd.is_illegal()) continue;
+		}
+
+		cw = fold_dtm50_wdl(cw);  // cursed/blessed → DRAW before inverting
+
+		const WDL_Entry my_wdl = invert_wdl(cw);
+		const uint16_t my_dtm = static_cast<uint16_t>(1u + static_cast<uint16_t>(cd.value()));
+
+		if (!have_candidate || prefer_new(my_wdl, my_dtm, best_wdl, best_dtm))
+		{
+			best_wdl = my_wdl;
+			best_dtm = my_dtm;
+			have_candidate = true;
+		}
+	}
+
+	if (!any_legal)
+		return pos.is_in_check() ? DTM_Final_Entry::make_loss(0) : DTM_Final_Entry::make_draw();
+	if (!have_candidate)
+		return DTM_Final_Entry::make_illegal();
+
+	if (best_wdl == WDL_Entry::WIN)  return DTM_Final_Entry::make_win(best_dtm);
+	if (best_wdl == WDL_Entry::LOSE) return DTM_Final_Entry::make_loss(best_dtm);
+	return DTM_Final_Entry::make_draw();
 }
 
 namespace {
@@ -1587,7 +2048,7 @@ std::vector<Root_Move> Probe_Tables::probe_root_dtz(
 		}
 		else
 		{
-			cr = m_impl->probe_impl(c.ps, c.pos, 0);
+			cr = m_impl->probe_impl(c.ps, c.pos, PROBE_IMPL_SKIP_DTM50, 0);
 		}
 		if (cr.status != Probe_Result::Status::OK || cr.wdl == WDL_Entry::ILLEGAL)
 			return {};
@@ -1672,7 +2133,7 @@ std::vector<Root_Move> Probe_Tables::probe_root_wdl(
 		}
 		else
 		{
-			cr = m_impl->probe_impl(c.ps, c.pos, 0);
+			cr = m_impl->probe_impl(c.ps, c.pos, PROBE_IMPL_SKIP_DTM50, 0);
 		}
 		if (cr.status != Probe_Result::Status::OK || cr.wdl == WDL_Entry::ILLEGAL)
 			return {};

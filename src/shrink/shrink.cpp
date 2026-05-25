@@ -1,7 +1,7 @@
 // Shrink EGTB files for shipping.
 //
 // Usage:
-//   ./shrink path/to/file.lzdtc path/to/file.lzdtm path/to/file.lzw ...
+//   ./shrink path/to/file.lzdtc path/to/file.lzdtm path/to/file.lzdtm50 path/to/file.lzw ...
 //   ./shrink path/to/dir/*       # shell glob
 //
 // Each file is detected by magic. The larger side-to-move table is dropped
@@ -581,9 +581,11 @@ bool shrink_one(const std::filesystem::path& path)
 		return shrink_rank_encoded(path, EGTB_Magic::DTC_MAGIC, "DTC");
 	if (magic == static_cast<uint32_t>(EGTB_Magic::DTM_MAGIC))
 		return shrink_rank_encoded(path, EGTB_Magic::DTM_MAGIC, "DTM");
+	if (magic == static_cast<uint32_t>(EGTB_Magic::DTM50_MAGIC))
+		return shrink_rank_encoded(path, EGTB_Magic::DTM50_MAGIC, "DTM50");
 	if (magic == static_cast<uint32_t>(EGTB_Magic::WDL_MAGIC))
 		return shrink_wdl(path);
-	std::fprintf(stderr, "%s: unknown magic 0x%08x (not DTC/DTM/WDL)\n", path.c_str(), magic);
+	std::fprintf(stderr, "%s: unknown magic 0x%08x (not DTC/DTM/DTM50/WDL)\n", path.c_str(), magic);
 	return false;
 }
 

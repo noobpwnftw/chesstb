@@ -402,11 +402,13 @@ FodyWeavers.xsd
 *.info
 *.lzdtc
 *.lzdtm
+*.lzdtm50
 *.lzw
 *.csv
 wdl/
 dtc/
 dtm/
+dtm50/
 tmp/
 reference/
 

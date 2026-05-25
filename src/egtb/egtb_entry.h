@@ -18,6 +18,9 @@ enum struct EGTB_Magic : uint64_t
 	DTC_SLICE_MAGIC = 0xd1cef11e51ce0001ULL,
 	DTM_MAGIC       = 0xabc98e32,
 	DTM_SLICE_MAGIC = 0xd1cef11e51ce0002ULL,
+	DTM50_MAGIC       = 0xabc98e50,
+	DTM50_SLICE_MAGIC = 0xd1cef11e51ce0050ULL,
+	DTM50_PHASE_MAGIC = 0xd1cef11e51ce0051ULL,
 };
 
 // WDL_Entry: 5-value + ILLEGAL sentinel, 4 bits per entry.
@@ -437,6 +440,42 @@ NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_
 			return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
 		case WDL_Entry::DRAW:
 		default:                      return DTM_Final_Entry::make_draw();
+	}
+}
+
+// DTM50 layer-0 decode. Reuses DTC's 5-class WDL: cursed/blessed → DRAW;
+// strict WIN/LOSE → halved class+value. No ambiguity at hmc=0 because a cell
+// can't be both strict-WIN-in-flat-DTM and DRAW-in-DTM50 at the fresh window.
+NODISCARD constexpr DTM_Final_Entry dtm50_entry_from_storage(uint16_t stored, WDL_Entry w)
+{
+	switch (w)
+	{
+		case WDL_Entry::ILLEGAL: return DTM_Final_Entry::make_illegal();
+		case WDL_Entry::WIN:     return DTM_Final_Entry::make_win(static_cast<uint16_t>((stored << 1) | 1u));
+		case WDL_Entry::LOSE:    return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
+		case WDL_Entry::CURSED_WIN:
+		case WDL_Entry::BLESSED_LOSS:
+		case WDL_Entry::DRAW:
+		default:                 return DTM_Final_Entry::make_draw();
+	}
+}
+
+// DTM50 layer-k>0 decode. WDL=WIN at storage=0 is ambiguous between WIN(1)
+// and DTM50-DRAW (cursed route from this hmc). Resolve to DRAW; the prober
+// recovers WIN(1)/LOSS(0) locally via move-gen when needed. storage>0 still
+// disambiguates WIN/LOSE by class.
+NODISCARD constexpr DTM_Final_Entry dtm50_layered_entry_from_storage(uint16_t stored, WDL_Entry w)
+{
+	if (w == WDL_Entry::ILLEGAL) return DTM_Final_Entry::make_illegal();
+	if (stored == 0)             return DTM_Final_Entry::make_draw();
+	switch (w)
+	{
+		case WDL_Entry::WIN:  return DTM_Final_Entry::make_win(static_cast<uint16_t>((stored << 1) | 1u));
+		case WDL_Entry::LOSE: return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
+		case WDL_Entry::CURSED_WIN:
+		case WDL_Entry::BLESSED_LOSS:
+		case WDL_Entry::DRAW:
+		default:              return DTM_Final_Entry::make_draw();
 	}
 }
 

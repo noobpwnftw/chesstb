@@ -1,16 +1,20 @@
 # chesstb
 
-Chess endgame tablebase generator. Produces three tables per material:
+Chess endgame tablebase generator. Produces four tables per material:
 
 - **WDL** -- 50-move-rule-aware win/draw/loss with cursed/blessed classes.
 - **DTC** -- distance-to-conversion (plies to the next zeroing move:
   capture, promotion, or pawn push), 50-move-rule-aware.
 - **DTM** -- distance-to-mate, no 50-move-rule. Flat ply count to mate
   across all moves, including captures and promotions into sub-tablebases.
+- **DTM50** -- distance-to-mate under the 50-move rule. Per-hmc layered:
+  100 tables per material, one for each value of the halfmove clock. Each
+  layer answers "given this hmc, what's the optimal mate distance?"
+  exactly. Routes that would bust the 50MR window collapse to DRAW.
 
 WDL is the projection induced by the DTC table and is written alongside it.
-DTM is opt-in (additive after DTC) and depends on the WDL companion at
-probe time for class reconstruction.
+DTM and DTM50 are opt-in (additive after DTC); both depend on the WDL
+companion at probe time for class reconstruction.
 
 ## Features
 
@@ -53,6 +57,7 @@ The build produces:
 ./chesstb --list five.txt
 ./chesstb -r KQRBKQNP --mem 4096 -t 32
 ./chesstb -r KBNK --builddtm
+./chesstb -r KBNK --builddtm50
 ```
 
 Outputs:
@@ -60,13 +65,54 @@ Outputs:
 - `wdl/<material>.lzw`
 - `dtc/<material>.lzdtc`
 - `dtc/<material>.info`
-- `dtm/<material>.lzdtm`    (with `--builddtm`)
-- `dtm/<material>.info`     (with `--builddtm`)
+- `dtm/<material>.lzdtm`            (with `--builddtm`)
+- `dtm/<material>.info`             (with `--builddtm`)
+- `dtm50/<material>/h<hmc>.lzdtm50` (with `--builddtm50`, hmc = 0..99)
+- `dtm50/<material>/h<hmc>.info`    (with `--builddtm50`, hmc = 0..99)
 
 Requested materials are expanded through their capture/promotion
 dependency closure and generated in dependency order. The DTC pass always
-runs; the DTM pass runs after DTC for each material when `--builddtm` is
-set. Existing final files are skipped.
+runs; DTM/DTM50 passes run after DTC for each material when the matching
+flag is set. Existing final files are skipped.
+
+## DTM50
+
+The 50-move rule turns "distance to mate" into a moving target: a position
+that wins-in-200-plies-flat is a 50MR draw, but the same position with 30
+plies left on the clock might still win if a zeroing capture lands soon.
+Carrying the halfmove clock in the table itself solves that exactly --
+each material stores 100 layers, one per hmc, and each cell at layer k
+answers "what's optimal mate distance from here, given hmc = k?". Cells
+whose only winning route would bust the 50MR window collapse to DRAW at
+that layer, so probing returns the actual playable outcome rather than a
+pretend value.
+
+The generator builds layer 0 first as a retro fixed-point (in-material
+pawn pushes are zeroing and self-reference within the same layer), then
+hmc = 99 down to 1 top-down. Each k > 0 layer is a single forward pass:
+quiet moves read the partner color's k+1, in-material pushes read opp's
+hmc = 0, and cap/promo reads the sub-tablebase's hmc = 0. A per-color
+phase tape tracks plies-since-zeroing during the layer-0 retro; it's
+scratch state that's freed after each layer build (and checkpointed
+across an interrupt at hmc = 0).
+
+The 5-class WDL companion still does class duty for halved values. At
+hmc = 0 there's no ambiguity. At hmc > 0 a WDL=WIN cell might be DRAW
+in DTM50 because the only winning route is too long for the remaining
+window; both collapse to storage = 0 and the prober recovers WIN(1)/
+LOSS(0) by local move-gen when the WDL flags a decisive cell. Cursed
+and blessed classes always project to DRAW under DTM50 -- by
+construction those cells can't carry mate-in-≤1.
+
+Disk: one `.lzdtm50` per (material, hmc) under `dtm50/<material>/`.
+Probe: `Probe_Tables::probe(pos, rule50)` selects the right layer and
+returns DTM50 alongside the other fields.
+
+```sh
+./chesstb -r KBNK --builddtm50
+./chesstb --estimate -r KBNK --builddtm50
+./tests/probe_fen --children --rule50 50 "8/8/8/4k3/8/8/Q7/K7 w - - 50 1"
+```
 
 ## Memory
 
@@ -79,22 +125,26 @@ Use `--estimate` before a large run:
 ```sh
 ./chesstb --estimate -r KQRBKQNP
 ./chesstb --estimate -r KQRBKQNP --builddtm
+./chesstb --estimate -r KQRBKQNP --builddtm50
 ```
 
 The estimate reports total resident-table size and peak group counts for
-init and iterate passes. With `--builddtm`, the iterate peak unions
-opponent's pawn-push-target groups (DTM's `PAWN_EVAL` reads them forward).
+init and iterate passes. With `--builddtm`/`--builddtm50`, the iterate
+peak unions opponent's pawn-push-target groups (forward reads). DTM50
+additionally pins layer 0 and the just-built k+1 layer alongside the
+current write layer (3× the per-layer peak) plus a per-color phase tape.
 Generation can run beyond RAM since storage is split into load/evict
 groups and spilled as needed.
 
 ## Resume
 
 Generation is interruptible. `SIGINT` flushes dirty groups, writes a
-checkpoint with the current batch, fusion, phase, and ply, then exits.
-Re-run the same command to resume the in-progress material instead of
-restarting it. DTC and DTM each carry their own checkpoint files; the
-DTC pass restarts independently of DTM. Checkpoints and scratch group
-files are removed after `save_to_disk` completes.
+checkpoint with the current batch, fusion, phase, ply, and (for DTM50)
+hmc layer, then exits. Re-run the same command to resume the in-progress
+material instead of restarting. DTC, DTM, and DTM50 each carry their own
+checkpoint files; DTM50 additionally persists its phase tape on interrupt
+at hmc = 0. Checkpoints and scratch group files are removed after
+`save_to_disk` completes.
 
 ## Probe
 
@@ -102,13 +152,17 @@ files are removed after `save_to_disk` completes.
 ./run_probe "8/8/8/5k2/8/8/1Q6/K7 w"
 ./run_probe --children "8/8/8/6B1/3k4/3B4/p7/1K6 w - - 0 1"
 ./run_probe --wdl ./wdl --dtc ./dtc --dtm ./dtm "8/8/8/8/4k3/8/Q7/K7 w"
+./run_probe --rule50 50 --dtm50 ./dtm50 "8/8/8/4k3/8/8/Q7/K7 w - - 50 30"
 ```
 
-`run_probe` reports WDL, DTC (as `dtz`), and DTM (when present). It derives
-the material from the FEN, mirrors to the canonical table orientation when
-needed, and honors a legal FEN en-passant target. DTC and DTM both require
-the WDL companion to decode class; the probe gates each field on its
-companion being available.
+`run_probe` reports WDL, DTC (as `dtz`), DTM, and DTM50 when their tables
+are present. It derives the material from the FEN, mirrors to the
+canonical table orientation when needed, and honors a legal FEN
+en-passant target. DTC/DTM/DTM50 all require the WDL companion to decode
+class; the probe gates each field on its companion being available.
+`--rule50 N` selects the DTM50 layer; `--children` threads each child's
+hmc through (zeroing → 0, quiet → parent+1) so the per-child DTM50 value
+matches what the engine would see post-move.
 
 ## Verify
 
@@ -154,8 +208,10 @@ to exhaustive:
 `shrink` rewrites files in place, dropping the larger compressed STM
 color when it can be derived at probe time. The probe code detects
 dropped colors and reconstructs them by one-ply minimax against the kept
-color and sub-TBs. The DTC and DTM wire layouts are identical, so a
-single rank-encoded shrinker handles both.
+color and sub-TBs (DTM50 derive threads each child's hmc through the
+recursion so per-layer semantics are preserved). DTC, DTM, and DTM50
+share the rank-encoded wire layout so a single shrinker dispatches all
+three by magic.
 
 Shrink is a postprocessing step. The generator does not accept any
 dependency on shrunken files -- shipping-format files are treated as
@@ -165,7 +221,7 @@ absent and regenerated as full files.
 
 ```text
 src/chess/   board, moves, FEN
-src/egtb/    generator (DTC + DTM), compression, slicing, paging
+src/egtb/    generator (DTC + DTM + DTM50), compression, slicing, paging
 src/probe/   standalone probe library
 src/shrink/  shipping-format shrinker
 src/util/    allocation, threading, compression helpers
@@ -176,7 +232,9 @@ lib/         vendored LZ4, LZMA, zstd
 ## Notes
 
 - WDL files use `.lzw`.
-- DTC files use `.lzdtc`; DTM files use `.lzdtm`.
-- DTC scratch groups use `.dtcs`; DTM scratch groups use `.dtms` (both
-  under `--tmp`).
-- Building DTM standalone is not supported (requires the DTC-produced WDL).
+- DTC files use `.lzdtc`; DTM files use `.lzdtm`; DTM50 files use `.lzdtm50`.
+- DTC scratch groups use `.dtcs`; DTM scratch groups use `.dtms`; DTM50
+  scratch groups use `.dtm50s` (all under `--tmp`).
+- Building DTM or DTM50 standalone is not supported (both require the
+  DTC-produced WDL companion). DTM50 reuses DTC's 5-class WDL --
+  cursed/blessed project to DRAW via a 3-line fold at decode.

@@ -3,6 +3,7 @@
 
 #include "egtb/egtb_gen_dtc.h"
 #include "egtb/egtb_gen_dtm.h"
+#include "egtb/egtb_gen_dtm50.h"
 #include "egtb/egtb_probe.h"
 
 #include "util/endian.h"
@@ -32,12 +33,14 @@ struct Options
 	std::filesystem::path wdl_dir = "./wdl/";
 	std::filesystem::path dtc_dir = "./dtc/";
 	std::filesystem::path dtm_dir = "./dtm/";
+	std::filesystem::path dtm50_dir = "./dtm50/";
 	std::filesystem::path tmp_dir = "./tmp/";
 	std::vector<std::filesystem::path> info_paths;
 	size_t mem_mib = 0;
 	size_t enumerate_up_to = 0;
 	bool estimate_only = false;
 	bool build_dtm = false;
+	bool build_dtm50 = false;
 };
 
 static void print_usage()
@@ -51,8 +54,10 @@ static void print_usage()
 		"  --dtc DIR     DTC output directory (default: ./dtc/)\n"
 		"  --tmp DIR     scratch directory (default: ./tmp/)\n"
 		"  --dtm DIR     DTM output directory (default: ./dtm/)\n"
+		"  --dtm50 DIR   DTM50 output directory (default: ./dtm50/)\n"
 		"  --mem MiB     resident DTC memory cap per material (0 = unbounded)\n"
 		"  --builddtm    after DTC, also build DTM for each material\n"
+		"  --builddtm50  after DTC, also build DTM50 for each material\n"
 		"  --enumerate N print canonical material names with <= N total pieces\n"
 		"  --estimate    print the working-set estimate and exit\n"
 		"  --info PATHS  dump one or more EGTB_Info (.info) files and exit\n"
@@ -87,8 +92,10 @@ static bool parse_args(int argc, char** argv, Options& out)
 		else if (const char* v = take("--wdl"))  out.wdl_dir = v;
 		else if (const char* v = take("--dtc"))  out.dtc_dir = v;
 		else if (const char* v = take("--dtm"))  out.dtm_dir = v;
+		else if (const char* v = take("--dtm50")) out.dtm50_dir = v;
 		else if (const char* v = take("--tmp"))  out.tmp_dir = v;
 		else if (a == "--builddtm")              out.build_dtm = true;
+		else if (a == "--builddtm50")            out.build_dtm50 = true;
 		else if (const char* v = take("--mem"))  {
 			out.mem_mib = std::strtoull(v, nullptr, 10);
 			if (out.mem_mib > 0 && out.mem_mib < 64) out.mem_mib = 64;
@@ -271,7 +278,7 @@ int main(int argc, char** argv)
 				std::cout << ps.name() << ": <=2 pieces, trivial draw, no table generated\n";
 				continue;
 			}
-			const Working_Set_Estimate w = compute_working_set(ps, opt.build_dtm);
+			const Working_Set_Estimate w = compute_working_set(ps, opt.build_dtm || opt.build_dtm50);
 			std::cout << ps.name() << ":\n";
 			std::printf("  positions             : %zu\n", w.num_positions);
 			std::printf("  total table (resident): %s  (both colors)\n", fmt_bytes(w.total_table_bytes).c_str());
@@ -299,6 +306,11 @@ int main(int argc, char** argv)
 			std::printf("  init per-batch        : %zu groups = %s\n",
 				w.peak_batch_init_groups,
 				fmt_bytes(w.peak_batch_init_groups * w.bytes_per_group).c_str());
+			if (opt.build_dtm50)
+			{
+				std::printf("  dtm50 phase           : 3 * peaks above + phase %s\n",
+					fmt_bytes(static_cast<size_t>(2) * w.num_positions).c_str());
+			}
 			std::cout << "\n";
 		}
 		return 0;
@@ -308,6 +320,7 @@ int main(int argc, char** argv)
 	paths.add_wdl_path(opt.wdl_dir);
 	paths.add_dtc_path(opt.dtc_dir);
 	paths.add_dtm_path(opt.dtm_dir);
+	paths.add_dtm50_path(opt.dtm50_dir);
 	paths.set_tmp_path(opt.tmp_dir);
 	paths.init_directories();
 
@@ -427,6 +440,29 @@ int main(int argc, char** argv)
 			const auto t_end = std::chrono::steady_clock::now();
 			std::cout << "  " << ps.name() << " DTM done in " << format_elapsed_time(t_start, t_end)
 			          << "  (DTM " << std::filesystem::file_size(paths.dtm_save_path(ps)) << " B)\n";
+		}
+
+		// Optional DTM50 pass. Sub-TB reads target partner's hmc=0 layer;
+		// closure order ensures those exist before we get here.
+		if (opt.build_dtm50 && !paths.find_dtm50_file(ps))
+		{
+			std::cout << "  " << ps.name() << ": generating DTM50...\n";
+			const auto t_start = std::chrono::steady_clock::now();
+
+			auto subs = EGTB_Generator::open_sub_probes<DTM50_Sub_File_Flat>(ps, paths, inout_param(pool));
+			DTM50_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
+			try
+			{
+				g.gen(inout_param(pool), paths);
+				g.save_to_disk(inout_param(pool), paths);
+			}
+			catch (const DTM50_Interrupted&)
+			{
+				return 130;
+			}
+
+			const auto t_end = std::chrono::steady_clock::now();
+			std::cout << "  " << ps.name() << " DTM50 done in " << format_elapsed_time(t_start, t_end) << "\n";
 		}
 	}
 	const auto t_total_end = std::chrono::steady_clock::now();

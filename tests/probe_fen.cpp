@@ -49,8 +49,10 @@ struct Options
 	std::string wdl_dir = "./wdl/";
 	std::string dtc_dir = "./dtc/";
 	std::string dtm_dir = "./dtm/";
+	std::string dtm50_dir = "./dtm50/";
 	bool dump_children = false;
 	size_t child_limit = 9999;
+	unsigned rule50 = 0;
 };
 
 struct Probe
@@ -68,11 +70,13 @@ struct Probe
 		"  %s [options] \"FEN\" w|b\n"
 		"\n"
 		"Options:\n"
-		"  --children        dump legal child moves and post-move disk WDL/DTC/DTM\n"
+		"  --children        dump legal child moves and post-move disk WDL/DTC/DTM/DTM50\n"
 		"  --limit N         max children to print (default: all)\n"
 		"  --wdl DIR         WDL directory (default ./wdl/)\n"
 		"  --dtc DIR         DTC directory (default ./dtc/)\n"
 		"  --dtm DIR         DTM directory (default ./dtm/)\n"
+		"  --dtm50 DIR       DTM50 directory (default ./dtm50/)\n"
+		"  --rule50 N        halfmove clock at the root for DTM50 layer selection (default 0)\n"
 		"  --help            this help\n",
 		argv0, argv0);
 	std::exit(2);
@@ -158,7 +162,23 @@ void print_probe_result(const Probe_Result& r, const char* prefix)
 	if (r.has_dtc) std::printf(" dtz=%u", static_cast<unsigned>(r.dtc.value()));
 	else           std::printf(" dtc=<missing>");
 	if (r.has_dtm) std::printf(" dtm=%u", static_cast<unsigned>(r.dtm.value()));
+	if (r.has_dtm50)
+	{
+		std::printf(" dtm50=%s",
+			r.dtm50.is_win()  ? "WIN"  :
+			r.dtm50.is_loss() ? "LOSS" :
+			r.dtm50.is_draw() ? "DRAW" : "?");
+		if (r.dtm50.is_win() || r.dtm50.is_loss())
+			std::printf("(%u)", static_cast<unsigned>(r.dtm50.value()));
+	}
 	std::printf("\n");
+}
+
+bool move_is_zeroing(const Position& pos, Move m)
+{
+	return piece_type(pos.piece_at(m.from())) == PAWN
+	    || pos.piece_at(m.to()) != PIECE_NONE
+	    || m.is_ep_capture();
 }
 
 // Local copy of probe.cpp's same-named helper.
@@ -210,6 +230,9 @@ void dump_children(const Options& opt, Probe_Tables* tables,
 		if (!root.is_pseudo_legal_move_legal(m)) continue;
 		if (printed >= opt.child_limit) break;
 
+		const bool zeroing = move_is_zeroing(root, m);
+		const unsigned child_rule50 = zeroing ? 0u : opt.rule50 + 1u;
+
 		Position child = root;
 		const Piece captured = child.do_move(m);
 		const Piece_Config child_ps = canonical_ps(child);
@@ -227,8 +250,8 @@ void dump_children(const Options& opt, Probe_Tables* tables,
 			is_pawn           ? "pawn-push" :
 			                    "quiet";
 
-		std::printf("    %-5s %-10s mat=%-8s stm=%s",
-			mbuf, kind, child_ps.name().c_str(), color_name(child.turn()));
+		std::printf("    %-5s %-10s mat=%-8s stm=%s hmc=%u",
+			mbuf, kind, child_ps.name().c_str(), color_name(child.turn()), child_rule50);
 		if (!same_material) std::printf(" sub");
 		std::printf("\n");
 
@@ -239,10 +262,11 @@ void dump_children(const Options& opt, Probe_Tables* tables,
 			r.wdl = WDL_Entry::DRAW;
 			r.has_dtc = true; r.dtc = DTC_Final_Entry::make_draw();
 			r.has_dtm = true; r.dtm = DTM_Final_Entry::make_draw();
+			r.has_dtm50 = true; r.dtm50 = DTM_Final_Entry::make_draw();
 		}
 		else
 		{
-			r = tables->probe(child);
+			r = tables->probe(child, child_rule50);
 		}
 		print_probe_result(r, "      ");
 		++printed;
@@ -272,7 +296,8 @@ void probe_one(const Options& opt, Probe_Tables* tables, const Probe& probe)
 			fen_ep_token(probe.fen).c_str(),
 			count_legal_ep_moves(root.pos, root.ep_square));
 
-	const Probe_Result r = tables->probe(root.ps, root.pos, root.ep_square);
+	const Probe_Result r = tables->probe(root.ps, root.pos, root.ep_square, opt.rule50);
+	std::printf("  hmc=%u\n", opt.rule50);
 	print_probe_result(r, "  result: ");
 
 	if (opt.dump_children) dump_children(opt, tables, root.pos, root.ps, root.ep_square);
@@ -290,6 +315,8 @@ std::vector<Probe> parse_args(int argc, char** argv, Options* opt)
 		if (a == "--wdl")   { if (++i >= argc) usage(argv[0]); opt->wdl_dir = argv[i]; continue; }
 		if (a == "--dtc")   { if (++i >= argc) usage(argv[0]); opt->dtc_dir = argv[i]; continue; }
 		if (a == "--dtm")   { if (++i >= argc) usage(argv[0]); opt->dtm_dir = argv[i]; continue; }
+		if (a == "--dtm50") { if (++i >= argc) usage(argv[0]); opt->dtm50_dir = argv[i]; continue; }
+		if (a == "--rule50"){ if (++i >= argc) usage(argv[0]); opt->rule50 = static_cast<unsigned>(std::strtoul(argv[i], nullptr, 10)); continue; }
 		if (!a.empty() && a[0] == '-') usage(argv[0]);
 		args.push_back(a);
 	}
@@ -323,6 +350,7 @@ int main(int argc, char** argv)
 	tables.add_wdl_path(opt.wdl_dir);
 	tables.add_dtc_path(opt.dtc_dir);
 	tables.add_dtm_path(opt.dtm_dir);
+	tables.add_dtm50_path(opt.dtm50_dir);
 
 	for (const Probe& p : probes) probe_one(opt, &tables, p);
 	return 0;

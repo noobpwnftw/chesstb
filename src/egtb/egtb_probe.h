@@ -74,18 +74,24 @@ struct EGTB_Paths
 	static inline const std::string WDL_EXT = ".lzw";
 	static inline const std::string DTC_EXT = ".lzdtc";
 	static inline const std::string DTM_EXT = ".lzdtm";
+	static inline const std::string DTM50_EXT = ".lzdtm50";
 	static inline const std::string INFO_EXT = ".info";
 	static inline const std::string DTC_SLICE_EXT[COLOR_NB] = { ".w.dtcs", ".b.dtcs" };
 	static inline const std::string DTM_SLICE_EXT[COLOR_NB] = { ".w.dtms", ".b.dtms" };
+	static inline const std::string DTM50_SLICE_EXT[COLOR_NB] = { ".w.dtm50s", ".b.dtm50s" };
 	static inline const std::string DTC_CKPT_EXT = ".dtc.ckpt";
 	static inline const std::string DTM_CKPT_EXT = ".dtm.ckpt";
+	static inline const std::string DTM50_CKPT_EXT = ".dtm50.ckpt";
+	static inline const std::string DTM50_PHASE_EXT[COLOR_NB] = { ".dtm50.phase.w", ".dtm50.phase.b" };
 	static inline const std::string DTM_SUB_FLAT_EXT[COLOR_NB] = { ".dtm.subflat.w", ".dtm.subflat.b" };
+	static inline const std::string DTM50_SUB_FLAT_EXT[COLOR_NB] = { ".dtm50.subflat.w", ".dtm50.subflat.b" };
 
 	EGTB_Paths() = default;
 
 	void add_dtc_path(std::filesystem::path s) { m_dtc_paths.emplace_back(std::move(s)); }
 	void add_wdl_path(std::filesystem::path s) { m_wdl_paths.emplace_back(std::move(s)); }
 	void add_dtm_path(std::filesystem::path s) { m_dtm_paths.emplace_back(std::move(s)); }
+	void add_dtm50_path(std::filesystem::path s) { m_dtm50_paths.emplace_back(std::move(s)); }
 	void set_tmp_path(std::filesystem::path s) { m_tmp_path = std::move(s); }
 
 	void init_directories() const
@@ -94,6 +100,7 @@ struct EGTB_Paths
 		for (const auto& p : m_wdl_paths) std::filesystem::create_directories(p);
 		for (const auto& p : m_dtc_paths) std::filesystem::create_directories(p);
 		for (const auto& p : m_dtm_paths) std::filesystem::create_directories(p);
+		for (const auto& p : m_dtm50_paths) std::filesystem::create_directories(p);
 	}
 
 	NODISCARD bool find_wdl_file(const Piece_Config& ps, std::filesystem::path* tb = nullptr) const
@@ -120,12 +127,34 @@ struct EGTB_Paths
 		if (tb) *tb = std::move(found);
 		return true;
 	}
+	// dtm50/<name>/h<hmc>.lzdtm50 — one subfolder per piece config.
+	NODISCARD bool find_dtm50_file(const Piece_Config& ps, std::filesystem::path* tb = nullptr, uint16_t hmc = 0) const
+	{
+		const std::string fn = "h" + std::to_string(hmc) + DTM50_EXT;
+		for (const auto& dir : m_dtm50_paths)
+		{
+			const auto path = path_join(dir, ps.name()) / fn;
+			if (!std::filesystem::exists(path)) continue;
+			if (!tb_file_is_full_format(path, EGTB_Magic::DTM50_MAGIC)) continue;
+			if (tb) *tb = path;
+			return true;
+		}
+		return false;
+	}
 
 	NODISCARD std::filesystem::path wdl_save_path(const Piece_Config& ps) const { return path_join(m_wdl_paths[0], ps.name() + WDL_EXT); }
 	NODISCARD std::filesystem::path dtc_save_path(const Piece_Config& ps) const { return path_join(m_dtc_paths[0], ps.name() + DTC_EXT); }
 	NODISCARD std::filesystem::path dtc_info_save_path(const Piece_Config& ps) const { return path_join(m_dtc_paths[0], ps.name() + INFO_EXT); }
 	NODISCARD std::filesystem::path dtm_save_path(const Piece_Config& ps) const { return path_join(m_dtm_paths[0], ps.name() + DTM_EXT); }
 	NODISCARD std::filesystem::path dtm_info_save_path(const Piece_Config& ps) const { return path_join(m_dtm_paths[0], ps.name() + INFO_EXT); }
+	NODISCARD std::filesystem::path dtm50_save_path(const Piece_Config& ps, uint16_t hmc = 0) const
+	{
+		return path_join(m_dtm50_paths[0], ps.name()) / ("h" + std::to_string(hmc) + DTM50_EXT);
+	}
+	NODISCARD std::filesystem::path dtm50_info_save_path(const Piece_Config& ps, uint16_t hmc = 0) const
+	{
+		return path_join(m_dtm50_paths[0], ps.name()) / ("h" + std::to_string(hmc) + INFO_EXT);
+	}
 
 	NODISCARD std::filesystem::path dtc_slice_save_path(const Piece_Config& ps, Color c) const
 	{
@@ -148,9 +177,21 @@ struct EGTB_Paths
 	{
 		return path_join(m_tmp_path, ps.name() + DTM_CKPT_EXT);
 	}
+	NODISCARD std::filesystem::path dtm50_checkpoint_path(const Piece_Config& ps) const
+	{
+		return path_join(m_tmp_path, ps.name() + DTM50_CKPT_EXT);
+	}
+	NODISCARD std::filesystem::path dtm50_phase_path(const Piece_Config& ps, Color c) const
+	{
+		return path_join(m_tmp_path, ps.name() + DTM50_PHASE_EXT[c]);
+	}
 	NODISCARD std::filesystem::path dtm_sub_flat_path(const Piece_Config& ps, Color c) const
 	{
 		return path_join(m_tmp_path, ps.name() + DTM_SUB_FLAT_EXT[c]);
+	}
+	NODISCARD std::filesystem::path dtm50_sub_flat_path(const Piece_Config& ps, Color c) const
+	{
+		return path_join(m_tmp_path, ps.name() + DTM50_SUB_FLAT_EXT[c]);
 	}
 
 private:
@@ -158,6 +199,7 @@ private:
 	std::vector<std::filesystem::path> m_dtc_paths = { "./dtc/" };
 	std::vector<std::filesystem::path> m_wdl_paths = { "./wdl/" };
 	std::vector<std::filesystem::path> m_dtm_paths = { "./dtm/" };
+	std::vector<std::filesystem::path> m_dtm50_paths = { "./dtm50/" };
 
 	NODISCARD bool find_tb_file(
 		const Piece_Config& ps,
@@ -580,6 +622,62 @@ struct DTM_Sub_File_Flat
 
 	// thread_id is accepted (and ignored) so this reader is a drop-in for
 	// DTM_File_For_Probe::read at the call site — swap the type, keep the call.
+	NODISCARD DTM_Final_Entry read(Color color, Board_Index pos, size_t /*thread_id*/ = 0) const
+	{
+		DTM_Final_Entry e;
+		std::memcpy(&e,
+		            m_files[color].data() + static_cast<size_t>(pos) * sizeof(DTM_Final_Entry),
+		            sizeof(DTM_Final_Entry));
+		return e;
+	}
+
+	Memory_Mapped_File m_files[COLOR_NB];
+	Temporary_File_Tracker m_tmp_files;
+};
+
+// =============================================================================
+// DTM50_Sub_File_Flat: layer-0 sub-table reader for DTM50 — same shape as
+// DTM_Sub_File_Flat but reads dtm50/<name>/h0.lzdtm50 and decodes with
+// dtm50_entry_from_storage (cursed/blessed → DRAW).
+// =============================================================================
+
+struct DTM50_Sub_File_Flat;
+
+void load_dtm50_sub_flat(
+	Out_Param<DTM50_Sub_File_Flat> flat,
+	const EGTB_Paths& egtb_files,
+	const Piece_Config& ps,
+	In_Out_Param<Thread_Pool> thread_pool);
+
+struct DTM50_Sub_File_Flat
+{
+	DTM50_Sub_File_Flat() = default;
+
+	DTM50_Sub_File_Flat(const EGTB_Paths& egtb_files, const Piece_Config& ps,
+		In_Out_Param<Thread_Pool> thread_pool)
+	{
+		open(egtb_files, ps, thread_pool);
+	}
+
+	DTM50_Sub_File_Flat(const DTM50_Sub_File_Flat&) = delete;
+	DTM50_Sub_File_Flat(DTM50_Sub_File_Flat&&) noexcept = default;
+	DTM50_Sub_File_Flat& operator=(const DTM50_Sub_File_Flat&) = delete;
+	DTM50_Sub_File_Flat& operator=(DTM50_Sub_File_Flat&&) noexcept = default;
+	~DTM50_Sub_File_Flat() { close(); }
+
+	void open(const EGTB_Paths& egtb_files, const Piece_Config& ps,
+		In_Out_Param<Thread_Pool> thread_pool)
+	{
+		load_dtm50_sub_flat(out_param(*this), egtb_files, ps, thread_pool);
+	}
+
+	void close()
+	{
+		for (Color c : { WHITE, BLACK })
+			m_files[c].close();
+		m_tmp_files.clear();
+	}
+
 	NODISCARD DTM_Final_Entry read(Color color, Board_Index pos, size_t /*thread_id*/ = 0) const
 	{
 		DTM_Final_Entry e;

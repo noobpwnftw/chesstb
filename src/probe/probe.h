@@ -1,6 +1,6 @@
 #pragma once
 
-// Probe .lzw/.lzdtc/.lzdtm tables without depending on the generator tools.
+// Probe .lzw/.lzdtc/.lzdtm/.lzdtm50 tables without depending on the generator.
 //
 // probe() and probe_root_*() are thread-safe after path setup. add_*_path()
 // and init() must not run concurrently with probes.
@@ -32,6 +32,9 @@ struct Probe_Result
 	DTC_Final_Entry dtc;
 	bool has_dtm = false;
 	DTM_Final_Entry dtm;
+	// DTM50 at the caller's rule50; cursed/blessed → DRAW.
+	bool has_dtm50 = false;
+	DTM_Final_Entry dtm50;
 };
 
 // Ranked legal move. Fields mirror Fathom's TbRootMove.
@@ -58,18 +61,21 @@ struct Probe_Tables
 	void add_wdl_path(std::filesystem::path dir);
 	void add_dtc_path(std::filesystem::path dir);
 	void add_dtm_path(std::filesystem::path dir);
+	void add_dtm50_path(std::filesystem::path dir);
 
-	// Add `dir`, or its wdl/dtc/dtm subdirs when present, and update largest().
+	// Add `dir`, or its wdl/dtc/dtm/dtm50 subdirs when present, and update largest().
 	bool init(const std::filesystem::path& dir);
 
 	// Maximum piece count, including kings, found on disk.
 	NODISCARD size_t largest() const;
 	void rescan();
 
-	NODISCARD Probe_Result probe(const Position& pos);
-	NODISCARD Probe_Result probe(const Position& pos, Square ep_square);
-	NODISCARD Probe_Result probe(const Piece_Config& ps, const Position& pos);
-	NODISCARD Probe_Result probe(const Piece_Config& ps, const Position& pos, Square ep_square);
+	// rule50 selects the DTM50 layer (default 0 = fresh-window). has_dtm50
+	// stays false when no DTM50 file is on disk; callers can ignore the field.
+	NODISCARD Probe_Result probe(const Position& pos, unsigned rule50 = 0);
+	NODISCARD Probe_Result probe(const Position& pos, Square ep_square, unsigned rule50 = 0);
+	NODISCARD Probe_Result probe(const Piece_Config& ps, const Position& pos, unsigned rule50 = 0);
+	NODISCARD Probe_Result probe(const Piece_Config& ps, const Position& pos, Square ep_square, unsigned rule50 = 0);
 
 	// Search-time WDL probe. Fathom semantics reject nonzero rule50.
 	NODISCARD WDL_Entry probe_wdl(const Position& pos, Square ep_square, unsigned rule50);
