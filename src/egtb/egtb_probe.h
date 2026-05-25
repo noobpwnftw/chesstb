@@ -631,7 +631,7 @@ struct DTM_Sub_File_Flat
 
 // =============================================================================
 // DTM50_Sub_File_Flat: layer-0 sub-table reader for DTM50 — same shape as
-// DTM_Sub_File_Flat but reads dtm50/<name>/h0.lzdtm50 and decodes with
+// DTM_Sub_File_Flat but reads dtm50/<name>.lzdtm50 and decodes with
 // dtm50_entry_from_storage (cursed/blessed → DRAW).
 // =============================================================================
 

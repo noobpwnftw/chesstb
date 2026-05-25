@@ -146,7 +146,7 @@ bool check_material(const Options& opt, const std::string& name)
 
 	const auto dtc_path = std::filesystem::path(opt.dtc_dir) / (ps.name() + ".lzdtc");
 	const auto dtm_path = std::filesystem::path(opt.dtm_dir) / (ps.name() + ".lzdtm");
-	const auto dtm50_path = std::filesystem::path(opt.dtm50_dir) / ps.name() / "h0.lzdtm50";
+	const auto dtm50_path = std::filesystem::path(opt.dtm50_dir) / (ps.name() + ".lzdtm50");
 	const bool have_dtc = std::filesystem::exists(dtc_path);
 	const bool have_dtm = std::filesystem::exists(dtm_path);
 	const bool have_dtm50 = std::filesystem::exists(dtm50_path);

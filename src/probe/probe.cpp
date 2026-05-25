@@ -1751,21 +1751,7 @@ void Probe_Tables::Impl::scan_paths()
 	for (const auto& d : wdl_dirs) scan_dir(d, WDL_EXT);
 	for (const auto& d : dtc_dirs) scan_dir(d, DTC_EXT);
 	for (const auto& d : dtm_dirs) scan_dir(d, DTM_EXT);
-	// DTM50 lives in per-material subfolders; the material name is the folder
-	// name itself rather than the file basename.
-	auto scan_dtm50_dir = [&](const std::filesystem::path& dir) {
-		std::error_code ec;
-		if (!std::filesystem::is_directory(dir, ec)) return;
-		for (auto& e : std::filesystem::directory_iterator(dir, ec))
-		{
-			if (ec) break;
-			if (!e.is_directory(ec)) continue;
-			const std::string n = e.path().filename().string();
-			const size_t cnt = count_pieces_from_filename(n + ".");
-			if (cnt > lg) lg = cnt;
-		}
-	};
-	for (const auto& d : dtm50_dirs) scan_dtm50_dir(d);
+	for (const auto& d : dtm50_dirs) scan_dir(d, DTM50_EXT);
 	largest_pieces.store(lg, std::memory_order_release);
 }
 
