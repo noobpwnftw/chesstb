@@ -608,7 +608,7 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 	}
 
 	const auto t_total_end = std::chrono::steady_clock::now();
-	std::printf("  gen (%zu hmc layers): done in %s (%zu pawn-slice pairs in %zu batches, %zu fusion groups)\n",
+	std::printf("  gen (%u hmc layers): done in %s (%zu pawn-slice pairs in %zu batches, %zu fusion groups)\n",
 		DTM50_HMC_COUNT,
 		format_elapsed_time(t_total_start, t_total_end).c_str(),
 		total_pairs, batches.size(), total_fusions);
