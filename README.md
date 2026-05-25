@@ -131,10 +131,12 @@ Use `--estimate` before a large run:
 The estimate reports total resident-table size and peak group counts for
 init and iterate passes. With `--builddtm`/`--builddtm50`, the iterate
 peak unions opponent's pawn-push-target groups (forward reads). DTM50
-additionally pins layer 0 and the just-built k+1 layer alongside the
-current write layer (3× the per-layer peak) plus a per-color phase tape.
-Generation can run beyond RAM since storage is split into load/evict
-groups and spilled as needed.
+pins layer 0 and the just-built k+1 layer alongside the current write
+layer (3× the per-layer peak) for k > 0 builds; the phase tape is
+allocated lazily for the layer-0 build only and freed before any k > 0
+build starts, so it never contributes to peak resident. Generation can
+run beyond RAM since storage is split into load/evict groups and
+spilled as needed.
 
 ## Resume
 

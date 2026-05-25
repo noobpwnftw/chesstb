@@ -18,9 +18,9 @@ enum struct EGTB_Magic : uint64_t
 	DTC_SLICE_MAGIC = 0xd1cef11e51ce0001ULL,
 	DTM_MAGIC       = 0xabc98e32,
 	DTM_SLICE_MAGIC = 0xd1cef11e51ce0002ULL,
-	DTM50_MAGIC       = 0xabc98e50,
-	DTM50_SLICE_MAGIC = 0xd1cef11e51ce0050ULL,
-	DTM50_PHASE_MAGIC = 0xd1cef11e51ce0051ULL,
+	DTM50_MAGIC             = 0xabc98e50,
+	DTM50_SLICE_MAGIC       = 0xd1cef11e51ce0050ULL,
+	DTM50_PHASE_SLICE_MAGIC = 0xd1cef11e51ce0051ULL,
 };
 
 // WDL_Entry: 5-value + ILLEGAL sentinel, 4 bits per entry.
@@ -442,6 +442,18 @@ NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_
 		default:                      return DTM_Final_Entry::make_draw();
 	}
 }
+
+// 1-byte cell used for DTM50's per-cell phase tape. Stored through the same
+// Sliced_EGTB_File_For_Gen path as DTM entries so it benefits from per-group
+// paging and disk spill. The trait `is_allowed_flag_type` is never consulted
+// (we don't call add_flags / lock_add_flags on the phase slice).
+struct DTM50_Phase_Entry
+{
+	constexpr DTM50_Phase_Entry() : v(0) {}
+	constexpr DTM50_Phase_Entry(uint8_t x) : v(x) {}
+	uint8_t v;
+};
+static_assert(sizeof(DTM50_Phase_Entry) == 1);
 
 // DTM50 layer-0 decode. Reuses DTC's 5-class WDL: cursed/blessed → DRAW;
 // strict WIN/LOSE → halved class+value. No ambiguity at hmc=0 because a cell

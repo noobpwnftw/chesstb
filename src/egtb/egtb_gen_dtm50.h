@@ -13,7 +13,6 @@
 #include "chess/attack.h"
 #include "chess/piece_config.h"
 
-#include "util/allocation.h"
 #include "util/defines.h"
 #include "util/param.h"
 #include "util/thread_pool.h"
@@ -46,9 +45,10 @@ struct DTM50_Table
 {
 	Piece_Config_For_Gen m_epsi;
 	Sliced_EGTB_File_For_Gen<DTM_Final_Entry> m_dtm[COLOR_NB][DTM50_HMC_COUNT];
-	// Per-color phase scratch: plies-since-last-zeroing along chosen route.
-	// Reused across layers; reset at start of each layer's build.
-	Huge_Array<uint8_t> m_phase[COLOR_NB];
+	// Per-color phase tape (plies-since-zeroing along the route). Slice-backed
+	// so apply_working_set pages it alongside the data layers during the
+	// layer-0 retro. Used by hmc=0 only; disk files removed when layer 0 done.
+	Sliced_EGTB_File_For_Gen<DTM50_Phase_Entry> m_phase[COLOR_NB];
 	bool m_is_symmetric = false;
 
 	DTM50_Table(const Piece_Config& ps, const std::filesystem::path& tmp_dir) :
@@ -67,8 +67,9 @@ struct DTM50_Table
 			m_dtm[WHITE][hmc].create(ns, per, tmp_dir, magic, w_fmt);
 			m_dtm[BLACK][hmc].create(ns, per, tmp_dir, magic, b_fmt);
 		}
-		m_phase[WHITE] = Huge_Array<uint8_t>(np);
-		m_phase[BLACK] = Huge_Array<uint8_t>(np);
+		const uint64_t phase_magic = static_cast<uint64_t>(EGTB_Magic::DTM50_PHASE_SLICE_MAGIC);
+		m_phase[WHITE].create(ns, per, tmp_dir, phase_magic, name + ".w.phase.%05zu.dtm50p");
+		m_phase[BLACK].create(ns, per, tmp_dir, phase_magic, name + ".b.phase.%05zu.dtm50p");
 	}
 
 	DTM50_Table(const DTM50_Table&) = delete;
@@ -122,14 +123,18 @@ private:
 		mark_iter(stm, pos, cur_layer(stm));
 	}
 
-	// Phase = plies-since-zeroing along the route. >100 ⇒ cursed, collapse to DRAW.
+	// Phase = plies-since-zeroing along the route. >100 ⇒ cursed, collapse to
+	// DRAW. Used by hmc=0 retro only; helpers no-op at k>0 since phase isn't
+	// consumed there and the slice isn't paged in.
 	NODISCARD INLINE uint8_t read_phase(Board_Index pos, Color stm) const
 	{
-		return m_table->m_phase[stm][static_cast<size_t>(pos)];
+		if (m_current_hmc != 0) return 0;
+		return m_table->m_phase[stm].read(pos).v;
 	}
 	INLINE void write_phase(Board_Index pos, Color stm, uint8_t v)
 	{
-		m_table->m_phase[stm][static_cast<size_t>(pos)] = v;
+		if (m_current_hmc != 0) return;
+		m_table->m_phase[stm].write(DTM50_Phase_Entry{v}, pos);
 	}
 
 	NODISCARD DTM_Final_Entry read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
@@ -183,6 +188,4 @@ private:
 
 	void page_in_for_group(In_Out_Param<Thread_Pool> thread_pool,
 	                       Color me, size_t group_id);
-
-	void reset_layer_state();
 };

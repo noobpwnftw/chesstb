@@ -82,7 +82,6 @@ struct EGTB_Paths
 	static inline const std::string DTC_CKPT_EXT = ".dtc.ckpt";
 	static inline const std::string DTM_CKPT_EXT = ".dtm.ckpt";
 	static inline const std::string DTM50_CKPT_EXT = ".dtm50.ckpt";
-	static inline const std::string DTM50_PHASE_EXT[COLOR_NB] = { ".dtm50.phase.w", ".dtm50.phase.b" };
 	static inline const std::string DTM_SUB_FLAT_EXT[COLOR_NB] = { ".dtm.subflat.w", ".dtm.subflat.b" };
 	static inline const std::string DTM50_SUB_FLAT_EXT[COLOR_NB] = { ".dtm50.subflat.w", ".dtm50.subflat.b" };
 
@@ -180,10 +179,6 @@ struct EGTB_Paths
 	NODISCARD std::filesystem::path dtm50_checkpoint_path(const Piece_Config& ps) const
 	{
 		return path_join(m_tmp_path, ps.name() + DTM50_CKPT_EXT);
-	}
-	NODISCARD std::filesystem::path dtm50_phase_path(const Piece_Config& ps, Color c) const
-	{
-		return path_join(m_tmp_path, ps.name() + DTM50_PHASE_EXT[c]);
 	}
 	NODISCARD std::filesystem::path dtm_sub_flat_path(const Piece_Config& ps, Color c) const
 	{

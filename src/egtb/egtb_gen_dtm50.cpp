@@ -77,13 +77,6 @@ void remove_checkpoint(const std::filesystem::path& p)
 	std::filesystem::remove(p, ec);
 }
 
-void remove_phase_files(const EGTB_Paths& paths, const Piece_Config& ps)
-{
-	std::error_code ec;
-	std::filesystem::remove(paths.dtm50_phase_path(ps, WHITE), ec);
-	std::filesystem::remove(paths.dtm50_phase_path(ps, BLACK), ec);
-}
-
 }  // namespace
 
 DTM50_Generator::DTM50_Generator(
@@ -417,6 +410,13 @@ uint16_t DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 					&m_table->m_dtm[BLACK][m_current_hmc + 1],
 					m_scratch_need[WHITE], m_scratch_need[BLACK]);
 			}
+		}
+		else
+		{
+			// Layer-0 init writes phase=0 seeds — page the phase slices in.
+			apply_working_set(thread_pool,
+				&m_table->m_phase[WHITE], &m_table->m_phase[BLACK],
+				m_scratch_need[WHITE], m_scratch_need[BLACK]);
 		}
 	};
 
@@ -980,7 +980,8 @@ void DTM50_Generator::page_in_for_group(In_Out_Param<Thread_Pool> thread_pool,
 	}
 
 	apply_working_set(thread_pool, &cur_layer(WHITE), &cur_layer(BLACK), m_scratch_need[WHITE], m_scratch_need[BLACK]);
-	// Same need bitmaps page opp hmc=0 / hmc=k+1 for layer-k retro.
+	// Same need bitmaps page opp hmc=0 / hmc=k+1 for layer-k retro; phase
+	// slices come along for layer-0 retro.
 	if (m_current_hmc != 0)
 	{
 		apply_working_set(thread_pool,
@@ -994,14 +995,12 @@ void DTM50_Generator::page_in_for_group(In_Out_Param<Thread_Pool> thread_pool,
 				m_scratch_need[WHITE], m_scratch_need[BLACK]);
 		}
 	}
-}
-
-void DTM50_Generator::reset_layer_state()
-{
-	std::memset(m_table->m_phase[WHITE].data(), 0, m_table->m_phase[WHITE].size());
-	std::memset(m_table->m_phase[BLACK].data(), 0, m_table->m_phase[BLACK].size());
-	m_max_dtm = 0;
-	seed_iter_groups();
+	else
+	{
+		apply_working_set(thread_pool,
+			&m_table->m_phase[WHITE], &m_table->m_phase[BLACK],
+			m_scratch_need[WHITE], m_scratch_need[BLACK]);
+	}
 }
 
 // =============================================================================
@@ -1040,7 +1039,8 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 				m_table->m_dtm[WHITE][h].remove_disk_files();
 				m_table->m_dtm[BLACK][h].remove_disk_files();
 			}
-			remove_phase_files(paths, m_epsi);
+			m_table->m_phase[WHITE].remove_disk_files();
+			m_table->m_phase[BLACK].remove_disk_files();
 		}
 	}
 
@@ -1050,8 +1050,9 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 		m_current_hmc = hmc;
 
 		// Unbounded budget: pre-load this layer plus the read-only layers it
-		// consumes (opp hmc=0 for in-M push, opp hmc=k+1 for quiet). Bounded
-		// paths page those alongside the write layer inside page_in_for_*.
+		// consumes (opp hmc=0 for in-M push, opp hmc=k+1 for quiet). At hmc=0
+		// also pre-load the phase slices. Bounded paths page those alongside
+		// the write layer inside page_in_for_*.
 		if (m_paging_budget_bytes == 0)
 		{
 			const size_t ng = cur_layer(WHITE).num_groups();
@@ -1069,6 +1070,12 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 						all_needed, all_needed);
 				}
 			}
+			else
+			{
+				apply_working_set(thread_pool,
+					&m_table->m_phase[WHITE], &m_table->m_phase[BLACK],
+					all_needed, all_needed);
+			}
 		}
 
 		// k+2 was the previous build's quiet-read layer; no future consumer.
@@ -1076,26 +1083,6 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 		{
 			m_table->m_dtm[WHITE][hmc + 2].evict_all(*thread_pool);
 			m_table->m_dtm[BLACK][hmc + 2].evict_all(*thread_pool);
-		}
-
-		// Phase tape: hmc=0 needs restore on mid-layer resume (retro state);
-		// hmc>0 has no in-layer chain so resetting is fine.
-		const bool resume_into_hmc0 = (hmc == 0 && hmc == resume_hmc && resume_batch_idx >= 0);
-		if (resume_into_hmc0)
-		{
-			load_group_raw(m_table->m_phase[WHITE].data(),
-				m_table->m_phase[WHITE].size(),
-				paths.dtm50_phase_path(m_epsi, WHITE),
-				static_cast<uint64_t>(EGTB_Magic::DTM50_PHASE_MAGIC));
-			load_group_raw(m_table->m_phase[BLACK].data(),
-				m_table->m_phase[BLACK].size(),
-				paths.dtm50_phase_path(m_epsi, BLACK),
-				static_cast<uint64_t>(EGTB_Magic::DTM50_PHASE_MAGIC));
-		}
-		else
-		{
-			std::memset(m_table->m_phase[WHITE].data(), 0, m_table->m_phase[WHITE].size());
-			std::memset(m_table->m_phase[BLACK].data(), 0, m_table->m_phase[BLACK].size());
 		}
 
 		size_t total_fusions = 0;
@@ -1159,23 +1146,14 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 				}
 				catch (const DTM50_Interrupted& e)
 				{
-					// hmc=0 has live phase tape state; persist for resume.
-					if (hmc == 0)
-					{
-						save_group_raw(m_table->m_phase[WHITE].data(),
-							m_table->m_phase[WHITE].size(),
-							paths.dtm50_phase_path(m_epsi, WHITE),
-							static_cast<uint64_t>(EGTB_Magic::DTM50_PHASE_MAGIC));
-						save_group_raw(m_table->m_phase[BLACK].data(),
-							m_table->m_phase[BLACK].size(),
-							paths.dtm50_phase_path(m_epsi, BLACK),
-							static_cast<uint64_t>(EGTB_Magic::DTM50_PHASE_MAGIC));
-					}
 					for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
 					{
 						m_table->m_dtm[WHITE][h].evict_all(*thread_pool);
 						m_table->m_dtm[BLACK][h].evict_all(*thread_pool);
 					}
+					// Phase slices spill same as data layers; resume re-pages.
+					m_table->m_phase[WHITE].evict_all(*thread_pool);
+					m_table->m_phase[BLACK].evict_all(*thread_pool);
 					Checkpoint_File ckpt{};
 					ckpt.hmc = hmc;
 					ckpt.batch_idx = static_cast<uint32_t>(bi);
@@ -1189,7 +1167,16 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 				}
 			}
 		}
-		if (hmc == 0) remove_phase_files(paths, m_epsi);  // tape no longer needed
+		if (hmc == 0)
+		{
+			// Phase tape is layer-0-only. remove_disk_files before close so
+			// the paths are still populated; close discards in-memory groups
+			// without flushing dirty pages (we're throwing them away anyway).
+			m_table->m_phase[WHITE].remove_disk_files();
+			m_table->m_phase[BLACK].remove_disk_files();
+			m_table->m_phase[WHITE].close();
+			m_table->m_phase[BLACK].close();
+		}
 		(void)total_fusions;
 	};
 
@@ -1481,7 +1468,8 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 	}
 
 	remove_checkpoint(paths.dtm50_checkpoint_path(m_epsi));
-	remove_phase_files(paths, m_epsi);
+	m_table->m_phase[WHITE].remove_disk_files();
+	m_table->m_phase[BLACK].remove_disk_files();
 	for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
 	{
 		m_table->m_dtm[WHITE][h].remove_disk_files();

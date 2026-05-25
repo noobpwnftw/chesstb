@@ -308,8 +308,7 @@ int main(int argc, char** argv)
 				fmt_bytes(w.peak_batch_init_groups * w.bytes_per_group).c_str());
 			if (opt.build_dtm50)
 			{
-				std::printf("  dtm50 phase           : 3 * peaks above + phase %s\n",
-					fmt_bytes(static_cast<size_t>(2) * w.num_positions).c_str());
+				std::printf("  dtm50                 : 3 * peaks above\n");
 			}
 			std::cout << "\n";
 		}
