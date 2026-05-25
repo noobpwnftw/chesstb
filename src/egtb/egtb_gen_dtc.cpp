@@ -201,7 +201,7 @@ WDL_Entry DTC_Generator::read_post_move_wdl(const Position_For_Gen& pos_gen, Mov
 	const Color mover = parent.turn();
 	const Board_Index post_idx = next_quiet_index(pos_gen, move);
 	if (post_idx == BOARD_INDEX_NONE) return WDL_Entry::ILLEGAL;
-	return m_table->m_dtc[color_opp(mover)].read(post_idx).wdl();
+	return read_dtc(post_idx, color_opp(mover)).wdl();
 }
 
 DTC_Any_Entry DTC_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id) const
@@ -635,7 +635,7 @@ void DTC_Generator::retro_mark_win_in_1(Position_For_Gen& pos_gen,
                                         Move_List& ml, Color stm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<false>(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
@@ -650,7 +650,7 @@ void DTC_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
                                        Move_List& ml, Color stm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<false>(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
@@ -669,7 +669,7 @@ void DTC_Generator::retro_mark_wins(Position_For_Gen& pos_gen,
                                     uint16_t target_dtz, bool cursed)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<false>(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
 	DTC_Final_Entry new_e = DTC_Final_Entry::make_win(target_dtz);
 	if (cursed) new_e = new_e.with_cap_cwin();
 	for (size_t i = 0; i < ml.size(); ++i)

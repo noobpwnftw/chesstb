@@ -147,7 +147,7 @@ DTM_Final_Entry DTM_Generator::read_post_move_dtm(const Position_For_Gen& pos_ge
 	const Color mover = parent.turn();
 	const Board_Index post_idx = next_quiet_index(pos_gen, move);
 	if (post_idx == BOARD_INDEX_NONE) return DTM_Final_Entry::make_illegal();
-	return m_table->m_dtm[color_opp(mover)].read(post_idx);
+	return read_dtm(post_idx, color_opp(mover));
 }
 
 namespace {
@@ -555,7 +555,7 @@ bool DTM_Generator::retro_mark_win_in_1(Position_For_Gen& pos_gen,
                                         Move_List& ml, Color stm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
 	bool wrote = false;
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
@@ -575,7 +575,7 @@ void DTM_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
                                        Move_List& ml, Color stm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
@@ -594,7 +594,7 @@ bool DTM_Generator::retro_mark_wins(Position_For_Gen& pos_gen,
                                     uint16_t target_dtm)
 {
 	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
+	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
 	const DTM_Final_Entry new_e = DTM_Final_Entry::make_win(target_dtm);
 	bool wrote = false;
 	for (size_t i = 0; i < ml.size(); ++i)

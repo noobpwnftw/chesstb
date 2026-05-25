@@ -191,7 +191,6 @@ void Position::gen_pseudo_legal_moves(Out_Param<Move_List> out) const
 template void Position::gen_pseudo_legal_moves<Position::Move_Kind::ALL>(Out_Param<Move_List>) const;
 template void Position::gen_pseudo_legal_moves<Position::Move_Kind::PAWN_PUSHES>(Out_Param<Move_List>) const;
 
-template <bool IncludePawnPushes>
 void Position::gen_pseudo_legal_pre_quiets(Out_Param<Move_List> out) const
 {
 	// Inverted moves of opp(m_turn): from=current, to=where-they-came-from.
@@ -236,53 +235,7 @@ void Position::gen_pseudo_legal_pre_quiets(Out_Param<Move_List> out) const
 		while (candidates)
 			out->add(Move::make_quiet(from_cur, candidates.pop_first_square()));
 	}
-
-	if constexpr (IncludePawnPushes)
-	{
-		Bitboard pawns = m_pieces[piece_make(mover, PAWN)];
-		while (pawns)
-		{
-			const Square from_cur = pawns.pop_first_square();
-			const Rank r = sq_rank(from_cur);
-			const File f = sq_file(from_cur);
-			if (mover == WHITE)
-			{
-				if (r >= RANK_3)
-				{
-					const Square prev1 = sq_make(static_cast<Rank>(r - 1), f);
-					if (empty & square_bb(prev1))
-						out->add(Move::make_quiet(from_cur, prev1));
-				}
-				if (r == RANK_4)
-				{
-					const Square inter = sq_make(RANK_3, f);
-					const Square prev2 = sq_make(RANK_2, f);
-					if ((empty & square_bb(inter)) && (empty & square_bb(prev2)))
-						out->add(Move::make_quiet(from_cur, prev2));
-				}
-			}
-			else
-			{
-				if (r <= RANK_6)
-				{
-					const Square prev1 = sq_make(static_cast<Rank>(r + 1), f);
-					if (empty & square_bb(prev1))
-						out->add(Move::make_quiet(from_cur, prev1));
-				}
-				if (r == RANK_5)
-				{
-					const Square inter = sq_make(RANK_6, f);
-					const Square prev2 = sq_make(RANK_7, f);
-					if ((empty & square_bb(inter)) && (empty & square_bb(prev2)))
-						out->add(Move::make_quiet(from_cur, prev2));
-				}
-			}
-		}
-	}
 }
-
-template void Position::gen_pseudo_legal_pre_quiets<false>(Out_Param<Move_List>) const;
-template void Position::gen_pseudo_legal_pre_quiets<true>(Out_Param<Move_List>) const;
 
 bool Position::is_pseudo_legal_move_legal(Move m) const
 {

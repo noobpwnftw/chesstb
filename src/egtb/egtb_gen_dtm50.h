@@ -23,12 +23,20 @@
 #include <memory>
 #include <vector>
 
-// DTM50 = plies-to-mate under 50MR. 100 per-hmc layers/color. hmc=0 is a retro
-// fixed-point (in-M pawn pushes self-reference); hmc=99..1 build top-down from
-// already-finalized layers (opp k+1 for quiet, opp 0 for in-M push, sub-TB 0
-// for cap/promo). Phase tape is per-layer scratch tracking plies-since-zeroing;
-// cells whose route would exceed 100 plies collapse to DRAW at write time, so
-// no per-layer phase ever persists.
+// DTM50 = plies-to-mate under 50MR. 100 per-hmc layers per color.
+//
+// Build is one-shot forward classification of every cell at every layer.
+// Pawn slices iterate in topo order; within each slice's fusion the hmc
+// loop runs 99..0. The order makes every read a finalized read:
+//   - non-pawn quiet at hmc=k targets opp[k+1] of the *same* slice
+//     (built in the previous inner step; k=99 has no k+1 and falls back
+//     to an inline mate check standing in for virtual hmc=100 = 50MR draw),
+//   - pawn push (zeroing) at any hmc targets opp[0] of a *push-destination*
+//     slice in a prior fusion (already finalized in topo order),
+//   - capture / promotion reads the sub-tablebase.
+//
+// hmc=99 of each fusion runs the full chess-legality check per cell; every
+// lower-hmc layer piggybacks the ILLEGAL flag from opp[k+1] at the same idx.
 
 inline constexpr size_t DTM50_HMC_COUNT = 100;
 
@@ -36,8 +44,6 @@ struct DTM50_Interrupted
 {
 	uint32_t batch_idx;
 	uint32_t fusion_idx;
-	uint16_t finished_ply;
-	uint16_t max_dtm;
 	uint16_t hmc;
 };
 
@@ -45,10 +51,6 @@ struct DTM50_Table
 {
 	Piece_Config_For_Gen m_epsi;
 	Sliced_EGTB_File_For_Gen<DTM_Final_Entry> m_dtm[COLOR_NB][DTM50_HMC_COUNT];
-	// Per-color phase tape (plies-since-zeroing along the route). Slice-backed
-	// so apply_working_set pages it alongside the data layers during the
-	// layer-0 retro. Used by hmc=0 only; disk files removed when layer 0 done.
-	Sliced_EGTB_File_For_Gen<DTM50_Phase_Entry> m_phase[COLOR_NB];
 	bool m_is_symmetric = false;
 
 	DTM50_Table(const Piece_Config& ps, const std::filesystem::path& tmp_dir) :
@@ -67,9 +69,6 @@ struct DTM50_Table
 			m_dtm[WHITE][hmc].create(ns, per, tmp_dir, magic, w_fmt);
 			m_dtm[BLACK][hmc].create(ns, per, tmp_dir, magic, b_fmt);
 		}
-		const uint64_t phase_magic = static_cast<uint64_t>(EGTB_Magic::DTM50_PHASE_SLICE_MAGIC);
-		m_phase[WHITE].create(ns, per, tmp_dir, phase_magic, name + ".w.phase.%05zu.dtm50p");
-		m_phase[BLACK].create(ns, per, tmp_dir, phase_magic, name + ".b.phase.%05zu.dtm50p");
 	}
 
 	DTM50_Table(const DTM50_Table&) = delete;
@@ -105,87 +104,24 @@ private:
 	// Layer being built. Helpers dispatch off it; gen() sets it per layer.
 	uint16_t m_current_hmc = 0;
 
-	// Termination floor for iterate(); reset per layer.
-	uint16_t m_max_dtm = 0;
-
 	NODISCARD INLINE Sliced_EGTB_File_For_Gen<DTM_Final_Entry>& cur_layer(Color c) const
 	{
 		return m_table->m_dtm[c][m_current_hmc];
 	}
 
-	NODISCARD INLINE DTM_Final_Entry read_dtm(Board_Index pos, Color stm) const
+	NODISCARD INLINE DTM_Final_Entry read_dtm(Board_Index pos, Color stm, uint16_t hmc) const
 	{
-		return cur_layer(stm).read(pos);
+		return m_table->m_dtm[stm][hmc].read(pos);
 	}
 	INLINE void write_dtm(Board_Index pos, Color stm, DTM_Final_Entry e)
 	{
 		cur_layer(stm).write(e, pos);
-		mark_iter(stm, pos, cur_layer(stm));
-	}
-
-	// Phase = plies-since-zeroing along the route. >100 ⇒ cursed, collapse to
-	// DRAW. Used by hmc=0 retro only; helpers no-op at k>0 since phase isn't
-	// consumed there and the slice isn't paged in.
-	NODISCARD INLINE uint8_t read_phase(Board_Index pos, Color stm) const
-	{
-		if (m_current_hmc != 0) return 0;
-		return m_table->m_phase[stm].read(pos).v;
-	}
-	INLINE void write_phase(Board_Index pos, Color stm, uint8_t v)
-	{
-		if (m_current_hmc != 0) return;
-		m_table->m_phase[stm].write(DTM50_Phase_Entry{v}, pos);
 	}
 
 	NODISCARD DTM_Final_Entry read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 	NODISCARD DTM_Final_Entry read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
 
-	NODISCARD DTM_Any_Entry make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id,
-	                                           Out_Param<uint16_t> worst_loss_dtm) const;
-	uint16_t init_entries(In_Out_Param<Thread_Pool> thread_pool);
-
-	enum class Iter_Action : uint8_t {
-		SKIP,
-		MARK_WIN_IN_1,
-		MARK_WIN_PREDS,
-		MARK_CHANGED,
-		CHANGE_REVERIFY,
-		PAWN_EVAL,
-	};
-
-	struct Loss_Verification_Result {
-		bool is_loss = false;
-		uint16_t loss_dtm = 0;
-		// Worst-resisting child's phase contribution. >100 ⇒ DRAW, not LOSS.
-		uint8_t  loss_phase = 0;
-	};
-
-	NODISCARD Iter_Action action_for_entry(DTM_Final_Entry e, uint16_t ply) const;
-
-	struct Iter_Result {
-		bool wrote = false;
-		uint16_t max_v = 0;
-		bool any_intermediate = false;
-		uint16_t max_classified = 0;
-	};
-	NODISCARD Iter_Result run_iter(In_Out_Param<Thread_Pool> thread_pool,
-	                               Color stm, uint16_t ply);
-
-	NODISCARD Loss_Verification_Result check_loss(
-		Position_For_Gen& pos_gen,
-		Move_List& ml,
-		uint16_t ply, size_t thread_id) const;
-
-	// retro_mark_wins gets cell_phase explicitly (pred's phase = 1 + cell_phase);
-	// the cell idx is only in scope at the call site.
-	bool retro_mark_win_in_1(Position_For_Gen& pos_gen, Move_List& ml, Color stm);
-	void retro_mark_changed(Position_For_Gen& pos_gen, Move_List& ml, Color stm);
-	bool retro_mark_wins(Position_For_Gen& pos_gen, Move_List& ml,
-	                     Color stm, uint16_t target_dtm, uint8_t cell_phase);
-
-	void iterate(In_Out_Param<Thread_Pool> thread_pool, uint16_t finished_ply = 0);
-
-	void page_in_for_group(In_Out_Param<Thread_Pool> thread_pool,
-	                       Color me, size_t group_id);
+	NODISCARD DTM_Final_Entry make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id) const;
+	void init_entries(In_Out_Param<Thread_Pool> thread_pool);
 };

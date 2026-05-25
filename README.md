@@ -87,14 +87,17 @@ whose only winning route would bust the 50MR window collapse to DRAW at
 that layer, so probing returns the actual playable outcome rather than a
 pretend value.
 
-The generator builds layer 0 first as a retro fixed-point (in-material
-pawn pushes are zeroing and self-reference within the same layer), then
-hmc = 99 down to 1 top-down. Each k > 0 layer is a single forward pass:
-quiet moves read the partner color's k+1, in-material pushes read opp's
-hmc = 0, and cap/promo reads the sub-tablebase's hmc = 0. A per-color
-phase tape tracks plies-since-zeroing during the layer-0 retro; it's
-scratch state that's freed after each layer build (and checkpointed
-across an interrupt at hmc = 0).
+The generator builds every layer as a single forward classification pass.
+Pawn slices iterate in topo order, and within each slice's fusion the hmc
+loop runs 99 down to 0. That order makes
+every read a finalized read: a non-pawn quiet at hmc = k targets opp's k+1
+in the same slice (just built one step earlier), an in-material pawn push
+targets opp's hmc = 0 in a push-destination slice (already finalized in a
+prior topo batch), and a capture or promotion reads the sub-tablebase.
+hmc = 99 has no k+1, so its non-pawn quiet reads inline an explicit
+50MR-draw / mate check. hmc = 99 of each fusion also runs the full chess-
+legality check per cell; every lower-hmc layer piggybacks ILLEGAL from
+opp[k+1] at the same idx and is orders of magnitude faster.
 
 The 5-class WDL companion still does class duty for halved values. At
 hmc = 0 there's no ambiguity. At hmc > 0 a WDL=WIN cell might be DRAW
@@ -131,22 +134,20 @@ Use `--estimate` before a large run:
 The estimate reports total resident-table size and peak group counts for
 init and iterate passes. With `--builddtm`/`--builddtm50`, the iterate
 peak unions opponent's pawn-push-target groups (forward reads). DTM50
-pins layer 0 and the just-built k+1 layer alongside the current write
-layer (3× the per-layer peak) for k > 0 builds; the phase tape is
-allocated lazily for the layer-0 build only and freed before any k > 0
-build starts, so it never contributes to peak resident. Generation can
-run beyond RAM since storage is split into load/evict groups and
-spilled as needed.
+pins opp[0] and opp[k+1] alongside the current write layer at every step
+(3× the per-layer peak); the previous step's k+2 layer is evicted before
+the next step starts, so resident layer count stays bounded across the
+99 → 0 sweep. Generation can run beyond RAM since storage is split into
+load/evict groups and spilled as needed.
 
 ## Resume
 
 Generation is interruptible. `SIGINT` flushes dirty groups, writes a
-checkpoint with the current batch, fusion, phase, ply, and (for DTM50)
-hmc layer, then exits. Re-run the same command to resume the in-progress
-material instead of restarting. DTC, DTM, and DTM50 each carry their own
-checkpoint files; DTM50 additionally persists its phase tape on interrupt
-at hmc = 0. Checkpoints and scratch group files are removed after
-`save_to_disk` completes.
+checkpoint, then exits. DTC and DTM record (batch, fusion, ply); DTM50
+records (batch, fusion, hmc). Re-run the same command to resume the
+in-progress material instead of restarting. DTC, DTM, and DTM50 each
+carry their own checkpoint files. Checkpoints and scratch group files
+are removed after `save_to_disk` completes.
 
 ## Probe
 

@@ -109,9 +109,7 @@ struct Position
 	void gen_pseudo_legal_moves(Out_Param<Move_List> out) const;
 
 	// Pre-edges (inverted: Move::from() = current square, Move::to() = source).
-	// Generates moves of opp(m_turn). IncludePawnPushes=false for DTC
-	// (pawn pushes are DTZ-zeroing, not same-material retrograde edges).
-	template <bool IncludePawnPushes>
+	// Generates moves of opp(m_turn), does not include pawn pushes.
 	void gen_pseudo_legal_pre_quiets(Out_Param<Move_List> out) const;
 
 	NODISCARD bool is_pseudo_legal_move_legal(Move m) const;

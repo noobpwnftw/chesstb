@@ -15,16 +15,12 @@
 #include "util/utility.h"
 
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
-#include <mutex>
 #include <optional>
-#include <set>
 
 namespace {
 
@@ -36,12 +32,10 @@ struct Checkpoint_File
 	uint32_t version = VERSION;
 	uint32_t batch_idx = 0;
 	uint32_t fusion_idx = 0;
-	uint16_t finished_ply = 0;
-	uint16_t max_dtm = 0;
 	uint16_t hmc = 0;
-	uint8_t  _pad[6] = { 0, 0, 0, 0, 0, 0 };
+	uint8_t  _pad[2] = { 0, 0 };
 };
-static_assert(sizeof(Checkpoint_File) == 32, "DTM50 Checkpoint_File size");
+static_assert(sizeof(Checkpoint_File) == 24, "DTM50 Checkpoint_File size");
 
 bool read_checkpoint(const std::filesystem::path& p, Checkpoint_File* out)
 {
@@ -93,8 +87,8 @@ DTM50_Generator::DTM50_Generator(
 	m_table->m_is_symmetric = m_is_symmetric;
 
 	// Budget is per-layer: paging operates on a single active layer at a time.
-	// Resident overhead for already-built layers is handled separately by the
-	// layer build loop (evict-to-disk after each layer finishes).
+	// Previously-built layers within the same fusion spill to disk via the k+2
+	// evict step inside gen().
 	const size_t bytes_per_color =
 		m_table->m_dtm[WHITE][0].num_slices()
 		* m_table->m_dtm[WHITE][0].within_slice_size()
@@ -153,22 +147,16 @@ DTM_Final_Entry DTM50_Generator::read_post_move_dtm(const Position_For_Gen& pos_
 	const Board_Index post_idx = next_quiet_index(pos_gen, move);
 	if (post_idx == BOARD_INDEX_NONE) return DTM_Final_Entry::make_illegal();
 
-	// Pawn push (zeroing) → opp hmc=0. Non-pawn quiet:
-	//   hmc=0 build: self-ref opp hmc=0 (phase tape tracks the chain).
-	//   hmc=k>0:    opp hmc=k+1; k=99 has no k+1 so the move targets virtual
-	//               hmc=100 (50MR draw unless the move itself is mate).
+	// Pawn push → opp[hmc=0]; non-pawn quiet → opp[hmc=k+1]; k=99 has no k+1
+	// so the move targets virtual hmc=100 (50MR draw unless mate). See header
+	// for the build-order argument that makes both reads finalized.
 	const bool is_pawn_push = piece_type(parent.piece_at(move.from())) == PAWN;
 	if (is_pawn_push)
-		return m_table->m_dtm[opp][0].read(post_idx);
-
-	if (m_current_hmc == 0)
-		return m_table->m_dtm[opp][0].read(post_idx);
+		return read_dtm(post_idx, opp, 0);
 
 	const uint16_t target_hmc = static_cast<uint16_t>(m_current_hmc + 1);
 	if (target_hmc >= DTM50_HMC_COUNT)
 	{
-		// hmc=99 quiet → virtual hmc=100; 50MR draws unless the move is mate
-		// (mate ends the game before 50MR fires).
 		Position child = parent;
 		(void)child.do_move(move);
 		if (!child.is_in_check(child.turn())) return DTM_Final_Entry::make_draw();
@@ -178,7 +166,7 @@ DTM_Final_Entry DTM50_Generator::read_post_move_dtm(const Position_For_Gen& pos_
 			if (child.is_pseudo_legal_move_legal(ml[i])) return DTM_Final_Entry::make_draw();
 		return DTM_Final_Entry::make_loss(0);
 	}
-	return m_table->m_dtm[opp][target_hmc].read(post_idx);
+	return read_dtm(post_idx, opp, target_hmc);
 }
 
 namespace {
@@ -261,19 +249,13 @@ DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(const Position_For_G
 // Initial classification.
 // =============================================================================
 
-DTM_Any_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id,
-                                                Out_Param<uint16_t> worst_loss_dtm) const
+DTM_Final_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id) const
 {
-	*worst_loss_dtm = 0;
 	if (!pos_gen.is_legal(Position_For_Gen::Legality_Lower_Bound::CHESS_LEGAL))
 		return DTM_Final_Entry::make_illegal();
 
 	Position& pos = pos_gen.board();
 	const bool in_check = pos.is_in_check(pos.turn());
-	// hmc=0: in-M children share this layer (unclassified during init), so seed
-	// only from cap/promo and let retro fill the rest.
-	// hmc>0: every child lives in an already-finalized layer; classify in one shot.
-	const bool layered_reads = (m_current_hmc != 0);
 
 	uint16_t best_win_dtm  = std::numeric_limits<uint16_t>::max();
 	uint16_t best_loss_dtm = 0;
@@ -283,29 +265,12 @@ DTM_Any_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, siz
 	Move_List ml;
 	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
 	bool any_legal = false;
-	bool any_in_material = false;
-	bool any_pawn_eval = false;
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Move m = ml[i];
 		if (!pos.is_pseudo_legal_move_legal(m)) continue;
 		any_legal = true;
-		const bool is_cap = m.is_ep_capture() || !pos.is_empty(m.to());
-		const bool is_in_material = !is_cap && !m.is_promotion();
 		const bool is_pawn = piece_type(pos.piece_at(m.from())) == PAWN;
-
-		if (is_in_material)
-		{
-			any_in_material = true;
-			if (is_pawn) any_pawn_eval = true;
-			if (!layered_reads) continue;
-		}
-		else
-		{
-			any_pawn_eval = true;
-		}
-
-		// Resolve the child's value via the layer-aware dispatch.
 		const DTM_Final_Entry child_e = is_pawn && is_pawn_double_push(m)
 			? effective_opp_dtm_after_dp(pos_gen, m, thread_id)
 			: read_post_move_dtm(pos_gen, m, thread_id);
@@ -319,7 +284,6 @@ DTM_Any_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, siz
 		else if (child_e.is_win())
 		{
 			const uint16_t cand = static_cast<uint16_t>(child_e.value() + 1);
-			update_max(*worst_loss_dtm, cand);
 			update_max(best_loss_dtm, cand);
 		}
 		else
@@ -328,33 +292,14 @@ DTM_Any_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, siz
 		}
 	}
 	if (!any_legal)
-	{
-		if (in_check) return DTM_Final_Entry::make_loss(0);
-		return DTM_Intermediate_Entry{};
-	}
-
-	if (saw_win)
-		return DTM_Final_Entry::make_win(best_win_dtm);
-
-	if (layered_reads)
-	{
-		// All children resolved: any DRAW → DRAW, else LOSS at the max child dtm.
-		if (saw_draw) return DTM_Final_Entry::make_draw();
-		if (best_loss_dtm > 0) return DTM_Final_Entry::make_loss(best_loss_dtm);
-		return DTM_Final_Entry::make_draw();
-	}
-
-	if (!any_in_material && !saw_draw)
-	{
-		if (*worst_loss_dtm > 0)
-			return DTM_Final_Entry::make_loss(*worst_loss_dtm);
-	}
-	return any_pawn_eval
-		? DTM_Intermediate_Entry::make_pawn_eval()
-		: DTM_Intermediate_Entry{};
+		return in_check ? DTM_Final_Entry::make_loss(0) : DTM_Final_Entry::make_draw();
+	if (saw_win)  return DTM_Final_Entry::make_win(best_win_dtm);
+	if (saw_draw) return DTM_Final_Entry::make_draw();
+	if (best_loss_dtm > 0) return DTM_Final_Entry::make_loss(best_loss_dtm);
+	return DTM_Final_Entry::make_draw();
 }
 
-uint16_t DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
+void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 {
 	const auto& psm = m_epsi.pawn_slice_manager();
 	const size_t nks = m_epsi.num_king_slices();
@@ -370,8 +315,13 @@ uint16_t DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 	for (int32_t pid : m_active_pawn_slices)
 		targets_by_pid[static_cast<size_t>(pid)] = psm.push_target_slices(pid);
 
-	// Init working set: both colors at g, plus (push_target_pid, same_kid) for
-	// the read_post_move_dtm path. Init writes both colors, so needs[B] == needs[W].
+	// Per-group working set: cur group + opp's king-neighbor groups (non-pawn
+	// quiet reads cross king-slices) + opp's push-target groups (in-M pawn
+	// push reads). Init writes both colors, so needs[B] == needs[W]. Same
+	// pattern as page_in_for_group in DTM/DTC.
+	const auto& kingsm = m_epsi.slice_manager();
+	const bool has_pawns = psm.has_pawns();
+
 	auto page_in_for_init_group = [&](size_t g) {
 		if (m_paging_budget_bytes == 0) return;
 		m_scratch_need[WHITE].assign(ngroups, 0);
@@ -387,78 +337,82 @@ uint16_t DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 			for (size_t s = s_lo; s < s_hi; ++s)
 			{
 				const int32_t kid = static_cast<int32_t>(s - pid_base);
-				for (int32_t tpid : targets_by_pid[static_cast<size_t>(pid)])
+				kingsm.neighbors(kid, m_scratch_nbrs);
+				for (int32_t pp : m_active_pawn_slices)
 				{
-					const size_t target_slice =
-						static_cast<size_t>(tpid) * nks + static_cast<size_t>(kid);
-					m_scratch_need[WHITE][target_slice / spg] = 1;
+					const size_t same = static_cast<size_t>(pp) * nks + static_cast<size_t>(kid);
+					m_scratch_need[WHITE][same / spg] = 1;
+					for (int32_t k : m_scratch_nbrs)
+					{
+						const size_t neigh = static_cast<size_t>(pp) * nks + static_cast<size_t>(k);
+						m_scratch_need[WHITE][neigh / spg] = 1;
+					}
+				}
+				if (has_pawns)
+				{
+					for (int32_t tpid : targets_by_pid[static_cast<size_t>(pid)])
+					{
+						const size_t target =
+							static_cast<size_t>(tpid) * nks + static_cast<size_t>(kid);
+						m_scratch_need[WHITE][target / spg] = 1;
+					}
 				}
 			}
 		}
 		m_scratch_need[BLACK] = m_scratch_need[WHITE];
 		apply_working_set(thread_pool, &cur_layer(WHITE), &cur_layer(BLACK), m_scratch_need[WHITE], m_scratch_need[BLACK]);
-		// Layer-k init also reads opp hmc=0 / hmc=k+1 at the same indices.
-		if (m_current_hmc != 0)
+		// opp[0] for pawn-push reads, opp[k+1] for non-pawn quiet + ILLEGAL.
+		apply_working_set(thread_pool,
+			&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
+			m_scratch_need[WHITE], m_scratch_need[BLACK]);
+		if (m_current_hmc + 1 < DTM50_HMC_COUNT)
 		{
 			apply_working_set(thread_pool,
-				&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
-				m_scratch_need[WHITE], m_scratch_need[BLACK]);
-			if (m_current_hmc + 1 < DTM50_HMC_COUNT)
-			{
-				apply_working_set(thread_pool,
-					&m_table->m_dtm[WHITE][m_current_hmc + 1],
-					&m_table->m_dtm[BLACK][m_current_hmc + 1],
-					m_scratch_need[WHITE], m_scratch_need[BLACK]);
-			}
-		}
-		else
-		{
-			// Layer-0 init writes phase=0 seeds — page the phase slices in.
-			apply_working_set(thread_pool,
-				&m_table->m_phase[WHITE], &m_table->m_phase[BLACK],
+				&m_table->m_dtm[WHITE][m_current_hmc + 1],
+				&m_table->m_dtm[BLACK][m_current_hmc + 1],
 				m_scratch_need[WHITE], m_scratch_need[BLACK]);
 		}
 	};
 
-	const size_t wss = m_epsi.within_slice_size();
-	size_t total_indices = 0;
-	for (size_t g : m_pair_group_ids)
-	{
-		const size_t g_start_slice = g * spg;
-		const size_t g_end_slice = std::min(g_start_slice + spg, ntotal);
-		total_indices += (g_end_slice - g_start_slice) * wss;
-	}
-
-	const size_t PRINT_PERIOD = thread_pool->num_workers() * (1 << 20);
+	// Progress bar only on hmc=99: the full legality check per cell dominates
+	// its runtime. Every other layer piggybacks ILLEGAL from opp[k+1].
 	std::optional<Concurrent_Progress_Bar> progress_bar;
-	if (m_current_hmc == 0)
+	if (m_current_hmc == DTM50_HMC_COUNT - 1)
+	{
+		const size_t wss = m_epsi.within_slice_size();
+		size_t total_indices = 0;
+		for (size_t g : m_pair_group_ids)
+		{
+			const size_t g_start_slice = g * spg;
+			const size_t g_end_slice = std::min(g_start_slice + spg, ntotal);
+			total_indices += (g_end_slice - g_start_slice) * wss;
+		}
+		const size_t PRINT_PERIOD = thread_pool->num_workers() * (1 << 20);
 		progress_bar.emplace(total_indices, PRINT_PERIOD, "init_entries");
+	}
 	else
 	{
 		std::printf("  build layer %2u\r", m_current_hmc);
 		std::fflush(stdout);
 	}
 
-	uint16_t max_init = 0;
 	for (size_t g : m_pair_group_ids)
 	{
+		if (egtb_is_interrupt_requested())
+			throw DTM50_Interrupted{ 0, 0, m_current_hmc };
 		page_in_for_init_group(g);
 		Shared_Board_Index_Iterator group_it = make_slice_group_iterator(g, spg);
 
-		const auto rets = thread_pool->run_sync_task_on_all_threads([&](size_t tid) -> uint16_t {
+		thread_pool->run_sync_task_on_all_threads([&](size_t tid) {
 			constexpr size_t PROGRESS_BAR_UPDATE_PERIOD = 64 * 64;
 			Position_For_Gen pos_gen(m_epsi, BOARD_INDEX_ZERO, WHITE);
 			Board_Index prev = BOARD_INDEX_NONE;
-			uint16_t local_max = 0;
 			size_t local_progress = 0;
 			const auto& slice_has_stab = m_epsi.slice_manager().slice_has_stabilizer;
 			for (const Board_Index idx : group_it.indices())
 			{
-				if (++local_progress % PROGRESS_BAR_UPDATE_PERIOD == 0)
-				{
-					if (progress_bar)
-						*progress_bar += PROGRESS_BAR_UPDATE_PERIOD;
-				}
+				if (++local_progress % PROGRESS_BAR_UPDATE_PERIOD == 0 && progress_bar)
+					*progress_bar += PROGRESS_BAR_UPDATE_PERIOD;
 				const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
 				if (!pid_in_pair[pid_of_idx])
 				{
@@ -496,522 +450,21 @@ uint16_t DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 				for (Color us : { WHITE, BLACK })
 				{
 					pos_gen.set_turn(us);
-					// Chess-legality is hmc-invariant; reuse layer-0's ILLEGAL flag.
-					if (m_current_hmc != 0
-					    && m_table->m_dtm[us][0].read(idx).is_illegal())
+					// Chess-legality is hmc-invariant; reuse opp[k+1]'s ILLEGAL
+					// flag. hmc=99 has no k+1 and computes fresh.
+					if (m_current_hmc + 1 < DTM50_HMC_COUNT
+					    && read_dtm(idx, us, m_current_hmc + 1).is_illegal())
 					{
 						write_dtm(idx, us, DTM_Final_Entry::make_illegal());
-						write_phase(idx, us, 0);
 						continue;
 					}
-					uint16_t worst_loss_dtm = 0;
-					std::visit(overload{
-						[&](DTM_Final_Entry entry) {
-							write_dtm(idx, us, entry);
-							// Seeds are zeroing or terminal → phase=0.
-							write_phase(idx, us, 0);
-							if (entry.is_win() || entry.is_loss())
-							{
-								const uint16_t v = static_cast<uint16_t>(entry.value());
-								update_max(local_max, v);
-							}
-						},
-						[&](DTM_Intermediate_Entry entry) {
-							write_dtm(idx, us, entry);
-							write_phase(idx, us, 0);
-							update_max(local_max, worst_loss_dtm);
-						},
-					}, make_initial_entry(pos_gen, tid, out_param(worst_loss_dtm)));
+					write_dtm(idx, us, make_initial_entry(pos_gen, tid));
 				}
 			}
-			return local_max;
 		});
-		for (uint16_t v : rets) update_max(max_init, v);
 	}
 
-	if (progress_bar)
-		progress_bar->set_finished();
-
-	return max_init;
-}
-
-// =============================================================================
-// Retrograde sweep.
-// =============================================================================
-
-DTM50_Generator::Iter_Action DTM50_Generator::action_for_entry(DTM_Final_Entry e, uint16_t ply) const
-{
-	if (e.is_illegal()) return Iter_Action::SKIP;
-
-	const bool has_pawns = m_epsi.pawn_slice_manager().has_pawns();
-
-	if (e.is_draw())
-	{
-		if (e.has_change()) return Iter_Action::CHANGE_REVERIFY;
-		// PAWN_EVAL: forward-read for retro-blind edges (cap/promo + pawn push).
-		if (ply > 0 && e.has_pawn_eval()) return Iter_Action::PAWN_EVAL;
-		return Iter_Action::SKIP;
-	}
-
-	if (ply == 0)
-	{
-		if (e.is_loss() && e.value() == 0) return Iter_Action::MARK_WIN_IN_1;
-		return Iter_Action::SKIP;
-	}
-
-	// WIN(ply) and WIN(ply-1) both fire MARK_CHANGED so predecessors' check_loss
-	// finds a fully-classified child. The two plies cover same-ply (e.g. just
-	// overwritten by retro at this ply) and prior-ply settlings. ply >= 1 here
-	// since the ply == 0 branch returned above.
-	if (e.is_win() && (e.value() == ply || e.value() == ply - 1))
-		return Iter_Action::MARK_CHANGED;
-
-	if (e.is_loss() && e.value() == ply)
-		return Iter_Action::MARK_WIN_PREDS;
-
-	// Pawnful stale WIN: init may have seeded WIN(value > ply) from cap/promo.
-	// A faster mate via in-material pawn pushes can overwrite this. Same handler
-	// as PAWN_EVAL — it just won't fall through to check_loss for non-draw e.
-	if (has_pawns && e.is_win() && e.value() > ply)
-		return Iter_Action::PAWN_EVAL;
-
-	return Iter_Action::SKIP;
-}
-
-DTM50_Generator::Loss_Verification_Result DTM50_Generator::check_loss(
-	Position_For_Gen& pos_gen,
-	Move_List& ml,
-	uint16_t ply, size_t thread_id) const
-{
-	Position& pos = pos_gen.board_unchecked();
-	const Color opp_color = color_opp(pos.turn());
-	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
-
-	Loss_Verification_Result r;
-	bool any_legal = false;
-	uint16_t max_contribution = 0;
-	uint8_t  worst_phase = 0;
-
-	for (size_t i = 0; i < ml.size(); ++i)
-	{
-		const Move m = ml[i];
-		if (!pos.is_pseudo_legal_move_legal(m)) continue;
-		any_legal = true;
-
-		const bool is_cap_or_ep = m.is_ep_capture() || !pos.is_empty(m.to());
-		const bool is_promo     = m.is_promotion();
-		const bool is_pawn_move = piece_type(pos.piece_at(m.from())) == PAWN;
-
-		uint16_t contribution;
-		uint8_t  move_phase;
-		if (is_cap_or_ep || is_promo)
-		{
-			// Sub-TB (zeroing) — phase resets.
-			const DTM_Final_Entry sub_e = read_sub_tb(pos_gen, m, thread_id);
-			if (!sub_e.is_win()) return r;
-			contribution = static_cast<uint16_t>(sub_e.value() + 1);
-			move_phase   = 0;
-		}
-		else if (is_pawn_move && is_pawn_double_push(m))
-		{
-			// Double push (zeroing) — phase resets.
-			const DTM_Final_Entry opp_e = effective_opp_dtm_after_dp(pos_gen, m, thread_id);
-			if (!opp_e.is_win()) return r;
-			if (m_current_hmc == 0 && opp_e.value() >= ply) return r;
-			contribution = static_cast<uint16_t>(opp_e.value() + 1);
-			move_phase   = 0;
-		}
-		else
-		{
-			// Quiet in-M. Pawn push zeros; non-pawn extends the chain.
-			const DTM_Final_Entry ce = read_post_move_dtm(pos_gen, m, thread_id);
-			if (!ce.is_win()) return r;
-			if (m_current_hmc == 0 && ce.value() >= ply) return r;
-			contribution = static_cast<uint16_t>(ce.value() + 1);
-			if (is_pawn_move) move_phase = 0;
-			else {
-				const Board_Index child_idx = next_quiet_index(pos_gen, m);
-				const uint8_t child_phase = (child_idx == BOARD_INDEX_NONE)
-					? 0 : read_phase(child_idx, opp_color);
-				move_phase = static_cast<uint8_t>(child_phase + 1);
-			}
-		}
-		// phase > 100 means STM can claim a 50MR draw — cell is DRAW, not LOSS.
-		if (move_phase > 100) return r;
-		if (contribution > max_contribution)
-		{
-			max_contribution = contribution;
-			worst_phase = move_phase;
-		}
-		else if (contribution == max_contribution && move_phase < worst_phase)
-		{
-			// Tied max-DTM: keep min phase to leave more 50MR budget upstream.
-			worst_phase = move_phase;
-		}
-	}
-
-	if (!any_legal) return r;
-	if (max_contribution != ply) return r;
-
-	r.is_loss = true;
-	r.loss_dtm = max_contribution;
-	r.loss_phase = worst_phase;
-	return r;
-}
-
-bool DTM50_Generator::retro_mark_win_in_1(Position_For_Gen& pos_gen,
-                                        Move_List& ml, Color stm)
-{
-	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
-	bool wrote = false;
-	for (size_t i = 0; i < ml.size(); ++i)
-	{
-		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
-		if (pred == BOARD_INDEX_NONE) continue;
-		const DTM_Final_Entry cur = read_dtm(pred, opp);
-		if (cur.is_illegal()) continue;
-		if (cur.is_loss()) continue;
-		if (cur.is_win() && cur.value() <= 1) continue;
-		write_dtm(pred, opp, DTM_Final_Entry::make_win(1));
-		write_phase(pred, opp, 1);  // 1 quiet ply ending at mate
-		wrote = true;
-	}
-	return wrote;
-}
-
-void DTM50_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
-                                       Move_List& ml, Color stm)
-{
-	const Color opp = color_opp(stm);
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
-	for (size_t i = 0; i < ml.size(); ++i)
-	{
-		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
-		if (pred == BOARD_INDEX_NONE) continue;
-		const auto e = read_dtm(pred, opp);
-		if (!e.is_draw() || e.has_change()) continue;
-		// Atomic OR: a concurrent retro_mark_wins overwrite to Final clears the
-		// flag naturally (we always write fresh class+value).
-		cur_layer(opp).lock_add_flags(pred, DTM_FLAG_CHANGE);
-		mark_iter(opp, pred, cur_layer(opp));
-	}
-}
-
-bool DTM50_Generator::retro_mark_wins(Position_For_Gen& pos_gen,
-                                    Move_List& ml, Color stm,
-                                    uint16_t target_dtm, uint8_t cell_phase)
-{
-	const Color opp = color_opp(stm);
-	// pred extends the chain by one quiet ply: pred_phase = 1 + cell_phase.
-	// cell_phase is always ≤ 100 in storage (writes past 100 short-circuit).
-	if (cell_phase >= 100) return false;  // pred would bust 50MR
-	const uint8_t pred_phase = static_cast<uint8_t>(cell_phase + 1);
-
-	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets<true>(out_param(ml));
-	const DTM_Final_Entry new_e = DTM_Final_Entry::make_win(target_dtm);
-	bool wrote = false;
-	for (size_t i = 0; i < ml.size(); ++i)
-	{
-		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
-		if (pred == BOARD_INDEX_NONE) continue;
-		const DTM_Final_Entry cur = read_dtm(pred, opp);
-		if (cur.is_illegal()) continue;
-		if (cur.is_loss()) continue;  // never demote a classified LOSS
-		if (cur.is_win() && cur.value() <= target_dtm) continue;
-		write_dtm(pred, opp, new_e);
-		write_phase(pred, opp, pred_phase);
-		wrote = true;
-	}
-	return wrote;
-}
-
-DTM50_Generator::Iter_Result DTM50_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
-                                                   Color stm, uint16_t ply)
-{
-	const size_t spg = cur_layer(stm).slices_per_group();
-	const auto& pid_in_pair = m_pid_in_pair;
-	const bool has_pawns = m_epsi.pawn_slice_manager().has_pawns();
-
-	Iter_Result global;
-
-	for (size_t g : m_pair_group_ids)
-	{
-		if (m_iter_groups[stm][g] == 0) continue;
-
-		page_in_for_group(thread_pool, stm, g);
-
-		Shared_Board_Index_Iterator cell_it = make_slice_group_iterator(g, spg);
-
-		const auto rets = thread_pool->run_sync_task_on_all_threads([&](size_t tid) -> Iter_Result {
-			Position_For_Gen pos_gen(m_epsi, BOARD_INDEX_ZERO, stm);
-			Board_Index prev = BOARD_INDEX_NONE;
-			Move_List ml;
-			Iter_Result local;
-
-			for (auto [chunk_start, chunk_end] : cell_it.chunks())
-			{
-				const size_t cid = static_cast<size_t>(chunk_start) / CHUNK_SIZE;
-				if (!m_iter_chunks[stm][cid]) continue;
-
-				Iter_Result chunk;
-
-				for (Board_Index idx = chunk_start; idx != chunk_end;
-				     idx = static_cast<Board_Index>(static_cast<size_t>(idx) + 1))
-				{
-					const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
-					if (!pid_in_pair[pid_of_idx]) continue;
-
-					const DTM_Final_Entry e = read_dtm(idx, stm);
-					if (e.is_illegal()) continue;
-
-					// Only flagged Intermediates revisit; bare DRAW SKIPs forever.
-					if (e.is_draw() && (e.has_change() || e.has_pawn_eval()))
-						chunk.any_intermediate = true;
-					else
-					{
-						const uint16_t v = static_cast<uint16_t>(e.value());
-						update_max(chunk.max_classified, v);
-					}
-
-					const Iter_Action action = action_for_entry(e, ply);
-					if (action == Iter_Action::SKIP) continue;
-
-					if (prev != BOARD_INDEX_NONE
-					    && static_cast<size_t>(idx) == static_cast<size_t>(prev) + 1)
-						++pos_gen;
-					else
-						pos_gen.set_board_index(idx);
-					prev = idx;
-					pos_gen.set_turn(stm);
-
-					switch (action)
-					{
-					case Iter_Action::MARK_WIN_IN_1:
-						if (retro_mark_win_in_1(pos_gen, ml, stm)) { local.wrote = true; update_max<uint16_t>(local.max_v, 1); }
-						break;
-					case Iter_Action::MARK_CHANGED:
-						retro_mark_changed(pos_gen, ml, stm);
-						local.wrote = true;
-						break;
-					case Iter_Action::MARK_WIN_PREDS:
-					{
-						const uint16_t target = static_cast<uint16_t>(ply + 1);
-						const uint8_t cell_phase = read_phase(idx, stm);
-						if (retro_mark_wins(pos_gen, ml, stm, target, cell_phase)) { local.wrote = true; update_max(local.max_v, target); }
-						break;
-					}
-					case Iter_Action::CHANGE_REVERIFY:
-					case Iter_Action::PAWN_EVAL:
-					{
-						// Forward pawn-WIN: a push reaching opp-LOSS(ply-1) makes
-						// this cell WIN(ply); also improves stale WIN(value > ply).
-						bool pawn_marked = false;
-						if (has_pawns)
-						{
-							Position& pos = pos_gen.board();
-							pos.gen_pseudo_legal_moves<Position::Move_Kind::PAWN_PUSHES>(out_param(ml));
-							for (size_t i = 0; i < ml.size(); ++i)
-							{
-								const Move m = ml[i];
-								if (!pos.is_pseudo_legal_move_legal(m)) continue;
-								const DTM_Final_Entry opp_e = is_pawn_double_push(m)
-									? effective_opp_dtm_after_dp(pos_gen, m, tid)
-									: read_post_move_dtm(pos_gen, m, tid);
-								if (opp_e.is_loss()
-								    && static_cast<uint16_t>(opp_e.value()) + 1 == ply)
-								{
-									pawn_marked = true;
-									break;
-								}
-							}
-							if (pawn_marked)
-							{
-								write_dtm(idx, stm, DTM_Final_Entry::make_win(ply));
-								write_phase(idx, stm, 0);  // pawn push zeros phase
-								update_max(local.max_v, ply);
-								retro_mark_changed(pos_gen, ml, stm);
-								local.wrote = true;
-								break;
-							}
-						}
-
-						if (!e.is_draw()) break;  // stale-WIN path; nothing else to try
-
-						const auto res = check_loss(pos_gen, ml, ply, tid);
-						if (!res.is_loss)
-						{
-							if (e.has_change())
-							{
-								write_dtm(idx, stm, e.without_change());
-								local.wrote = true;
-							}
-							break;
-						}
-						// 50MR collapse: worst-resisting route exceeds 100 plies →
-						// drawn before the loss materializes; reclassify DRAW.
-						if (res.loss_phase > 100)
-						{
-							if (e.has_change())
-							{
-								write_dtm(idx, stm, e.without_change());
-								local.wrote = true;
-							}
-							break;
-						}
-						write_dtm(idx, stm, DTM_Final_Entry::make_loss(res.loss_dtm));
-						write_phase(idx, stm, res.loss_phase);
-						update_max<uint16_t>(local.max_v, res.loss_dtm + 1);
-						(void)retro_mark_wins(pos_gen, ml, stm, res.loss_dtm + 1, res.loss_phase);
-						local.wrote = true;
-						break;
-					}
-					default:
-						break;
-					}
-				}
-
-				if (chunk.any_intermediate) local.any_intermediate = true;
-				update_max(local.max_classified, chunk.max_classified);
-
-				// Evict only full-CHUNK_SIZE chunks — head/tail share their bit.
-				if (static_cast<size_t>(chunk_end) - static_cast<size_t>(chunk_start) == CHUNK_SIZE
-				    && !chunk.any_intermediate && chunk.max_classified + 1 < ply)
-					m_iter_chunks[stm][cid] = 0;
-			}
-			return local;
-		});
-		bool any_intermediate = false;
-		uint16_t max_classified = 0;
-		for (const Iter_Result& r : rets) {
-			if (r.wrote) global.wrote = true;
-			update_max(global.max_v, r.max_v);
-			if (r.any_intermediate) any_intermediate = true;
-			update_max(max_classified, r.max_classified);
-		}
-		// Evict: no Intermediate cells remain and every classified cell's value
-		// is strictly behind ply-1, so no action_for_entry can fire at this ply
-		// or any future ply. Any later write reinstates the bit via mark_iter.
-		if (!any_intermediate && max_classified + 1 < ply)
-			m_iter_groups[stm][g] = 0;
-	}
-	return global;
-}
-
-void DTM50_Generator::iterate(In_Out_Param<Thread_Pool> thread_pool, uint16_t finished_ply)
-{
-	auto check_interrupt = [&](uint16_t fp) {
-		if (egtb_is_interrupt_requested())
-			throw DTM50_Interrupted{ 0, 0, fp, m_max_dtm, m_current_hmc };
-	};
-
-	if (finished_ply == 0)
-	{
-		(void)run_iter(thread_pool, WHITE, 0);
-		(void)run_iter(thread_pool, BLACK, 0);
-	}
-
-	while (finished_ply < DTM_SCORE_MAX)
-	{
-		++finished_ply;
-		std::printf("  iterate %4u\r", finished_ply); std::fflush(stdout);
-		const Iter_Result rw = run_iter(thread_pool, WHITE, finished_ply);
-		const Iter_Result rb = run_iter(thread_pool, BLACK, finished_ply);
-		update_max(m_max_dtm, rw.max_v);
-		update_max(m_max_dtm, rb.max_v);
-		// Stop only after passing every classified dtm — init-seeded WIN(d)
-		// from cap/promo sits dormant until ply hits d-1.
-		if (!rw.wrote && !rb.wrote && finished_ply > m_max_dtm) break;
-		check_interrupt(finished_ply);
-	}
-}
-
-// =============================================================================
-// Paging (working-set load/evict). apply_working_set lives in egtb_gen.h
-// (templated, shared with DTC); page_in_for_group is DTM-specific because it
-// folds opp's push-target groups into the working set for PAWN_EVAL inside
-// run_iter.
-// =============================================================================
-
-void DTM50_Generator::page_in_for_group(In_Out_Param<Thread_Pool> thread_pool,
-                                      Color me, size_t group_id)
-{
-	if (m_paging_budget_bytes == 0) return;
-	const Color opp = color_opp(me);
-	const size_t nks = m_epsi.num_king_slices();
-	const size_t spg = cur_layer(me).slices_per_group();
-	const size_t ntotal = m_epsi.num_slices();
-	const auto& kingsm = m_epsi.slice_manager();
-	const auto& psm = m_epsi.pawn_slice_manager();
-	const bool has_pawns = psm.has_pawns();
-
-	const size_t g_start = group_id * spg;
-	const size_t g_end   = std::min(g_start + spg, ntotal);
-
-	const size_t ngroups = m_table->m_dtm[WHITE][0].num_groups();
-	auto& need_me  = m_scratch_need[me];
-	auto& need_opp = m_scratch_need[opp];
-	need_me.assign(ngroups, 0);
-	need_opp.assign(ngroups, 0);
-	need_me[group_id] = 1;
-
-	for (int32_t pid : m_active_pawn_slices)
-	{
-		const size_t pid_base = static_cast<size_t>(pid) * nks;
-		const size_t s_lo = std::max(g_start, pid_base);
-		const size_t s_hi = std::min(g_end,   pid_base + nks);
-		if (s_lo >= s_hi) continue;
-		for (size_t s = s_lo; s < s_hi; ++s)
-		{
-			const int32_t kid = static_cast<int32_t>(s - pid_base);
-			kingsm.neighbors(kid, m_scratch_nbrs);
-			for (int32_t pp : m_active_pawn_slices)
-			{
-				const size_t same = static_cast<size_t>(pp) * nks + static_cast<size_t>(kid);
-				need_opp[same / spg] = 1;
-				for (int32_t k : m_scratch_nbrs)
-				{
-					const size_t neigh = static_cast<size_t>(pp) * nks + static_cast<size_t>(k);
-					need_opp[neigh / spg] = 1;
-				}
-			}
-			if (has_pawns)
-			{
-				// PAWN_EVAL inside run_iter reads opp's push-target groups at
-				// the same king-slice. DTC doesn't need this — pawns there are
-				// handled forward-only at init.
-				for (int32_t tpid : psm.push_target_slices(pid))
-				{
-					const size_t target =
-						static_cast<size_t>(tpid) * nks + static_cast<size_t>(kid);
-					need_opp[target / spg] = 1;
-				}
-			}
-		}
-	}
-
-	apply_working_set(thread_pool, &cur_layer(WHITE), &cur_layer(BLACK), m_scratch_need[WHITE], m_scratch_need[BLACK]);
-	// Same need bitmaps page opp hmc=0 / hmc=k+1 for layer-k retro; phase
-	// slices come along for layer-0 retro.
-	if (m_current_hmc != 0)
-	{
-		apply_working_set(thread_pool,
-			&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
-			m_scratch_need[WHITE], m_scratch_need[BLACK]);
-		if (m_current_hmc + 1 < DTM50_HMC_COUNT)
-		{
-			apply_working_set(thread_pool,
-				&m_table->m_dtm[WHITE][m_current_hmc + 1],
-				&m_table->m_dtm[BLACK][m_current_hmc + 1],
-				m_scratch_need[WHITE], m_scratch_need[BLACK]);
-		}
-	}
-	else
-	{
-		apply_working_set(thread_pool,
-			&m_table->m_phase[WHITE], &m_table->m_phase[BLACK],
-			m_scratch_need[WHITE], m_scratch_need[BLACK]);
-	}
+	if (progress_bar) progress_bar->set_finished();
 }
 
 // =============================================================================
@@ -1028,20 +481,16 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 	for (const auto& batch : batches) total_pairs += batch.size();
 
 	const auto ckpt_path = paths.dtm50_checkpoint_path(m_epsi);
-	uint16_t resume_hmc = 0;
 	int64_t resume_batch_idx = -1;
 	int64_t resume_fusion_idx = -1;
-	uint16_t resume_finished_ply = 0;
-	uint16_t resume_max_dtm = 0;
+	int64_t resume_hmc = -1;
 	{
 		Checkpoint_File ckpt{};
 		if (read_checkpoint(ckpt_path, &ckpt))
 		{
-			resume_hmc = ckpt.hmc;
 			resume_batch_idx = static_cast<int64_t>(ckpt.batch_idx);
 			resume_fusion_idx = static_cast<int64_t>(ckpt.fusion_idx);
-			resume_finished_ply = ckpt.finished_ply;
-			resume_max_dtm = ckpt.max_dtm;
+			resume_hmc = static_cast<int64_t>(ckpt.hmc);
 		}
 		else
 		{
@@ -1050,108 +499,85 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 				m_table->m_dtm[WHITE][h].remove_disk_files();
 				m_table->m_dtm[BLACK][h].remove_disk_files();
 			}
-			m_table->m_phase[WHITE].remove_disk_files();
-			m_table->m_phase[BLACK].remove_disk_files();
 		}
 	}
 
-	// Build order: hmc=0 (retro, self-referential in-M reads), then 99..1
-	// top-down. hmc=0 leads so k>0 sees a finalized opp[hmc=0] for zeroing edges.
-	auto build_one_layer = [&](uint16_t hmc) {
-		m_current_hmc = hmc;
-		m_max_dtm = 0;
-
-		// Unbounded budget: pre-load this layer plus the read-only layers it
-		// consumes (opp hmc=0 for in-M push, opp hmc=k+1 for quiet). At hmc=0
-		// also pre-load the phase slices. Bounded paths page those alongside
-		// the write layer inside page_in_for_*.
-		if (m_paging_budget_bytes == 0)
+	// Outer = topo batch / fusion, inner = hmc 99..0; see header for the read
+	// dependency argument that this order satisfies.
+	for (size_t bi = 0; bi < batches.size(); ++bi)
+	{
+		if (static_cast<int64_t>(bi) < resume_batch_idx) continue;
+		const auto& batch = batches[bi];
+		const auto fusions = compute_fusion_groups(m_table->m_dtm[WHITE][0], batch);
+		if (pawnful)
 		{
-			const size_t ng = cur_layer(WHITE).num_groups();
-			std::vector<uint8_t> all_needed(ng, 1);
-			apply_working_set(thread_pool, &cur_layer(WHITE), &cur_layer(BLACK), all_needed, all_needed);
-			if (hmc != 0)
+			std::printf("  batch %zu/%zu (%zu pairs in %zu fusion%s)\n",
+				bi + 1, batches.size(), batch.size(),
+				fusions.size(), fusions.size() == 1 ? "" : "s");
+			std::fflush(stdout);
+		}
+
+		for (size_t fi = 0; fi < fusions.size(); ++fi)
+		{
+			if (static_cast<int64_t>(bi) == resume_batch_idx &&
+			    static_cast<int64_t>(fi) < resume_fusion_idx) continue;
+
+			const auto& fusion = fusions[fi];
+
+			m_active_pawn_slices.clear();
+			for (int32_t pair_sid : fusion)
 			{
-				apply_working_set(thread_pool,
-					&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
-					all_needed, all_needed);
-				if (hmc + 1 < DTM50_HMC_COUNT)
+				const auto m = psm.pair_members(pair_sid);
+				m_active_pawn_slices.insert(m_active_pawn_slices.end(), m.begin(), m.end());
+			}
+			std::sort(m_active_pawn_slices.begin(), m_active_pawn_slices.end());
+			m_active_pawn_slices.erase(
+				std::unique(m_active_pawn_slices.begin(), m_active_pawn_slices.end()),
+				m_active_pawn_slices.end());
+
+			for (int hmc_signed = static_cast<int>(DTM50_HMC_COUNT) - 1; hmc_signed >= 0; --hmc_signed)
+			{
+				// Within the resume fusion, layers 99..(resume_hmc+1) were
+				// already finished; resume at resume_hmc and run the rest fresh.
+				if (static_cast<int64_t>(bi) == resume_batch_idx &&
+				    static_cast<int64_t>(fi) == resume_fusion_idx &&
+				    static_cast<int64_t>(hmc_signed) > resume_hmc) continue;
+
+				const uint16_t hmc = static_cast<uint16_t>(hmc_signed);
+				m_current_hmc = hmc;
+
+				// Unbounded budget: pre-load every group of the layers this
+				// step reads (cur layer + opp[0] + opp[k+1]). Bounded mode
+				// does the per-group equivalent in page_in_for_init_group.
+				if (m_paging_budget_bytes == 0)
 				{
+					const size_t ng = cur_layer(WHITE).num_groups();
+					std::vector<uint8_t> all_needed(ng, 1);
+					apply_working_set(thread_pool, &cur_layer(WHITE), &cur_layer(BLACK), all_needed, all_needed);
 					apply_working_set(thread_pool,
-						&m_table->m_dtm[WHITE][hmc + 1], &m_table->m_dtm[BLACK][hmc + 1],
+						&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
 						all_needed, all_needed);
+					if (hmc + 1 < DTM50_HMC_COUNT)
+					{
+						apply_working_set(thread_pool,
+							&m_table->m_dtm[WHITE][hmc + 1], &m_table->m_dtm[BLACK][hmc + 1],
+							all_needed, all_needed);
+					}
 				}
-			}
-			else
-			{
-				apply_working_set(thread_pool,
-					&m_table->m_phase[WHITE], &m_table->m_phase[BLACK],
-					all_needed, all_needed);
-			}
-		}
 
-		// k+2 was the previous build's quiet-read layer; no future consumer.
-		if (hmc != 0 && hmc + 2 < DTM50_HMC_COUNT)
-		{
-			m_table->m_dtm[WHITE][hmc + 2].evict_all(*thread_pool);
-			m_table->m_dtm[BLACK][hmc + 2].evict_all(*thread_pool);
-		}
-
-		for (size_t bi = 0; bi < batches.size(); ++bi)
-		{
-			if (hmc == resume_hmc && static_cast<int64_t>(bi) < resume_batch_idx) continue;
-			const auto& batch = batches[bi];
-			const auto fusions = compute_fusion_groups(cur_layer(WHITE), batch);
-			if (pawnful && hmc == 0)
-			{
-				std::printf("  batch %zu/%zu (%zu pairs in %zu fusion%s)\n",
-					bi + 1, batches.size(), batch.size(),
-					fusions.size(), fusions.size() == 1 ? "" : "s");
-				std::fflush(stdout);
-			}
-			for (size_t fi = 0; fi < fusions.size(); ++fi)
-			{
-				const bool is_resume_fusion =
-					hmc == resume_hmc &&
-					static_cast<int64_t>(bi) == resume_batch_idx &&
-					static_cast<int64_t>(fi) == resume_fusion_idx;
-				if (hmc == resume_hmc &&
-				    static_cast<int64_t>(bi) == resume_batch_idx &&
-				    static_cast<int64_t>(fi) < resume_fusion_idx)
-					continue;
-
-				const auto& fusion = fusions[fi];
-
-				m_active_pawn_slices.clear();
-				for (int32_t pair_sid : fusion)
+				// k+2 was the previous step's read layer; no future step in
+				// this fusion needs it.
+				if (hmc + 2 < DTM50_HMC_COUNT)
 				{
-					const auto m = psm.pair_members(pair_sid);
-					m_active_pawn_slices.insert(m_active_pawn_slices.end(), m.begin(), m.end());
+					m_table->m_dtm[WHITE][hmc + 2].evict_all(*thread_pool);
+					m_table->m_dtm[BLACK][hmc + 2].evict_all(*thread_pool);
 				}
-				std::sort(m_active_pawn_slices.begin(), m_active_pawn_slices.end());
-				m_active_pawn_slices.erase(
-					std::unique(m_active_pawn_slices.begin(), m_active_pawn_slices.end()),
-					m_active_pawn_slices.end());
+
 				refresh_active_metadata(cur_layer(WHITE));
-
-				seed_iter_groups();
-
-				uint16_t start_ply = 0;
-				if (is_resume_fusion)
-				{
-					start_ply = resume_finished_ply;
-					update_max(m_max_dtm, resume_max_dtm);
-				}
-				else
-				{
-					const uint16_t init_max = init_entries(thread_pool);
-					update_max(m_max_dtm, init_max);
-				}
 
 				try
 				{
-					// k>0: init fully classifies (no in-layer chain). k=0: retro.
-					if (hmc == 0) iterate(thread_pool, start_ply);
+					init_entries(thread_pool);
 				}
 				catch (const DTM50_Interrupted& e)
 				{
@@ -1160,55 +586,22 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 						m_table->m_dtm[WHITE][h].evict_all(*thread_pool);
 						m_table->m_dtm[BLACK][h].evict_all(*thread_pool);
 					}
-					// Phase slices spill same as data layers; resume re-pages.
-					m_table->m_phase[WHITE].evict_all(*thread_pool);
-					m_table->m_phase[BLACK].evict_all(*thread_pool);
 					Checkpoint_File ckpt{};
-					ckpt.hmc = hmc;
 					ckpt.batch_idx = static_cast<uint32_t>(bi);
 					ckpt.fusion_idx = static_cast<uint32_t>(fi);
-					ckpt.finished_ply = e.finished_ply;
-					ckpt.max_dtm = e.max_dtm;
+					ckpt.hmc = e.hmc;
 					write_checkpoint(ckpt_path, ckpt);
-					std::printf("\n  interrupted: checkpoint written (hmc=%u)\n", hmc);
+					std::printf("\n  interrupted: checkpoint written (bi=%zu, fi=%zu, hmc=%u)\n",
+						bi, fi, e.hmc);
 					std::fflush(stdout);
 					throw;
 				}
 			}
 		}
-		if (hmc == 0)
-		{
-			// Phase tape is layer-0-only. remove_disk_files before close so
-			// the paths are still populated; close discards in-memory groups
-			// without flushing dirty pages (we're throwing them away anyway).
-			m_table->m_phase[WHITE].remove_disk_files();
-			m_table->m_phase[BLACK].remove_disk_files();
-			m_table->m_phase[WHITE].close();
-			m_table->m_phase[BLACK].close();
-		}
-	};
-
-	// Per-layer schedule: 0, then 99 down to 1.
-	std::vector<uint16_t> hmc_schedule;
-	hmc_schedule.reserve(DTM50_HMC_COUNT);
-	hmc_schedule.push_back(0);
-	for (uint16_t h = DTM50_HMC_COUNT - 1; h >= 1; --h)
-		hmc_schedule.push_back(h);
-
-	bool seen_resume = false;
-	for (uint16_t hmc : hmc_schedule)
-	{
-		if (!seen_resume)
-		{
-			if (hmc == resume_hmc) seen_resume = true;
-			else if (resume_hmc != 0 || resume_batch_idx >= 0) continue;
-			else seen_resume = true;
-		}
-		build_one_layer(hmc);
 	}
 
 	const auto t_total_end = std::chrono::steady_clock::now();
-	std::printf("  gen (init + build, %zu hmc layers): done in %s (%zu pawn-slice pairs in %zu batches)\n",
+	std::printf("  gen (%zu hmc layers): done in %s (%zu pawn-slice pairs in %zu batches)\n",
 		DTM50_HMC_COUNT,
 		format_elapsed_time(t_total_start, t_total_end).c_str(),
 		total_pairs, batches.size());
@@ -1478,8 +871,6 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 	}
 
 	remove_checkpoint(paths.dtm50_checkpoint_path(m_epsi));
-	m_table->m_phase[WHITE].remove_disk_files();
-	m_table->m_phase[BLACK].remove_disk_files();
 	for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
 	{
 		m_table->m_dtm[WHITE][h].remove_disk_files();
