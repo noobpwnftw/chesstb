@@ -441,8 +441,7 @@ int main(int argc, char** argv)
 			          << "  (DTM " << std::filesystem::file_size(paths.dtm_save_path(ps)) << " B)\n";
 		}
 
-		// Optional DTM50 pass. Sub-TB reads target partner's hmc=0 layer;
-		// closure order ensures those exist before we get here.
+		// Optional DTM50 pass for this material.
 		if (opt.build_dtm50 && !paths.find_dtm50_file(ps))
 		{
 			std::cout << "  " << ps.name() << ": generating DTM50...\n";

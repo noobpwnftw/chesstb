@@ -680,9 +680,11 @@ private:
 template <typename EntryT>
 struct Save_Group_Cache
 {
-	using Key = std::pair<Color, size_t>;
+	// Key is (table_idx, group_id). DTC/DTM use table_idx as Color; DTM50
+	// passes all HMC_COUNT × 2 layer tables to share one residency budget.
+	using Key = std::pair<size_t, size_t>;
 
-	Sliced_EGTB_File_For_Gen<EntryT>* tables[COLOR_NB];
+	std::vector<Sliced_EGTB_File_For_Gen<EntryT>*> tables;
 	size_t cap;
 	std::mutex mu;
 	std::list<Key> fifo;           // load order; front = oldest
@@ -690,29 +692,18 @@ struct Save_Group_Cache
 
 	Save_Group_Cache(Sliced_EGTB_File_For_Gen<EntryT>* w_tbl,
 	                 Sliced_EGTB_File_For_Gen<EntryT>* b_tbl,
-	                 size_t c) : cap(c)
-	{
-		tables[WHITE] = w_tbl;
-		tables[BLACK] = b_tbl;
-		for (Color col : { WHITE, BLACK })
-		{
-			auto& tbl = *tables[col];
-			for (size_t g = 0; g < tbl.num_groups(); ++g)
-			{
-				if (tbl.is_group_resident(g))
-				{
-					fifo.push_back({ col, g });
-					pin_count[{ col, g }] = 0;
-				}
-			}
-		}
-	}
+	                 size_t c)
+		: tables{ w_tbl, b_tbl }, cap(c) { init_resident(); }
 
-	void acquire(Color c, size_t g)
+	Save_Group_Cache(std::vector<Sliced_EGTB_File_For_Gen<EntryT>*> tbls,
+	                 size_t c)
+		: tables(std::move(tbls)), cap(c) { init_resident(); }
+
+	void acquire(size_t table_idx, size_t g)
 	{
 		std::lock_guard<std::mutex> lk(mu);
-		const Key k{ c, g };
-		auto& tbl = *tables[c];
+		const Key k{ table_idx, g };
+		auto& tbl = *tables[table_idx];
 		auto [pit, inserted] = pin_count.try_emplace(k, 0);
 		if (inserted)
 		{
@@ -737,10 +728,28 @@ struct Save_Group_Cache
 		}
 	}
 
-	void release(Color c, size_t g)
+	void release(size_t table_idx, size_t g)
 	{
 		std::lock_guard<std::mutex> lk(mu);
-		pin_count[{ c, g }]--;
+		pin_count[{ table_idx, g }]--;
+	}
+
+private:
+	void init_resident()
+	{
+		for (size_t ti = 0; ti < tables.size(); ++ti)
+		{
+			if (!tables[ti]) continue;
+			auto& tbl = *tables[ti];
+			for (size_t g = 0; g < tbl.num_groups(); ++g)
+			{
+				if (tbl.is_group_resident(g))
+				{
+					fifo.push_back({ ti, g });
+					pin_count[{ ti, g }] = 0;
+				}
+			}
+		}
 	}
 };
 
@@ -748,22 +757,22 @@ template <typename EntryT>
 struct Pinned_Group_Range
 {
 	Save_Group_Cache<EntryT>* cache;
-	Color color;
+	size_t table_idx;
 	std::vector<size_t> held;
 
-	Pinned_Group_Range(Save_Group_Cache<EntryT>& c, Color col, size_t first_g, size_t last_g)
-		: cache(&c), color(col)
+	Pinned_Group_Range(Save_Group_Cache<EntryT>& c, size_t ti, size_t first_g, size_t last_g)
+		: cache(&c), table_idx(ti)
 	{
 		held.reserve(last_g - first_g + 1);
 		for (size_t g = first_g; g <= last_g; ++g)
 		{
-			cache->acquire(color, g);
+			cache->acquire(table_idx, g);
 			held.push_back(g);
 		}
 	}
 	~Pinned_Group_Range()
 	{
-		for (size_t g : held) cache->release(color, g);
+		for (size_t g : held) cache->release(table_idx, g);
 	}
 	Pinned_Group_Range(const Pinned_Group_Range&) = delete;
 	Pinned_Group_Range& operator=(const Pinned_Group_Range&) = delete;

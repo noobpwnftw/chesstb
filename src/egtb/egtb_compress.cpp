@@ -981,12 +981,9 @@ void load_dtm_sub_flat(
 	}
 }
 
-// DTM50 layer-0 variant of load_dtm_sub_flat. Same eager-decompress-to-tmp-mmap
-// shape; differs only in the file it opens (dtm50/<name>/h0.lzdtm50), the
-// magic it checks (DTM50_MAGIC), the tmp output path (dtm50_sub_flat_path),
-// and the value/class reconstruction (dtm50_entry_from_storage folds
-// CURSED_WIN/BLESSED_LOSS → DRAW because layer-0 already collapsed those
-// cells during the build).
+// Eagerly decompress and remap the hmc=0 column of the rs-pack into a flat
+// mmap'd array — that's the only column higher-piece DTM50 gens read.
+// File / block layout is defined in egtb_gen_dtm50.cpp::save_to_disk.
 void load_dtm50_sub_flat(
 	Out_Param<DTM50_Sub_File_Flat> flat,
 	const EGTB_Paths& egtb_files,
@@ -995,8 +992,8 @@ void load_dtm50_sub_flat(
 )
 {
 	std::filesystem::path dtm_path;
-	if (!egtb_files.find_dtm50_file(ps, &dtm_path, /*hmc=*/0))
-		throw std::runtime_error("Could not find a DTM50 hmc=0 file for " + ps.name());
+	if (!egtb_files.find_dtm50_file(ps, &dtm_path))
+		throw std::runtime_error("Could not find a DTM50 file for " + ps.name());
 	std::filesystem::path wdl_path;
 	if (!egtb_files.find_wdl_file(ps, &wdl_path))
 		throw std::runtime_error("Could not find a WDL file for " + ps.name()
@@ -1029,9 +1026,9 @@ void load_dtm50_sub_flat(
 	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
 
 	size_t entry_bytes[COLOR_NB]{ 0, 0 };
-	size_t tail_size[COLOR_NB]{ 0, 0 };
-	size_t block_size[COLOR_NB]{ 0, 0 };
+	size_t block_positions[COLOR_NB]{ 0, 0 };
 	size_t block_cnt[COLOR_NB]{ 0, 0 };
+	size_t tail_positions[COLOR_NB]{ 0, 0 };
 	size_t data_size[COLOR_NB]{ 0, 0 };
 	bool is_singular[COLOR_NB]{ false, false };
 	std::vector<uint16_t> rank_to_value[COLOR_NB];
@@ -1044,17 +1041,17 @@ void load_dtm50_sub_flat(
 		if (flag & EGTB_SINGULAR_FLAG)
 		{
 			is_singular[i] = true;
-			reader.advance(1);
+			reader.advance(1);  // singular_wdl byte; unused (DRAW everywhere)
 		}
 		else
 		{
 			entry_bytes[i] = reader.read<uint8_t>();
-			if (entry_bytes[i] != sizeof(DTM_Final_Entry) && entry_bytes[i] != 1)
+			if (entry_bytes[i] != 1 && entry_bytes[i] != 2)
 				throw std::runtime_error("Bad DTM50 entry_bytes in " + dtm_path.string());
-			tail_size[i]  = reader.read<uint32_t>();
-			block_size[i] = reader.read<uint32_t>();
-			block_cnt[i]  = reader.read<uint32_t>();
-			data_size[i]  = reader.read<uint64_t>();
+			block_positions[i] = reader.read<uint32_t>();
+			block_cnt[i]       = reader.read<uint32_t>();
+			tail_positions[i]  = reader.read<uint32_t>();
+			data_size[i]       = reader.read<uint64_t>();
 
 			const size_t num_ranks = reader.read<uint16_t>();
 			rank_to_value[i].resize(num_ranks);
@@ -1067,9 +1064,8 @@ void load_dtm50_sub_flat(
 	{
 		if (is_singular[i]) continue;
 		offset_tb[i] = reader.caret();
-		reader.advance(block_cnt[i] * 8);
+		reader.advance(block_cnt[i] * 16);
 	}
-
 	for (const Color i : table_colors)
 	{
 		if (is_singular[i]) continue;
@@ -1093,71 +1089,89 @@ void load_dtm50_sub_flat(
 
 		if (is_singular[i])
 		{
-			// Singular DTM50 ⇒ DRAW everywhere; see note in load_dtm_sub_flat.
+			// Singular ⇒ DRAW everywhere. ILLEGAL cells are allocated but never
+			// probed (sub-TB callers always resolve to legal child indices).
 			std::memset(out, 0, file_bytes);
+			flat->m_files[i] = std::move(out_map);
+			continue;
 		}
-		else
-		{
-			const size_t num_full = tail_size[i] != 0 ? block_cnt[i] - 1 : block_cnt[i];
-			const size_t src_sz   = block_size[i] * num_full + tail_size[i];
-			if (src_sz != num_positions * entry_bytes[i])
-				throw std::runtime_error("DTM50 decompressed size mismatch " + dtm_path.string());
 
-			const auto& r2v = rank_to_value[i];
-			const size_t blocks = block_cnt[i];
-			const size_t positions_per_block = block_size[i] / entry_bytes[i];
-			std::atomic<size_t> next_block(0);
+		const auto& r2v = rank_to_value[i];
+		const size_t blocks = block_cnt[i];
+		const size_t ppb = block_positions[i];
+		const size_t eb = entry_bytes[i];
+		std::atomic<size_t> next_block(0);
 
-			thread_pool->run_sync_task_on_all_threads([&](size_t thread_id) {
-				LZMA_Decompress_Helper dc_helper(block_size[i]);
+		// Decompress buffer must hold the worst-case payload (every position
+		// non-trivial with all 100 layers distinct).
+		const size_t max_payload = 8 + (ppb + 7) / 8
+			+ ppb * eb + 4 * (ppb + 1) + ppb * (1 + 16 + 100 * eb);
 
-				for (;;)
+		thread_pool->run_sync_task_on_all_threads([&](size_t thread_id) {
+			LZMA_Decompress_Helper dc_helper(max_payload);
+
+			for (;;)
+			{
+				const size_t bidx = next_block.fetch_add(1, std::memory_order_relaxed);
+				if (bidx >= blocks) return;
+
+				uint64_t dso, usz;
+				std::memcpy(&dso, offset_tb[i] + bidx * 16,     8);
+				std::memcpy(&usz, offset_tb[i] + bidx * 16 + 8, 8);
+				const size_t dsz  = dso & 0xFFFFFu;
+				const size_t doff = dso >> 20;
+
+				const size_t this_bp =
+					(bidx == blocks - 1 && tail_positions[i] != 0) ? tail_positions[i] : ppb;
+				const size_t base_pos = bidx * ppb;
+
+				const Const_Span<uint8_t> raw = dc_helper.decompress(
+					Const_Span<uint8_t>(data[i] + doff, dsz), usz);
+
+				const uint8_t* p = raw.data();
+				uint32_t np32, ntri32;
+				std::memcpy(&np32,  p,     4);
+				std::memcpy(&ntri32, p + 4, 4);
+				ASSERT(np32 == this_bp);
+				const size_t num_nontrivial = ntri32;
+				const size_t num_trivial = this_bp - num_nontrivial;
+				p += 8;
+
+				const uint8_t* T = p;
+				p += (this_bp + 7) / 8;
+				const uint8_t* trivial_ranks = p;
+				p += num_trivial * eb;
+				const uint32_t* ntri_dir = reinterpret_cast<const uint32_t*>(p);
+				p += (num_nontrivial + 1) * 4;
+				const uint8_t* ntri_data = p;
+
+				size_t triv_cursor = 0;
+				size_t ntri_cursor = 0;
+				for (size_t k = 0; k < this_bp; ++k)
 				{
-					const size_t idx = next_block.fetch_add(1, std::memory_order_relaxed);
-					if (idx >= blocks) return;
-
-					const uint8_t* offset = offset_tb[i] + idx * 8;
-					const uint64_t dso = reinterpret_cast<const uint64_t*>(offset)[0];
-					const size_t dsz  = dso & 0xFFFFF;
-					const size_t doff = dso >> 20;
-
-					const size_t decode_sz =
-						(idx == blocks - 1 && tail_size[i] != 0) ? tail_size[i] : block_size[i];
-					const size_t positions = decode_sz / entry_bytes[i];
-					const size_t pos = idx * positions_per_block;
-
-					if (dsz == 0)
+					uint16_t rank;
+					if (T[k >> 3] & (uint8_t)(1u << (k & 7)))
 					{
-						for (size_t k = 0; k < positions; ++k)
-							out[pos + k] = DTM_Final_Entry::make_illegal();
-						continue;
-					}
-
-					const Const_Span<uint8_t> raw = dc_helper.decompress(
-						Const_Span<uint8_t>(data[i] + doff, dsz), decode_sz);
-
-					if (entry_bytes[i] == 1)
-					{
-						for (size_t k = 0; k < positions; ++k)
-						{
-							const uint16_t stored = r2v[raw[k]];
-							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
-							out[pos + k] = dtm50_entry_from_storage(stored, w);
-						}
+						// Non-trivial: hmc=0 is always changepoint 0, at
+						// offset 17 (1 count + 16 bitmap).
+						const uint8_t* blk = ntri_data + ntri_dir[ntri_cursor];
+						if (eb == 1) rank = blk[17];
+						else         std::memcpy(&rank, blk + 17, 2);
+						++ntri_cursor;
 					}
 					else
 					{
-						const uint16_t* in = reinterpret_cast<const uint16_t*>(raw.data());
-						for (size_t k = 0; k < positions; ++k)
-						{
-							const uint16_t stored = r2v[in[k]];
-							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
-							out[pos + k] = dtm50_entry_from_storage(stored, w);
-						}
+						if (eb == 1) rank = trivial_ranks[triv_cursor];
+						else         std::memcpy(&rank, trivial_ranks + triv_cursor * 2, 2);
+						++triv_cursor;
 					}
+					const uint16_t stored = r2v[rank];
+					const WDL_Entry w = wdl.read(i,
+						static_cast<Board_Index>(base_pos + k), thread_id);
+					out[base_pos + k] = dtm50_entry_from_storage(stored, w);
 				}
-			});
-		}
+			}
+		});
 
 		flat->m_files[i] = std::move(out_map);
 	}

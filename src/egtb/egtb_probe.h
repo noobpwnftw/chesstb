@@ -126,15 +126,14 @@ struct EGTB_Paths
 		if (tb) *tb = std::move(found);
 		return true;
 	}
-	// dtm50/<name>/h<hmc>.lzdtm50 — one subfolder per piece config.
-	NODISCARD bool find_dtm50_file(const Piece_Config& ps, std::filesystem::path* tb = nullptr, uint16_t hmc = 0) const
+	// dtm50/<name>.lzdtm50 — one packed file per material, all 100 hmc layers.
+	NODISCARD bool find_dtm50_file(const Piece_Config& ps, std::filesystem::path* tb = nullptr) const
 	{
-		const std::string fn = "h" + std::to_string(hmc) + DTM50_EXT;
+		const std::string fn = ps.name() + DTM50_EXT;
 		for (const auto& dir : m_dtm50_paths)
 		{
-			const auto path = path_join(dir, ps.name()) / fn;
+			const auto path = path_join(dir, fn);
 			if (!std::filesystem::exists(path)) continue;
-			if (!tb_file_is_full_format(path, EGTB_Magic::DTM50_MAGIC)) continue;
 			if (tb) *tb = path;
 			return true;
 		}
@@ -146,13 +145,13 @@ struct EGTB_Paths
 	NODISCARD std::filesystem::path dtc_info_save_path(const Piece_Config& ps) const { return path_join(m_dtc_paths[0], ps.name() + INFO_EXT); }
 	NODISCARD std::filesystem::path dtm_save_path(const Piece_Config& ps) const { return path_join(m_dtm_paths[0], ps.name() + DTM_EXT); }
 	NODISCARD std::filesystem::path dtm_info_save_path(const Piece_Config& ps) const { return path_join(m_dtm_paths[0], ps.name() + INFO_EXT); }
-	NODISCARD std::filesystem::path dtm50_save_path(const Piece_Config& ps, uint16_t hmc = 0) const
+	NODISCARD std::filesystem::path dtm50_save_path(const Piece_Config& ps) const
 	{
-		return path_join(m_dtm50_paths[0], ps.name()) / ("h" + std::to_string(hmc) + DTM50_EXT);
+		return path_join(m_dtm50_paths[0], ps.name() + DTM50_EXT);
 	}
-	NODISCARD std::filesystem::path dtm50_info_save_path(const Piece_Config& ps, uint16_t hmc = 0) const
+	NODISCARD std::filesystem::path dtm50_info_save_path(const Piece_Config& ps) const
 	{
-		return path_join(m_dtm50_paths[0], ps.name()) / ("h" + std::to_string(hmc) + INFO_EXT);
+		return path_join(m_dtm50_paths[0], ps.name() + INFO_EXT);
 	}
 
 	NODISCARD std::filesystem::path dtc_slice_save_path(const Piece_Config& ps, Color c) const

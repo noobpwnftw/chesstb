@@ -296,6 +296,234 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 	return true;
 }
 
+// =============================================================================
+// DTM50 shrinker. Separate from shrink_rank_encoded because the .lzdtm50 pack
+// uses block-stride-in-positions and 16-byte (dso, usz) offset entries.
+// =============================================================================
+struct Dtm50_Color_Info
+{
+	bool present = false;
+	uint8_t flag = 0;
+	uint8_t single_val = 0;
+	// Fields below are populated only when flag_is_normal(flag).
+	uint8_t entry_bytes = 0;
+	uint32_t block_positions = 0;
+	uint32_t block_cnt = 0;
+	uint32_t tail_positions = 0;
+	uint64_t data_size = 0;
+	uint16_t num_ranks = 0;
+	const uint8_t* rank_table_ptr = nullptr;
+	const uint8_t* offset_tb_ptr  = nullptr;   // 16 bytes per block
+	const uint8_t* data_ptr       = nullptr;
+};
+
+NODISCARD bool parse_dtm50(const Const_Span<uint8_t>& bytes,
+                           Dtm50_Color_Info info[COLOR_NB],
+                           uint32_t* key_and_table_num,
+                           Fixed_Vector<Color, 2>* out_table_colors)
+{
+	Serial_Memory_Reader r(bytes);
+	if (!r.is_end_checksum_ok(CHECKSUM_INIT)) return false;
+	const uint32_t magic = r.read<uint32_t>();
+	if (magic != static_cast<uint32_t>(EGTB_Magic::DTM50_MAGIC)) return false;
+	*key_and_table_num = r.read<uint32_t>();
+	const size_t table_num = *key_and_table_num & 3;
+	*out_table_colors = egtb_table_colors(table_num);
+
+	for (Color c : *out_table_colors)
+	{
+		info[c].present = true;
+		const uint8_t flag = r.read<uint8_t>();
+		info[c].flag = flag;
+		if (flag & SINGULAR_FLAG)
+		{
+			info[c].single_val = r.read<uint8_t>();
+		}
+		else if (flag & DROPPED_FLAG)
+		{
+			// Dropped colors have no payload.
+		}
+		else
+		{
+			info[c].entry_bytes     = r.read<uint8_t>();
+			info[c].block_positions = r.read<uint32_t>();
+			info[c].block_cnt       = r.read<uint32_t>();
+			info[c].tail_positions  = r.read<uint32_t>();
+			info[c].data_size       = r.read<uint64_t>();
+			info[c].num_ranks       = r.read<uint16_t>();
+			info[c].rank_table_ptr  = r.caret();
+			r.advance(info[c].num_ranks * 2);
+		}
+	}
+
+	for (Color c : *out_table_colors)
+	{
+		if (!info[c].present) continue;
+		if (!flag_is_normal(info[c].flag)) continue;
+		info[c].offset_tb_ptr = r.caret();
+		r.advance(info[c].block_cnt * 16);
+	}
+
+	for (Color c : *out_table_colors)
+	{
+		if (!info[c].present) continue;
+		if (!flag_is_normal(info[c].flag)) continue;
+		r.align(64);
+		info[c].data_ptr = r.caret();
+		r.advance(info[c].data_size);
+	}
+
+	return true;
+}
+
+NODISCARD size_t dtm50_color_header_bytes(const Dtm50_Color_Info& ci)
+{
+	if (ci.flag & SINGULAR_FLAG) return 2;
+	if (ci.flag & DROPPED_FLAG)  return 1;
+	// 1 flag + 1 eb + 4 block_positions + 4 block_cnt + 4 tail_positions
+	// + 8 data_size + 2 num_ranks + ranks.
+	return 24 + ci.num_ranks * 2;
+}
+
+bool shrink_dtm50(const std::filesystem::path& path)
+{
+	Memory_Mapped_File in;
+	if (!in.open_readonly(path.c_str()))
+	{
+		std::fprintf(stderr, "%s: open failed\n", path.c_str());
+		return false;
+	}
+	const Const_Span<uint8_t> bytes = in.data_span();
+	if ((bytes.size() & 63) != 8)
+	{
+		std::fprintf(stderr, "%s: bad file size\n", path.c_str());
+		return false;
+	}
+
+	Dtm50_Color_Info info[COLOR_NB]{};
+	uint32_t key_and_table_num = 0;
+	Fixed_Vector<Color, 2> table_colors;
+	if (!parse_dtm50(bytes, info, &key_and_table_num, &table_colors))
+	{
+		std::fprintf(stderr, "%s: bad DTM50 header/checksum\n", path.c_str());
+		return false;
+	}
+
+	const Color drop = pick_drop_color(info, table_colors);
+	if (drop == COLOR_NB)
+	{
+		std::printf("%s: skip (nothing droppable)\n", path.c_str());
+		return true;
+	}
+
+	Dtm50_Color_Info shrunk[COLOR_NB] = { info[WHITE], info[BLACK] };
+	shrunk[drop].flag = DROPPED_FLAG;
+	shrunk[drop].entry_bytes = 0;
+	shrunk[drop].num_ranks = 0;
+	shrunk[drop].rank_table_ptr = nullptr;
+	shrunk[drop].offset_tb_ptr = nullptr;
+	shrunk[drop].data_ptr = nullptr;
+	shrunk[drop].data_size = 0;
+	shrunk[drop].block_cnt = 0;
+
+	size_t out_size = 8;  // magic + key_and_table_num
+	for (Color c : table_colors)
+		out_size += dtm50_color_header_bytes(shrunk[c]);
+	for (Color c : table_colors)
+		if (shrunk[c].present && flag_is_normal(shrunk[c].flag))
+			out_size += shrunk[c].block_cnt * 16;  // 16 bytes per block (dso + usz)
+	out_size = ceil_to_multiple(out_size, (size_t)64);
+	for (Color c : table_colors)
+	{
+		if (!shrunk[c].present || !flag_is_normal(shrunk[c].flag)) continue;
+		out_size += shrunk[c].data_size;
+		out_size = ceil_to_multiple(out_size, (size_t)64);
+	}
+
+	const std::filesystem::path tmp = path.string() + ".shrink_tmp";
+	Memory_Mapped_File out;
+	if (!out.create(tmp.c_str(), out_size + 8))
+	{
+		std::fprintf(stderr, "%s: create temp failed\n", tmp.c_str());
+		return false;
+	}
+	Serial_Memory_Writer w(out.data_span());
+
+	w.write<uint32_t>(static_cast<uint32_t>(EGTB_Magic::DTM50_MAGIC));
+	w.write<uint32_t>(key_and_table_num);
+
+	for (Color c : table_colors)
+	{
+		const Dtm50_Color_Info& ci = shrunk[c];
+		if (ci.flag & SINGULAR_FLAG)
+		{
+			w.write<uint8_t>(ci.flag);
+			w.write<uint8_t>(ci.single_val);
+		}
+		else if (ci.flag & DROPPED_FLAG)
+		{
+			w.write<uint8_t>(ci.flag);
+		}
+		else
+		{
+			w.write<uint8_t>(0);
+			w.write<uint8_t>(ci.entry_bytes);
+			w.write<uint32_t>(ci.block_positions);
+			w.write<uint32_t>(ci.block_cnt);
+			w.write<uint32_t>(ci.tail_positions);
+			w.write<uint64_t>(ci.data_size);
+			w.write<uint16_t>(ci.num_ranks);
+			if (ci.num_ranks)
+				w.write(Const_Span<uint8_t>(ci.rank_table_ptr, ci.num_ranks * 2));
+		}
+	}
+
+	for (Color c : table_colors)
+	{
+		const Dtm50_Color_Info& ci = shrunk[c];
+		if (!ci.present || !flag_is_normal(ci.flag)) continue;
+		w.write(Const_Span<uint8_t>(ci.offset_tb_ptr, ci.block_cnt * 16));
+	}
+
+	w.zero_align(64);
+
+	for (Color c : table_colors)
+	{
+		const Dtm50_Color_Info& ci = shrunk[c];
+		if (!ci.present || !flag_is_normal(ci.flag)) continue;
+		w.write(Const_Span<uint8_t>(ci.data_ptr, ci.data_size));
+		w.zero_align(64);
+	}
+
+	if (w.num_bytes_written() != out_size)
+	{
+		std::fprintf(stderr, "%s: size mismatch %zu != %zu\n",
+			path.c_str(), w.num_bytes_written(), out_size);
+		out.close();
+		std::filesystem::remove(tmp);
+		return false;
+	}
+	w.write_end_checksum(CHECKSUM_INIT);
+	out.close();
+	in.close();
+
+	std::error_code ec;
+	std::filesystem::rename(tmp, path, ec);
+	if (ec)
+	{
+		std::fprintf(stderr, "%s: rename failed: %s\n", path.c_str(), ec.message().c_str());
+		std::filesystem::remove(tmp);
+		return false;
+	}
+
+	const size_t orig = bytes.size();
+	std::printf("%s: DTM50 shrunk %zu -> %zu (-%.1f%%), dropped %s\n",
+		path.c_str(), orig, out_size + 8,
+		100.0 * (1.0 - double(out_size + 8) / double(orig)),
+		drop == WHITE ? "WHITE" : "BLACK");
+	return true;
+}
+
 // WDL shrinker.
 struct Wdl_Color_Info
 {
@@ -582,7 +810,7 @@ bool shrink_one(const std::filesystem::path& path)
 	if (magic == static_cast<uint32_t>(EGTB_Magic::DTM_MAGIC))
 		return shrink_rank_encoded(path, EGTB_Magic::DTM_MAGIC, "DTM");
 	if (magic == static_cast<uint32_t>(EGTB_Magic::DTM50_MAGIC))
-		return shrink_rank_encoded(path, EGTB_Magic::DTM50_MAGIC, "DTM50");
+		return shrink_dtm50(path);
 	if (magic == static_cast<uint32_t>(EGTB_Magic::WDL_MAGIC))
 		return shrink_wdl(path);
 	std::fprintf(stderr, "%s: unknown magic 0x%08x (not DTC/DTM/DTM50/WDL)\n", path.c_str(), magic);

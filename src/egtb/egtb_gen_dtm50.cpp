@@ -9,8 +9,11 @@
 #include "chess/attack.h"
 #include "chess/piece_config.h"
 
+#include "util/compress.h"
 #include "util/defines.h"
+#include "util/filesystem.h"
 #include "util/math.h"
+#include "util/memory.h"
 #include "util/progress_bar.h"
 #include "util/utility.h"
 
@@ -86,14 +89,17 @@ DTM50_Generator::DTM50_Generator(
 	std::filesystem::create_directories(tmp_dir);
 	m_table->m_is_symmetric = m_is_symmetric;
 
-	// Budget is per-layer: paging operates on a single active layer at a time.
-	// Previously-built layers within the same fusion spill to disk via the k+2
-	// evict step inside gen().
+	// Gen holds 1–3 layers at the hmc peak (k, k+1, opp[0]); save_to_disk
+	// holds all HMC_COUNT layers × 2 colors at once to assemble the change-
+	// point encoding — the 100× amplifier between the two phases. We clamp
+	// the budget to "unbounded" only when it can fit the save peak, so save's
+	// Save_Group_Cache doesn't silently page-thrash on budgets that were
+	// "more than enough" for gen alone.
 	const size_t bytes_per_color =
 		m_table->m_dtm[WHITE][0].num_slices()
 		* m_table->m_dtm[WHITE][0].within_slice_size()
 		* sizeof(DTM_Final_Entry);
-	const size_t total_bytes = bytes_per_color * 2;
+	const size_t total_bytes = bytes_per_color * COLOR_NB * DTM50_HMC_COUNT;
 	if (m_paging_budget_bytes >= total_bytes) m_paging_budget_bytes = 0;
 
 	init_group_state(m_table->m_dtm[WHITE][0].num_groups());
@@ -601,15 +607,6 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 		}
 	}
 
-	// Hand off to save_to_disk with bounded memory: only layer 0 (saved first)
-	// stays resident; layers 1..99 spill to disk and reload on demand from the
-	// per-layer save cache.
-	for (size_t h = 1; h < DTM50_HMC_COUNT; ++h)
-	{
-		m_table->m_dtm[WHITE][h].evict_all(*thread_pool);
-		m_table->m_dtm[BLACK][h].evict_all(*thread_pool);
-	}
-
 	const auto t_total_end = std::chrono::steady_clock::now();
 	std::printf("  gen (%zu hmc layers): done in %s (%zu pawn-slice pairs in %zu batches, %zu fusion groups)\n",
 		DTM50_HMC_COUNT,
@@ -617,274 +614,534 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 		total_pairs, batches.size(), total_fusions);
 }
 
-// =============================================================================
-// save_to_disk: gather DTM info, build rank table, LZMA-compress, write .lzdtm.
-// =============================================================================
-
 namespace {
 
-struct DTM_Singular_Probe_Result {
-	WDL_Entry singular;
-	uint64_t  legal_cnt;
-	uint64_t  illegal_cnt;
+// =============================================================================
+// save_to_disk: pack 100 hmc layers into a single .lzdtm50 via a layer-axis
+// change-point encoding, plus a sidecar .info with hmc=0 stats.
+//
+// File layout:
+//   uint32  magic = EGTB_Magic::DTM50_MAGIC
+//   uint32  key_and_table_num
+//   per-color:
+//     uint8  flag (SINGULAR bit set ⇒ singular-WDL color)
+//     if SINGULAR:
+//       uint8 singular_wdl
+//     else:
+//       uint8  entry_bytes  (1 or 2)
+//       uint32 block_positions
+//       uint32 block_cnt
+//       uint32 tail_positions
+//       uint64 data_size
+//       uint16 num_ranks
+//       uint16 rank_to_value[num_ranks]
+//   per-color (non-singular): offset_tb[block_cnt] of uint64 = (doff << 20) | dsz
+//   align 64
+//   per-color (non-singular): compressed data, ceil64-aligned tail
+//   end-checksum (8 bytes, xxhash with EGTB_CHECKSUM_INIT_VALUE)
+//
+// Per-block uncompressed payload (LZMA-compressed before write):
+//   uint32 num_positions
+//   uint32 num_nontrivial
+//   uint8  T_bitmap[ceil(num_positions/8)]    bit i ⇒ position i has ≥1 transition
+//   uint8  trivial_ranks[(num_positions - num_nontrivial) * entry_bytes]
+//   uint32 nontrivial_dir[num_nontrivial + 1]  cumulative byte offsets
+//   uint8  nontrivial_data[...]
+//     per non-trivial position:
+//       uint8  change_count           (1..HMC_COUNT)
+//       uint8  changepoint_bitmap[16] (100 bits used)
+//       uint8  value_ranks[change_count * entry_bytes]
+// =============================================================================
+
+// Uniform block stride so probe's block lookup is `pos / RS_BLOCK_POSITIONS`.
+// 1 << 19 matches DTC/DTM's per-block scale (1 MB raw at 2 B/pos) so the
+// LZMA window and cold-decompress latency are comparable.
+constexpr uint32_t RS_BLOCK_POSITIONS = 1u << 19;
+
+struct Color_Ranks_RS
+{
+	static constexpr size_t LUT_SIZE = 2048;
+	static constexpr uint16_t NO_RANK = 0xFFFFu;
+	uint8_t entry_bytes = 1;
+	std::vector<uint16_t> rank_to_value;
+	std::array<uint16_t, LUT_SIZE> value_to_rank{};
+
+	void reset()
+	{
+		entry_bytes = 1;
+		rank_to_value.clear();
+		value_to_rank.fill(NO_RANK);
+	}
+
+	NODISCARD uint16_t rank_of(uint16_t value) const
+	{
+		ASSERT(value < LUT_SIZE);
+		ASSERT(value_to_rank[value] != NO_RANK);
+		return value_to_rank[value];
+	}
 };
 
-using DTM_Save_Cache = Save_Group_Cache<DTM_Final_Entry>;
-using DTM_Pinned_Range = Pinned_Group_Range<DTM_Final_Entry>;
-
-NODISCARD DTM_Singular_Probe_Result dtm_singular_probe(
-	const Piece_Config_For_Gen& epsi,
-	Sliced_EGTB_File_For_Gen<DTM_Final_Entry>& src,
-	DTM_Save_Cache& cache,
-	Color color,
-	size_t num_positions)
+INLINE void write_rank_bytes(std::vector<uint8_t>& dst, uint16_t r, uint8_t eb)
 {
-	const size_t within = src.within_slice_size();
-	const size_t spg = src.slices_per_group();
-	const size_t ns = src.num_slices();
-	const size_t ng = src.num_groups();
-	bool saw_win = false, saw_draw = false, saw_lose = false;
-	uint64_t legal = 0, illegal = 0;
-
-	Decomposed_Board_Index didx{};
-	bool didx_init = false;
-	for (size_t g = 0; g < ng; ++g)
-	{
-		DTM_Pinned_Range pin(cache, color, g, g);
-		const size_t s_begin = g * spg;
-		const size_t s_end   = std::min(s_begin + spg, ns);
-		for (size_t s = s_begin; s < s_end; ++s)
-		{
-			const size_t base = s * within;
-			if (base >= num_positions) break;
-			const size_t end_in_slice = std::min(within, num_positions - base);
-			const auto* const raw = src.slice_data(s);
-			if (!didx_init)
-			{
-				epsi.decompose_board_index(static_cast<Board_Index>(base), out_param(didx));
-				didx_init = true;
-			}
-			for (size_t i = 0; i < end_in_slice; ++i)
-			{
-				DTM_Final_Entry e;
-				std::memcpy(&e, &raw[i], sizeof(e));
-				const uint64_t w = epsi.orbit_weight(didx);
-				switch (e.wdl())
-				{
-					case WDL_Entry::WIN:  saw_win = true;  legal   += w; break;
-					case WDL_Entry::DRAW: saw_draw = true; legal   += w; break;
-					case WDL_Entry::LOSE: saw_lose = true; legal   += w; break;
-					case WDL_Entry::ILLEGAL: illegal += w; break;
-					default: return {WDL_Entry::ILLEGAL, 0, 0};
-				}
-				if (static_cast<int>(saw_win) + static_cast<int>(saw_draw) + static_cast<int>(saw_lose) >= 2)
-					return {WDL_Entry::ILLEGAL, 0, 0};
-				epsi.step_to_next(inout_param(didx));
-			}
-		}
-	}
-	WDL_Entry s;
-	if      (saw_win)  s = WDL_Entry::WIN;
-	else if (saw_lose) s = WDL_Entry::LOSE;
-	else if (saw_draw) s = WDL_Entry::DRAW;
-	else               s = WDL_Entry::WIN;
-	return {s, legal, illegal};
-}
-
-void gather_dtm_info(
-	const Piece_Config_For_Gen& epsi,
-	DTM_Save_Cache& cache,
-	Sliced_EGTB_File_For_Gen<DTM_Final_Entry>& src,
-	Color color,
-	size_t num_positions,
-	EGTB_Info& info,
-	Value_Histogram& hist)
-{
-	const size_t within = src.within_slice_size();
-	const size_t spg = src.slices_per_group();
-	const size_t ng = src.num_groups();
-	const size_t ns = src.num_slices();
-	Decomposed_Board_Index didx{};
-	bool didx_init = false;
-	for (size_t g = 0; g < ng; ++g)
-	{
-		cache.acquire(color, g);
-		const size_t s_begin = g * spg;
-		const size_t s_end   = std::min(s_begin + spg, ns);
-		for (size_t s = s_begin; s < s_end; ++s)
-		{
-			const size_t base = s * within;
-			const size_t end  = std::min(base + within, num_positions);
-			if (!didx_init)
-			{
-				epsi.decompose_board_index(static_cast<Board_Index>(base), out_param(didx));
-				didx_init = true;
-			}
-			for (size_t idx = base; idx < end; ++idx)
-			{
-				const DTM_Final_Entry e = src.read(static_cast<Board_Index>(idx));
-				const uint64_t w = epsi.orbit_weight(didx);
-				info.add_result(color, e.wdl(), w);
-				if (e.is_win())
-					info.maybe_update_longest_win(color, idx, e.value());
-				if (!e.is_illegal())
-				{
-					// DTM halves storage in both tiers (parity invariant), so a
-					// single histogram over halved values suffices. hist_2b is
-					// unused for DTM and stays zero-initialized.
-					const uint16_t v = dtm_value_for_storage(e);
-					if (v < Value_Histogram::HIST_BINS) ++hist.hist_1b[v];
-				}
-				epsi.step_to_next(inout_param(didx));
-			}
-		}
-		cache.release(color, g);
+	if (eb == 1) {
+		dst.push_back(static_cast<uint8_t>(r));
+	} else {
+		dst.push_back(static_cast<uint8_t>(r & 0xFF));
+		dst.push_back(static_cast<uint8_t>(r >> 8));
 	}
 }
 
-Block_Source make_dtm_block_source(
-	Sliced_EGTB_File_For_Gen<DTM_Final_Entry>& src,
-	DTM_Save_Cache& cache,
-	Color color,
-	size_t block_size,
-	size_t entry_bytes)
+// ILLEGAL positions emit the most recent legal rank into trivial_ranks so
+// LZMA sees long same-rank runs spanning illegal/legal stretches.
+struct RS_Block_Builder
 {
-	constexpr size_t kEntry = sizeof(DTM_Final_Entry);
-	ASSERT(block_size % entry_bytes == 0);
-	const size_t source_block_bytes = block_size * kEntry / entry_bytes;
-	const size_t within = src.within_slice_size();
-	const size_t spg = src.slices_per_group();
-	const size_t total_entries = src.num_slices() * within;
-	const size_t source_total_bytes = total_entries * kEntry;
-	const size_t output_total_bytes = total_entries * entry_bytes;
-	return Block_Source{
-		output_total_bytes,
-		[&src, &cache, color, within, spg, source_block_bytes, source_total_bytes](size_t block_id, Span<uint8_t> scratch) -> Const_Span<uint8_t> {
-			const size_t block_off = block_id * source_block_bytes;
-			const size_t this_block = std::min(source_block_bytes, source_total_bytes - block_off);
-			ASSERT(scratch.size() >= this_block);
-			ASSERT(block_off % kEntry == 0);
-			ASSERT(this_block % kEntry == 0);
+	const Color_Ranks_RS* ranks = nullptr;
+	std::vector<uint8_t> out;
 
-			const size_t entry_off = block_off / kEntry;
-			const size_t entry_cnt = this_block / kEntry;
+	void build(const std::vector<uint16_t>& values, size_t num_positions)
+	{
+		ASSERT(ranks != nullptr);
+		const uint8_t eb = ranks->entry_bytes;
+		const size_t tbm_bytes = (num_positions + 7) / 8;
+		std::vector<uint8_t> T_bitmap(tbm_bytes, 0);
+		std::vector<uint8_t> trivial_ranks;
+		std::vector<uint32_t> nontrivial_dir;
+		std::vector<uint8_t> nontrivial_data;
+		nontrivial_dir.push_back(0);
 
-			const size_t first_g = (entry_off / within) / spg;
-			const size_t last_g  = (entry_cnt == 0 ? first_g
-			                                       : ((entry_off + entry_cnt - 1) / within) / spg);
-			DTM_Pinned_Range pin(cache, color, first_g, last_g);
+		std::array<uint16_t, DTM50_HMC_COUNT> changepoints{};
+		std::array<uint16_t, DTM50_HMC_COUNT> change_ranks{};
 
-			size_t done = 0;
-			while (done < entry_cnt)
+		uint16_t last_legal_rank = 0;
+
+		for (size_t i = 0; i < num_positions; ++i)
+		{
+			bool is_illegal = false;
+			for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
 			{
-				const size_t cur = entry_off + done;
-				const size_t s = cur / within;
-				const size_t in_slice = cur - s * within;
-				const size_t take = std::min(entry_cnt - done, within - in_slice);
-				const auto* const raw = src.slice_data(s) + in_slice;
-				std::memcpy(scratch.data() + done * kEntry, raw, take * kEntry);
-				done += take;
+				if (values[h * num_positions + i] == DTM_Final_Entry::ILLEGAL_VAL)
+				{
+					is_illegal = true;
+					break;
+				}
+			}
+			if (is_illegal)
+			{
+				write_rank_bytes(trivial_ranks, last_legal_rank, eb);
+				continue;
 			}
 
-			return Const_Span<uint8_t>(scratch.data(), this_block);
+			size_t k = 0;
+			uint16_t prev = ranks->rank_of(values[0 * num_positions + i]);
+			changepoints[k] = 0;
+			change_ranks[k] = prev;
+			++k;
+			for (size_t h = 1; h < DTM50_HMC_COUNT; ++h)
+			{
+				const uint16_t r = ranks->rank_of(values[h * num_positions + i]);
+				if (r != prev)
+				{
+					changepoints[k] = static_cast<uint16_t>(h);
+					change_ranks[k] = r;
+					prev = r;
+					++k;
+				}
+			}
+
+			if (k == 1)
+			{
+				last_legal_rank = change_ranks[0];
+				write_rank_bytes(trivial_ranks, last_legal_rank, eb);
+				continue;
+			}
+
+			T_bitmap[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+			const size_t base = nontrivial_data.size();
+			nontrivial_data.push_back(static_cast<uint8_t>(k));
+			uint8_t bm[16] = { 0 };
+			for (size_t j = 0; j < k; ++j)
+			{
+				const uint16_t h = changepoints[j];
+				bm[h / 8] |= static_cast<uint8_t>(1u << (h % 8));
+			}
+			nontrivial_data.insert(nontrivial_data.end(), bm, bm + 16);
+			for (size_t j = 0; j < k; ++j)
+				write_rank_bytes(nontrivial_data, change_ranks[j], eb);
+			nontrivial_dir.push_back(static_cast<uint32_t>(nontrivial_data.size() - base));
 		}
-	};
-}
+
+		for (size_t i = 1; i < nontrivial_dir.size(); ++i)
+			nontrivial_dir[i] += nontrivial_dir[i - 1];
+
+		const uint32_t num_nontrivial = static_cast<uint32_t>(nontrivial_dir.size() - 1);
+		const uint32_t num_trivial = static_cast<uint32_t>(num_positions) - num_nontrivial;
+
+		const size_t total =
+			8
+			+ tbm_bytes
+			+ static_cast<size_t>(num_trivial) * eb
+			+ nontrivial_dir.size() * 4
+			+ nontrivial_data.size();
+		out.assign(total, 0);
+		size_t off = 0;
+		const uint32_t np32 = static_cast<uint32_t>(num_positions);
+		std::memcpy(out.data() + off, &np32, 4); off += 4;
+		std::memcpy(out.data() + off, &num_nontrivial, 4); off += 4;
+		std::memcpy(out.data() + off, T_bitmap.data(), tbm_bytes); off += tbm_bytes;
+		if (!trivial_ranks.empty())
+		{
+			std::memcpy(out.data() + off, trivial_ranks.data(), trivial_ranks.size());
+			off += trivial_ranks.size();
+		}
+		std::memcpy(out.data() + off, nontrivial_dir.data(), nontrivial_dir.size() * 4);
+		off += nontrivial_dir.size() * 4;
+		if (!nontrivial_data.empty())
+		{
+			std::memcpy(out.data() + off, nontrivial_data.data(), nontrivial_data.size());
+			off += nontrivial_data.size();
+		}
+		ASSERT(off == total);
+	}
+};
+
+struct RS_Color_Output
+{
+	bool is_singular = false;
+	uint8_t singular_wdl = 0;
+	Color_Ranks_RS ranks;
+	uint32_t block_positions = 0;
+	uint32_t block_cnt = 0;
+	uint32_t tail_positions = 0;
+	// Each block stores (dso, usz) on disk. usz is needed because plain LZMA
+	// has no end-marker and the decoder must know the exact output size.
+	std::vector<uint64_t> offsets;   // (doff << 20) | dsz, one per block
+	std::vector<uint64_t> usizes;
+	std::vector<uint8_t> data;
+};
 
 }  // namespace
 
 void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths& paths)
 {
-	const auto colors = table_colors();
 	const auto t_save_start = std::chrono::steady_clock::now();
+	const auto colors = table_colors();
+	const size_t num_positions = m_epsi.num_positions();
+	if (num_positions == 0) return;
 
 	m_epsi.prepare_orbit_weight_table();
+	m_info.clear();
 
-	const size_t bytes_per_group = m_table->m_dtm[WHITE][0].slices_per_group()
-		* m_table->m_dtm[WHITE][0].within_slice_size() * sizeof(DTM_Final_Entry);
-	size_t cap_groups;
-	size_t max_workers;
-	if (m_paging_budget_bytes == 0 || bytes_per_group == 0)
+	const size_t ng = m_table->m_dtm[WHITE][0].num_groups();
+	const size_t spg = m_table->m_dtm[WHITE][0].slices_per_group();
+	const size_t wss = m_table->m_dtm[WHITE][0].within_slice_size();
+	const size_t positions_per_group = spg * wss;
+
+	// One cache across all 2 × HMC_COUNT layer tables shares the paging
+	// budget; cap_groups = SIZE_MAX when unbounded keeps everything resident.
+	const size_t group_bytes = positions_per_group * sizeof(DTM_Final_Entry);
+	const size_t cap_groups = (m_paging_budget_bytes == 0 || group_bytes == 0)
+		? std::numeric_limits<size_t>::max()
+		: std::max<size_t>(1, m_paging_budget_bytes / group_bytes);
+
+	std::vector<Sliced_EGTB_File_For_Gen<DTM_Final_Entry>*> all_tables;
+	all_tables.reserve(COLOR_NB * DTM50_HMC_COUNT);
+	for (Color c : { WHITE, BLACK })
+		for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
+			all_tables.push_back(&m_table->m_dtm[c][h]);
+	Save_Group_Cache<DTM_Final_Entry> cache(std::move(all_tables), cap_groups);
+
+	auto table_idx_of = [](Color c, size_t h) {
+		return static_cast<size_t>(c) * DTM50_HMC_COUNT + h;
+	};
+
+	auto parallel_for_layers = [&](size_t h_lo, size_t h_hi, auto&& body) {
+		const size_t n = h_hi - h_lo;
+		if (n == 0) return;
+		const size_t workers = std::min(thread_pool->num_workers(), n);
+		std::atomic<size_t> next(h_lo);
+		thread_pool->run_sync_task_on_multiple_threads(workers, [&](size_t) {
+			for (;;)
+			{
+				const size_t h = next.fetch_add(1, std::memory_order_relaxed);
+				if (h >= h_hi) return;
+				body(h);
+			}
+		});
+	};
+
+	RS_Color_Output color_out[COLOR_NB]{};
+
+	for (Color me : colors)
 	{
-		cap_groups = std::numeric_limits<size_t>::max();
-		max_workers = 0;
+		// 2× since pre-pass and main-pass each read every (position, layer) cell.
+		const size_t color_units = 2u * num_positions * DTM50_HMC_COUNT;
+		const size_t print_period = thread_pool->num_workers() * (1u << 20);
+		Concurrent_Progress_Bar progress_bar(color_units, print_period,
+			std::string("save_to_disk ") + std::to_string(static_cast<int>(me)));
+
+		// Pre-pass: union all layers' distinct halved values into a per-color
+		// rank table, scored by how many layers each value appears in.
+		std::array<uint64_t, Color_Ranks_RS::LUT_SIZE> score{};
+		std::array<std::array<uint8_t, Color_Ranks_RS::LUT_SIZE>, DTM50_HMC_COUNT> per_layer_seen{};
+
+		parallel_for_layers(0, DTM50_HMC_COUNT, [&](size_t h) {
+			const size_t ti = table_idx_of(me, h);
+			auto& tbl = m_table->m_dtm[me][h];
+			auto& seen = per_layer_seen[h];
+			// Only h=0 gathers .info — it's the canonical fresh-50MR view;
+			// k>0 layers are intermediate states a probe never enters cold.
+			const bool gather_info = (h == 0);
+			for (size_t g = 0; g < ng; ++g)
+			{
+				Pinned_Group_Range<DTM_Final_Entry> pin(cache, ti, g, g);
+				const size_t p_lo = g * positions_per_group;
+				const size_t p_hi = std::min(p_lo + positions_per_group, num_positions);
+				Decomposed_Board_Index didx{};
+				if (gather_info)
+					m_epsi.decompose_board_index(static_cast<Board_Index>(p_lo), out_param(didx));
+				for (size_t p = p_lo; p < p_hi; ++p)
+				{
+					const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(p));
+					const uint16_t v = dtm_value_for_storage(e);
+					if (v != DTM_Final_Entry::ILLEGAL_VAL) seen[v] = 1;
+					if (gather_info)
+					{
+						const uint64_t w = m_epsi.orbit_weight(didx);
+						m_info.add_result(me, e.wdl(), w);
+						if (e.is_win())
+							m_info.maybe_update_longest_win(me, p, e.value());
+						m_epsi.step_to_next(inout_param(didx));
+					}
+				}
+				progress_bar += (p_hi - p_lo);
+			}
+		});
+
+		// Values present in more layers get smaller ranks (LZMA bias).
+		for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
+			for (size_t v = 0; v < Color_Ranks_RS::LUT_SIZE; ++v)
+				if (per_layer_seen[h][v]) ++score[v];
+
+		std::vector<uint16_t> values;
+		values.reserve(64);
+		for (size_t v = 0; v < Color_Ranks_RS::LUT_SIZE; ++v)
+			if (score[v] != 0) values.push_back(static_cast<uint16_t>(v));
+
+		// All-ILLEGAL across every layer — degenerate but possible.
+		if (values.empty())
+		{
+			color_out[me].is_singular = true;
+			color_out[me].singular_wdl = static_cast<uint8_t>(WDL_Entry::DRAW);
+			progress_bar.set_finished();
+			continue;
+		}
+
+		std::sort(values.begin(), values.end(),
+			[&](uint16_t a, uint16_t b) {
+				if (score[a] != score[b]) return score[a] > score[b];
+				return a < b;
+			});
+
+		auto& ranks = color_out[me].ranks;
+		ranks.reset();
+		ranks.rank_to_value = std::move(values);
+		ranks.entry_bytes = (ranks.rank_to_value.size() <= 256) ? 1 : 2;
+		for (size_t i = 0; i < ranks.rank_to_value.size(); ++i)
+			ranks.value_to_rank[ranks.rank_to_value[i]] = static_cast<uint16_t>(i);
+
+		// Main pass: fill the [layer × position] matrix one block at a time,
+		// pack it, LZMA the result. The shared cache handles cross-block
+		// reuse vs spill round-trip under tight budgets transparently.
+		const size_t bcnt = (num_positions + RS_BLOCK_POSITIONS - 1) / RS_BLOCK_POSITIONS;
+		color_out[me].block_positions = RS_BLOCK_POSITIONS;
+		color_out[me].block_cnt = static_cast<uint32_t>(bcnt);
+		const size_t tail = num_positions - (bcnt - 1) * RS_BLOCK_POSITIONS;
+		color_out[me].tail_positions =
+			(tail == RS_BLOCK_POSITIONS) ? 0u : static_cast<uint32_t>(tail);
+		color_out[me].offsets.assign(bcnt, 0);
+		color_out[me].usizes.assign(bcnt, 0);
+
+		auto group_id_of_pos = [&](size_t p) {
+			return positions_per_group == 0 ? size_t{ 0 } : p / positions_per_group;
+		};
+
+		const size_t batch_size = std::max<size_t>(thread_pool->num_workers(), 1);
+
+		std::vector<uint16_t> chunk(static_cast<size_t>(RS_BLOCK_POSITIONS) * DTM50_HMC_COUNT);
+		RS_Block_Builder builder;
+		builder.ranks = &color_out[me].ranks;
+
+		std::vector<std::vector<uint8_t>> raw_payloads(batch_size);
+		std::vector<std::vector<uint8_t>> compressed(batch_size);
+
+		for (size_t batch_start = 0; batch_start < bcnt; batch_start += batch_size)
+		{
+			const size_t batch_end = std::min(batch_start + batch_size, bcnt);
+			const size_t batch_n = batch_end - batch_start;
+
+			for (size_t i = 0; i < batch_n; ++i)
+			{
+				const size_t b = batch_start + i;
+				const size_t p_base = b * RS_BLOCK_POSITIONS;
+				const size_t this_bp =
+					(b == bcnt - 1 && color_out[me].tail_positions != 0)
+					? color_out[me].tail_positions : RS_BLOCK_POSITIONS;
+
+				const size_t want_lo = group_id_of_pos(p_base);
+				const size_t want_hi = group_id_of_pos(p_base + this_bp - 1);
+
+				parallel_for_layers(0, DTM50_HMC_COUNT, [&](size_t h) {
+					Pinned_Group_Range<DTM_Final_Entry> pin(
+						cache, table_idx_of(me, h), want_lo, want_hi);
+					auto& tbl = m_table->m_dtm[me][h];
+					uint16_t* row = chunk.data() + h * this_bp;
+					for (size_t k = 0; k < this_bp; ++k)
+					{
+						const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(p_base + k));
+						row[k] = dtm_value_for_storage(e);
+					}
+					progress_bar += this_bp;
+				});
+
+				builder.build(chunk, this_bp);
+				raw_payloads[i] = std::move(builder.out);
+			}
+
+			std::atomic<size_t> next(0);
+			thread_pool->run_sync_task_on_all_threads([&](size_t) {
+				LZMA_Compress_Helper local;
+				for (;;)
+				{
+					const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+					if (i >= batch_n) return;
+					compressed[i] = local.compress(
+						Const_Span<uint8_t>(raw_payloads[i].data(), raw_payloads[i].size()));
+				}
+			});
+
+			// Append in block order so file offsets stay deterministic.
+			for (size_t i = 0; i < batch_n; ++i)
+			{
+				const size_t b = batch_start + i;
+				const size_t doff = color_out[me].data.size();
+				const size_t dsz = compressed[i].size();
+				if (dsz >= (1u << 20))
+					throw std::runtime_error("rs block too large for offset encoding");
+				color_out[me].offsets[b] =
+					(static_cast<uint64_t>(doff) << 20) | static_cast<uint64_t>(dsz);
+				color_out[me].usizes[b] = raw_payloads[i].size();
+				color_out[me].data.insert(color_out[me].data.end(),
+					compressed[i].begin(), compressed[i].end());
+				raw_payloads[i].clear();
+				compressed[i].clear();
+			}
+		}
+
+		progress_bar.set_finished();
 	}
-	else
+
+	const auto out_path = paths.dtm50_save_path(m_epsi);
+	std::filesystem::create_directories(out_path.parent_path());
+
+	size_t header_bytes = 4 + 4;  // magic + key_and_table_num
+	const uint32_t key_and_table_num =
+		(m_epsi.min_material_key().value() << 2) | static_cast<uint32_t>(colors.size());
+	for (Color c : colors)
 	{
-		cap_groups = std::max<size_t>(1, m_paging_budget_bytes / bytes_per_group);
-		max_workers = cap_groups;
+		header_bytes += 1;  // flag
+		if (color_out[c].is_singular) header_bytes += 1;
+		else {
+			header_bytes += 1 + 4 + 4 + 4 + 8 + 2;
+			header_bytes += color_out[c].ranks.rank_to_value.size() * 2;
+		}
+	}
+	size_t out_size = header_bytes;
+	for (Color c : colors)
+		if (!color_out[c].is_singular)
+			out_size += color_out[c].block_cnt * 16;  // dso + usz per block
+	out_size = ceil_to_multiple(out_size, size_t{ 64 });
+	for (Color c : colors)
+	{
+		if (color_out[c].is_singular) continue;
+		out_size += color_out[c].data.size();
+		out_size = ceil_to_multiple(out_size, size_t{ 64 });
 	}
 
-	static constexpr size_t DTM_BLOCK_SIZE = 1024 * 1024;
-	const size_t num_positions = m_epsi.num_positions();
+	const auto tmp = out_path.string() + ".tmp";
+	Memory_Mapped_File out;
+	if (!out.create(tmp.c_str(), out_size + 8))
+		throw std::runtime_error("Failed to create " + tmp);
+	Serial_Memory_Writer w(out.data_span());
 
-	// Per-material subfolder dtm50/<name>/ for the layer files.
-	std::filesystem::create_directories(paths.dtm50_save_path(m_epsi, 1).parent_path());
+	w.write<uint32_t>(narrowing_static_cast<uint32_t>(EGTB_Magic::DTM50_MAGIC));
+	w.write<uint32_t>(key_and_table_num);
 
-	for (uint16_t hmc = 0; hmc < DTM50_HMC_COUNT; ++hmc)
+	for (Color c : colors)
 	{
-		std::printf("  save layer %2u\r", hmc); std::fflush(stdout);
-
-		auto& dtm_w = m_table->m_dtm[WHITE][hmc];
-		auto& dtm_b = m_table->m_dtm[BLACK][hmc];
-
-		m_info.clear();
-
-		Compressed_EGTB dtm_save[COLOR_NB];
-		Value_Histogram dtm_hist[COLOR_NB];
-
-		DTM_Save_Cache cache(&dtm_w, &dtm_b, cap_groups);
-
-		for (Color me : colors)
+		const RS_Color_Output& co = color_out[c];
+		if (co.is_singular)
 		{
-			auto& dtm_me = m_table->m_dtm[me][hmc];
-			const auto probe = dtm_singular_probe(m_epsi, dtm_me, cache, me, num_positions);
-			if (probe.singular == WDL_Entry::DRAW)
-			{
-				m_info.draw_cnt[me]    = probe.legal_cnt;
-				m_info.illegal_cnt[me] = probe.illegal_cnt;
-				dtm_save[me] = Compressed_EGTB::make_singular(WDL_Entry::DRAW);
-			}
-			else
-			{
-				gather_dtm_info(m_epsi, cache, dtm_me, me, num_positions, m_info, dtm_hist[me]);
-			}
-
-			if (m_info.longest_win[me] > 0)
-			{
-				Position_For_Gen pos_gen(m_epsi, static_cast<Board_Index>(m_info.longest_idx[me]), me);
-				pos_gen.board().to_fen(Span(m_info.longest_fen[me]));
-			}
+			w.write<uint8_t>(EGTB_SINGULAR_FLAG);
+			w.write<uint8_t>(co.singular_wdl);
 		}
-
-		Value_Rank_Table dtm_rank[COLOR_NB];
-		size_t dtm_entry_bytes[COLOR_NB]{};
-		for (Color me : colors)
+		else
 		{
-			dtm_rank[me] = Value_Rank_Table::build_1b(dtm_hist[me].hist_1b);
-			dtm_entry_bytes[me] = (dtm_rank[me].ranks.size() <= 256) ? 1 : 2;
+			w.write<uint8_t>(0);
+			w.write<uint8_t>(co.ranks.entry_bytes);
+			w.write<uint32_t>(co.block_positions);
+			w.write<uint32_t>(co.block_cnt);
+			w.write<uint32_t>(co.tail_positions);
+			w.write<uint64_t>(static_cast<uint64_t>(co.data.size()));
+			const uint16_t nr = static_cast<uint16_t>(co.ranks.rank_to_value.size());
+			w.write<uint16_t>(nr);
+			for (uint16_t v : co.ranks.rank_to_value) w.write<uint16_t>(v);
 		}
-
-		for (Color me : colors)
+	}
+	for (Color c : colors)
+	{
+		const RS_Color_Output& co = color_out[c];
+		if (co.is_singular) continue;
+		ASSERT(co.offsets.size() == co.usizes.size());
+		for (size_t b = 0; b < co.offsets.size(); ++b)
 		{
-			if (dtm_save[me].is_singular()) continue;
-			Block_Source src = make_dtm_block_source(m_table->m_dtm[me][hmc], cache, me, DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
-			dtm_save[me] = save_compress_egtb(
-				thread_pool, src, me, m_info, dtm_entry_bytes[me], DTM_BLOCK_SIZE, max_workers,
-				dtm_rank[me], &dtm_storage_fn, /*silent=*/true);
+			w.write<uint64_t>(co.offsets[b]);
+			w.write<uint64_t>(co.usizes[b]);
 		}
+	}
+	w.zero_align(64);
+	for (Color c : colors)
+	{
+		const RS_Color_Output& co = color_out[c];
+		if (co.is_singular) continue;
+		w.write(Const_Span<uint8_t>(co.data.data(), co.data.size()));
+		w.zero_align(64);
+	}
+	if (w.num_bytes_written() != out_size)
+		throw std::runtime_error("rs file size mismatch");
+	w.write_end_checksum(EGTB_CHECKSUM_INIT_VALUE);
+	out.close();
 
-		save_egtb_table(m_epsi, dtm_save, paths.dtm50_save_path(m_epsi, hmc), colors, EGTB_Magic::DTM50_MAGIC);
+	std::error_code ec;
+	std::filesystem::rename(tmp, out_path, ec);
+	if (ec) throw std::runtime_error("rename failed: " + ec.message());
 
-		std::ofstream fp(paths.dtm50_info_save_path(m_epsi, hmc), std::ios::binary | std::ios::trunc);
-		fp.write(reinterpret_cast<const char*>(&m_info), sizeof(EGTB_Info));
+	for (Color me : colors)
+	{
+		if (m_info.longest_win[me] == 0) continue;
+		Position_For_Gen pos_gen(m_epsi,
+			static_cast<Board_Index>(m_info.longest_idx[me]), me);
+		pos_gen.board().to_fen(Span(m_info.longest_fen[me]));
+	}
+	std::ofstream fp(paths.dtm50_info_save_path(m_epsi),
+		std::ios::binary | std::ios::trunc);
+	fp.write(reinterpret_cast<const char*>(&m_info), sizeof(EGTB_Info));
 
-		// Layer h is done — drop its scratch files and in-memory groups before
-		// the next iteration loads layer h+1 from disk.
-		m_table->m_dtm[WHITE][hmc].remove_disk_files();
-		m_table->m_dtm[BLACK][hmc].remove_disk_files();
-		m_table->m_dtm[WHITE][hmc].close();
-		m_table->m_dtm[BLACK][hmc].close();
+	for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
+	{
+		m_table->m_dtm[WHITE][h].remove_disk_files();
+		m_table->m_dtm[BLACK][h].remove_disk_files();
+		m_table->m_dtm[WHITE][h].close();
+		m_table->m_dtm[BLACK][h].close();
 	}
 
 	remove_checkpoint(paths.dtm50_checkpoint_path(m_epsi));

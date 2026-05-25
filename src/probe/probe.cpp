@@ -66,22 +66,6 @@ constexpr size_t DTM50_HMC_COUNT = 100;
 // 0 so default callers still get the fresh-window DTM50 layer.
 constexpr unsigned PROBE_IMPL_SKIP_DTM50 = ~0u;
 
-bool find_dtm50_in_dirs(const Piece_Config& ps, uint16_t hmc,
-                        const std::vector<std::filesystem::path>& dirs,
-                        std::filesystem::path* out)
-{
-	const std::string fn = "h" + std::to_string(hmc) + DTM50_EXT;
-	for (const auto& d : dirs)
-	{
-		const auto p = d / ps.name() / fn;
-		if (std::filesystem::exists(p))
-		{
-			if (out) *out = p;
-			return true;
-		}
-	}
-	return false;
-}
 
 bool find_in_dirs(const Piece_Config& ps, const char* ext,
                   const std::vector<std::filesystem::path>& dirs,
@@ -770,17 +754,18 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	return dtm_entry_from_storage(stored, wdl);
 }
 
-// DTM50 layer file. Same container as DTM_Probe_File; differs only in the
-// magic and the storage→entry mapping (layer-aware: dispatches by m_hmc).
+// DTM50 packed file: one file per material, all hmc layers in a single block
+// stream via layer-axis change-point encoding (see save_to_disk in
+// egtb_gen_dtm50.cpp for the on-disk layout). read() dispatches by hmc.
 struct DTM50_Probe_File
 {
 	struct Per_Color
 	{
-		size_t entry_bytes = 0;
-		size_t block_size = 0;
-		size_t tail_size = 0;
+		size_t entry_bytes = 0;          // 1 or 2 bytes per rank
+		size_t block_positions = 0;      // positions per non-tail block
+		size_t tail_positions = 0;       // positions in last block, 0 if no tail
 		size_t block_cnt = 0;
-		const uint8_t* offset_tb = nullptr;
+		const uint8_t* offset_tb = nullptr;   // 16-byte entries: (dso, usz)
 		const uint8_t* compressed_data = nullptr;
 		std::vector<uint16_t> rank_to_value;
 
@@ -797,11 +782,9 @@ struct DTM50_Probe_File
 	bool is_dropped[COLOR_NB]  = { false, false };
 	Per_Color per_color[COLOR_NB];
 	Memory_Mapped_File mapped;
-	// hmc this file represents; chooses the decode variant (hmc=0 vs k>0).
-	uint16_t m_hmc = 0;
 
 	void load(const Piece_Config& ps, const std::filesystem::path& path);
-	NODISCARD DTM_Final_Entry read(Color c, Board_Index pos, WDL_Entry wdl);
+	NODISCARD DTM_Final_Entry read(Color c, Board_Index pos, WDL_Entry wdl, uint16_t hmc);
 
 private:
 	NODISCARD Block_Ptr get_block_locked(Per_Color& pc, size_t block_id);
@@ -852,12 +835,12 @@ void DTM50_Probe_File::load(const Piece_Config& ps, const std::filesystem::path&
 		{
 			Per_Color& pc = per_color[i];
 			pc.entry_bytes = reader.read<uint8_t>();
-			if (pc.entry_bytes != 1 && pc.entry_bytes != sizeof(DTM_Final_Entry))
+			if (pc.entry_bytes != 1 && pc.entry_bytes != 2)
 				throw std::runtime_error("Bad DTM50 entry_bytes " + path.string());
-			pc.tail_size  = reader.read<uint32_t>();
-			pc.block_size = reader.read<uint32_t>();
-			pc.block_cnt  = reader.read<uint32_t>();
-			data_size[i]  = reader.read<uint64_t>();
+			pc.block_positions = reader.read<uint32_t>();
+			pc.block_cnt       = reader.read<uint32_t>();
+			pc.tail_positions  = reader.read<uint32_t>();
+			data_size[i]       = reader.read<uint64_t>();
 
 			const size_t num_ranks = reader.read<uint16_t>();
 			pc.rank_to_value.resize(num_ranks);
@@ -870,7 +853,7 @@ void DTM50_Probe_File::load(const Piece_Config& ps, const std::filesystem::path&
 	{
 		if (is_singular[i] || is_dropped[i]) continue;
 		per_color[i].offset_tb = reader.caret();
-		reader.advance(per_color[i].block_cnt * 8);
+		reader.advance(per_color[i].block_cnt * 16);
 	}
 	for (Color i : table_colors)
 	{
@@ -879,17 +862,6 @@ void DTM50_Probe_File::load(const Piece_Config& ps, const std::filesystem::path&
 		per_color[i].compressed_data = reader.caret();
 		reader.advance(data_size[i]);
 	}
-
-	const size_t num_positions = Piece_Config_For_Gen(ps).num_positions();
-	for (Color i : table_colors)
-	{
-		if (is_singular[i] || is_dropped[i]) continue;
-		Per_Color& pc = per_color[i];
-		const size_t num_full = pc.tail_size != 0 ? pc.block_cnt - 1 : pc.block_cnt;
-		const size_t src_sz   = pc.block_size * num_full + pc.tail_size;
-		if (src_sz != num_positions * pc.entry_bytes)
-			throw std::runtime_error("DTM50 decompressed size mismatch " + path.string());
-	}
 }
 
 Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
@@ -897,60 +869,66 @@ Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 	for (size_t i = 0; i < pc.live; ++i)
 		if (pc.block_id[i] == block_id) return pc.data[i];
 
-	const size_t decode_sz =
-		(block_id == pc.block_cnt - 1 && pc.tail_size != 0) ? pc.tail_size : pc.block_size;
-	const size_t positions = decode_sz / pc.entry_bytes;
-
-	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
-	const size_t dsz  = dso & 0xFFFFF;
+	uint64_t dso, usz;
+	std::memcpy(&dso, pc.offset_tb + block_id * 16,     8);
+	std::memcpy(&usz, pc.offset_tb + block_id * 16 + 8, 8);
+	const size_t dsz  = dso & 0xFFFFFu;
 	const size_t doff = dso >> 20;
+
+	auto buf = std::make_shared<std::vector<uint8_t>>(usz, 0);
+	if (!pc.decomp) pc.decomp = std::make_unique<LZMA_Decompress_Helper>(usz);
+	const Const_Span<uint8_t> raw = pc.decomp->decompress(
+		Const_Span(pc.compressed_data + doff, dsz), usz);
+	std::memcpy(buf->data(), raw.data(), usz);
 
 	size_t slot;
 	if (pc.live < BLOCK_CACHE_SLOTS) { slot = pc.live++; }
 	else { slot = pc.next_slot; pc.next_slot = (pc.next_slot + 1) % BLOCK_CACHE_SLOTS; }
 	pc.block_id[slot] = block_id;
-	auto buf = std::make_shared<std::vector<uint8_t>>(positions * sizeof(uint16_t), 0);
-
-	if (dsz != 0)
-	{
-		if (!pc.decomp) pc.decomp = std::make_unique<LZMA_Decompress_Helper>(pc.block_size);
-		const Const_Span<uint8_t> raw = pc.decomp->decompress(
-			Const_Span(pc.compressed_data + doff, dsz), decode_sz);
-
-		const auto& r2v = pc.rank_to_value;
-		uint16_t* out = reinterpret_cast<uint16_t*>(buf->data());
-		if (pc.entry_bytes == 1)
-			for (size_t k = 0; k < positions; ++k) out[k] = r2v[raw[k]];
-		else
-		{
-			const uint16_t* in = reinterpret_cast<const uint16_t*>(raw.data());
-			for (size_t k = 0; k < positions; ++k) out[k] = r2v[in[k]];
-		}
-	}
 	pc.data[slot] = buf;
-	return pc.data[slot];
+	return buf;
 }
 
-DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
+namespace {
+
+// Inclusive popcount: count set bits in `bm[0..bit]`.
+NODISCARD INLINE size_t popcount_prefix_inclusive(const uint8_t* bm, size_t bit)
+{
+	const size_t full_bytes = bit / 8;
+	const size_t partial_bits = (bit & 7) + 1;
+	size_t pc = 0;
+	const size_t full_qw = full_bytes / 8;
+	for (size_t i = 0; i < full_qw; ++i)
+	{
+		uint64_t w;
+		std::memcpy(&w, bm + i * 8, 8);
+		pc += __builtin_popcountll(w);
+	}
+	for (size_t i = full_qw * 8; i < full_bytes; ++i)
+		pc += __builtin_popcount(bm[i]);
+	const uint8_t last = bm[full_bytes] & static_cast<uint8_t>((1u << partial_bits) - 1u);
+	pc += __builtin_popcount(last);
+	return pc;
+}
+
+}  // namespace
+
+DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, uint16_t hmc)
 {
 	if (is_singular[c]) return DTM_Final_Entry::make_draw();
-	// is_dropped is handled by probe_dtm50_internal — callers must check first.
 	ASSERT(!is_dropped[c]);
 
 	Per_Color& pc = per_color[c];
-	const size_t positions_per_block = pc.block_size / pc.entry_bytes;
-	const size_t block_id = static_cast<size_t>(pos) / positions_per_block;
-	const size_t in_block_pos = static_cast<size_t>(pos) % positions_per_block;
-
-	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
-	if ((dso & 0xFFFFF) == 0) return DTM_Final_Entry::make_illegal();
+	const size_t ppb = pc.block_positions;
+	const size_t block_id = static_cast<size_t>(pos) / ppb;
+	const size_t pos_in_block = static_cast<size_t>(pos) % ppb;
 
 	thread_local TL_Block_FIFO tl;
-	const uint8_t* data = nullptr;
+	const uint8_t* payload = nullptr;
 	for (size_t i = 0; i < TL_Block_FIFO::N; ++i)
 		if (tl.epoch[i] == pc.epoch && tl.block_id[i] == block_id)
-			{ data = tl.bytes[i]->data(); break; }
-	if (!data)
+			{ payload = tl.bytes[i]->data(); break; }
+	if (!payload)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
 		Block_Ptr blk = get_block_locked(pc, block_id);
@@ -958,11 +936,51 @@ DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 		tl.epoch[s]    = pc.epoch;
 		tl.block_id[s] = block_id;
 		tl.bytes[s]    = blk;
-		data = blk->data();
+		payload = blk->data();
 	}
-	uint16_t stored;
-	std::memcpy(&stored, data + in_block_pos * sizeof(uint16_t), sizeof(stored));
-	return m_hmc == 0
+
+	uint32_t num_positions, num_nontrivial;
+	std::memcpy(&num_positions,  payload,     4);
+	std::memcpy(&num_nontrivial, payload + 4, 4);
+	const size_t num_trivial = num_positions - num_nontrivial;
+	const size_t eb = pc.entry_bytes;
+	const size_t tbm_bytes = (num_positions + 7) / 8;
+	const uint8_t* T              = payload + 8;
+	const uint8_t* trivial_ranks  = T + tbm_bytes;
+	const uint32_t* nontrivial_dir = reinterpret_cast<const uint32_t*>(trivial_ranks + num_trivial * eb);
+	const uint8_t* nontrivial_data = reinterpret_cast<const uint8_t*>(nontrivial_dir + num_nontrivial + 1);
+
+	const bool is_nontrivial = (T[pos_in_block >> 3] >> (pos_in_block & 7)) & 1u;
+	const size_t set_count = popcount_prefix_inclusive(T, pos_in_block);
+
+	uint16_t rank;
+	if (is_nontrivial)
+	{
+		const size_t ntri_idx = set_count - 1;
+		const uint8_t* blk = nontrivial_data + nontrivial_dir[ntri_idx];
+		uint64_t lo, hi;
+		std::memcpy(&lo, blk + 1, 8);
+		std::memcpy(&hi, blk + 9, 8);
+		// Mask bits ≤ hmc; hmc ∈ [0,99] so the high word may be partial.
+		uint64_t mask_lo, mask_hi;
+		if (hmc < 63) { mask_lo = (uint64_t{1} << (hmc + 1)) - 1; mask_hi = 0; }
+		else if (hmc == 63) { mask_lo = ~uint64_t{0}; mask_hi = 0; }
+		else { mask_lo = ~uint64_t{0}; mask_hi = (uint64_t{1} << (hmc - 63)) - 1; }
+		const size_t k = static_cast<size_t>(__builtin_popcountll(lo & mask_lo))
+		               + static_cast<size_t>(__builtin_popcountll(hi & mask_hi)) - 1;
+		const uint8_t* vals = blk + 17;
+		if (eb == 1) rank = vals[k];
+		else         { uint16_t r; std::memcpy(&r, vals + k * 2, 2); rank = r; }
+	}
+	else
+	{
+		const size_t triv_idx = (pos_in_block + 1) - set_count - 1;
+		if (eb == 1) rank = trivial_ranks[triv_idx];
+		else         { uint16_t r; std::memcpy(&r, trivial_ranks + triv_idx * 2, 2); rank = r; }
+	}
+
+	const uint16_t stored = pc.rank_to_value[rank];
+	return hmc == 0
 		? dtm50_entry_from_storage(stored, wdl)
 		: dtm50_layered_entry_from_storage(stored, wdl);
 }
@@ -1118,10 +1136,9 @@ struct Probe_Tables::Impl
 	std::unordered_map<uint32_t, std::unique_ptr<DTC_Probe_File>> dtc_cache;
 	mutable std::shared_mutex                                 dtm_mu;
 	std::unordered_map<uint32_t, std::unique_ptr<DTM_Probe_File>> dtm_cache;
-	// DTM50 cache key is (material_key << 8 | hmc) — one DTM50_Probe_File per
-	// (material, layer) since each layer lives in its own .lzdtm50 file.
+	// DTM50 cache: one file per material, all 100 hmc layers inside.
 	mutable std::shared_mutex                                 dtm50_mu;
-	std::unordered_map<uint64_t, std::unique_ptr<DTM50_Probe_File>> dtm50_cache;
+	std::unordered_map<uint32_t, std::unique_ptr<DTM50_Probe_File>> dtm50_cache;
 	mutable std::shared_mutex                                 epsi_mu;
 	std::unordered_map<uint32_t, std::unique_ptr<Piece_Config_For_Gen>> epsi_cache;
 
@@ -1225,10 +1242,10 @@ struct Probe_Tables::Impl
 		return raw;
 	}
 
-	NODISCARD DTM50_Probe_File* open_dtm50(const Piece_Config& ps, uint16_t hmc)
+	NODISCARD DTM50_Probe_File* open_dtm50(const Piece_Config& ps)
 	{
-		const uint64_t k = (static_cast<uint64_t>(ps.min_material_key().value()) << 8) | hmc;
-		thread_local TL_Probe_Cache<DTM50_Probe_File, uint64_t> tl;
+		const uint32_t k = ps.min_material_key().value();
+		thread_local TL_Probe_Cache<DTM50_Probe_File> tl;
 		DTM50_Probe_File* hit;
 		if (tl.lookup(epoch, k, hit)) return hit;
 		{
@@ -1239,11 +1256,10 @@ struct Probe_Tables::Impl
 		}
 		std::filesystem::path path;
 		std::unique_ptr<DTM50_Probe_File> f;
-		if (find_dtm50_in_dirs(ps, hmc, dtm50_dirs, &path))
+		if (find_in_dirs(ps, DTM50_EXT, dtm50_dirs, &path))
 		{
 			f = std::make_unique<DTM50_Probe_File>();
 			f->load(ps, path);
-			f->m_hmc = hmc;
 		}
 		std::unique_lock wlk(dtm50_mu);
 		auto [it, inserted] = dtm50_cache.try_emplace(k, std::move(f));
@@ -1558,7 +1574,7 @@ Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Positi
 	const bool rule50_drawn = rule50 != PROBE_IMPL_SKIP_DTM50 && rule50 >= DTM50_HMC_COUNT;
 	DTM50_Probe_File* m50 = nullptr;
 	if (rule50 != PROBE_IMPL_SKIP_DTM50 && !rule50_drawn)
-		m50 = open_dtm50(ps, static_cast<uint16_t>(rule50));
+		m50 = open_dtm50(ps);
 	if (!w && !d && !m && !m50 && !rule50_drawn) return r;
 
 	const Piece_Config_For_Gen& epsi = get_epsi(ps);
@@ -1862,7 +1878,7 @@ DTM_Final_Entry Probe_Tables::Impl::probe_dtm50_internal(
 	// Auto-50MR draw: no DTM50 layer applies.
 	if (rule50 >= DTM50_HMC_COUNT) return DTM_Final_Entry::make_draw();
 	const uint16_t hmc = static_cast<uint16_t>(rule50);
-	DTM50_Probe_File* m = open_dtm50(ps, hmc);
+	DTM50_Probe_File* m = open_dtm50(ps);
 	if (!m) return DTM_Final_Entry::make_illegal();
 
 	const Piece_Config_For_Gen& epsi = get_epsi(ps);
@@ -1872,7 +1888,7 @@ DTM_Final_Entry Probe_Tables::Impl::probe_dtm50_internal(
 	const Color stm = pos.turn();
 	const DTM_Final_Entry e = m->is_dropped[stm]
 		? derive_dtm50(ps, pos, rule50, depth)
-		: m->read(stm, idx, wdl);
+		: m->read(stm, idx, wdl, hmc);
 
 	// Recover mate-in-≤1 if the layered decoder collapsed it to DRAW.
 	if (hmc > 0 && e.is_draw() && (wdl == WDL_Entry::WIN || wdl == WDL_Entry::LOSE))

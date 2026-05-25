@@ -7,10 +7,11 @@ Chess endgame tablebase generator. Produces four tables per material:
   capture, promotion, or pawn push), 50-move-rule-aware.
 - **DTM** -- distance-to-mate, no 50-move-rule. Flat ply count to mate
   across all moves, including captures and promotions into sub-tablebases.
-- **DTM50** -- distance-to-mate under the 50-move rule. Per-hmc layered:
-  100 tables per material, one for each value of the halfmove clock. Each
-  layer answers "given this hmc, what's the optimal mate distance?"
-  exactly. Routes that would bust the 50MR window collapse to DRAW.
+- **DTM50** -- distance-to-mate under the 50-move rule. 100 hmc layers per
+  material, one for each value of the halfmove clock, packed into a single
+  file via a layer-axis change-point encoding. Each layer answers "given
+  this hmc, what's the optimal mate distance?" exactly. Routes that would
+  bust the 50MR window collapse to DRAW.
 
 WDL is the projection induced by the DTC table and is written alongside it.
 DTM and DTM50 are opt-in (additive after DTC); both depend on the WDL
@@ -67,8 +68,8 @@ Outputs:
 - `dtc/<material>.info`
 - `dtm/<material>.lzdtm`            (with `--builddtm`)
 - `dtm/<material>.info`             (with `--builddtm`)
-- `dtm50/<material>/h<hmc>.lzdtm50` (with `--builddtm50`, hmc = 0..99)
-- `dtm50/<material>/h<hmc>.info`    (with `--builddtm50`, hmc = 0..99)
+- `dtm50/<material>.lzdtm50`        (with `--builddtm50`)
+- `dtm50/<material>.info`           (with `--builddtm50`)
 
 Requested materials are expanded through their capture/promotion
 dependency closure and generated in dependency order. The DTC pass always
@@ -81,23 +82,23 @@ The 50-move rule turns "distance to mate" into a moving target: a position
 that wins-in-200-plies-flat is a 50MR draw, but the same position with 30
 plies left on the clock might still win if a zeroing capture lands soon.
 Carrying the halfmove clock in the table itself solves that exactly --
-each material stores 100 layers, one per hmc, and each cell at layer k
-answers "what's optimal mate distance from here, given hmc = k?". Cells
-whose only winning route would bust the 50MR window collapse to DRAW at
-that layer, so probing returns the actual playable outcome rather than a
+each material stores 100 hmc layers, and each cell at layer k answers
+"what's optimal mate distance from here, given hmc = k?". Cells whose
+only winning route would bust the 50MR window collapse to DRAW at that
+layer, so probing returns the actual playable outcome rather than a
 pretend value.
 
 The generator builds every layer as a single forward classification pass.
 Pawn slices iterate in topo order, and within each slice's fusion the hmc
-loop runs 99 down to 0. That order makes
-every read a finalized read: a non-pawn quiet at hmc = k targets opp's k+1
-in the same slice (just built one step earlier), an in-material pawn push
-targets opp's hmc = 0 in a push-destination slice (already finalized in a
-prior topo batch), and a capture or promotion reads the sub-tablebase.
-hmc = 99 has no k+1, so its non-pawn quiet reads inline an explicit
-50MR-draw / mate check. hmc = 99 of each fusion also runs the full chess-
-legality check per cell; every lower-hmc layer piggybacks ILLEGAL from
-opp[k+1] at the same idx and is orders of magnitude faster.
+loop runs 99 down to 0. That order makes every read a finalized read: a
+non-pawn quiet at hmc = k targets opp's k+1 in the same slice (just built
+one step earlier), an in-material pawn push targets opp's hmc = 0 in a
+push-destination slice (already finalized in a prior topo batch), and a
+capture or promotion reads the sub-tablebase. hmc = 99 has no k+1, so
+its non-pawn quiet reads inline an explicit 50MR-draw / mate check.
+hmc = 99 of each fusion also runs the full chess-legality check per cell;
+every lower-hmc layer piggybacks ILLEGAL from opp[k+1] at the same idx
+and is orders of magnitude faster.
 
 The 5-class WDL companion still does class duty for halved values. At
 hmc = 0 there's no ambiguity. At hmc > 0 a WDL=WIN cell might be DRAW
@@ -107,9 +108,24 @@ LOSS(0) by local move-gen when the WDL flags a decisive cell. Cursed
 and blessed classes always project to DRAW under DTM50 -- by
 construction those cells can't carry mate-in-≤1.
 
-Disk: one `.lzdtm50` per (material, hmc) under `dtm50/<material>/`.
-Probe: `Probe_Tables::probe(pos, rule50)` selects the right layer and
-returns DTM50 alongside the other fields.
+### Pack layout
+
+All 100 hmc layers go into a single `dtm50/<material>.lzdtm50`. The pack
+exploits the fact that, for most positions, the value is constant across
+the hmc axis: a fortress draw is DRAW at every layer, a fast mate is
+WIN(d) at every layer until the 50MR cliff. So per output block we split
+positions into
+
+- **trivial** -- single value covers all 100 layers; stored once as a
+  rank index into the per-color value table.
+- **non-trivial** -- a 100-bit changepoint bitmap (bit h = 1 iff layer h
+  differs from layer h-1) plus the value at each changepoint.
+
+A probe at hmc = k masks the bitmap to bits ≤ k, popcounts to find the
+applicable changepoint index, and reads the value there. The non-trivial
+fraction is small on real materials, so total storage is ~one rank per
+position plus a sparse side table -- roughly an order of magnitude under
+the equivalent 100-file-per-material per-hmc layout.
 
 ```sh
 ./chesstb -r KBNK --builddtm50
@@ -212,9 +228,10 @@ to exhaustive:
 color when it can be derived at probe time. The probe code detects
 dropped colors and reconstructs them by one-ply minimax against the kept
 color and sub-TBs (DTM50 derive threads each child's hmc through the
-recursion so per-layer semantics are preserved). DTC, DTM, and DTM50
-share the rank-encoded wire layout so a single shrinker dispatches all
-three by magic.
+recursion so per-layer semantics are preserved). WDL, DTC, DTM, and
+DTM50 all dispatch through `shrink` by magic; DTC/DTM share the
+rank-encoded wire layout while DTM50 uses its own rs-pack header (16-byte
+offset entries: `dso` + uncompressed payload size).
 
 Shrink is a postprocessing step. The generator does not accept any
 dependency on shrunken files -- shipping-format files are treated as
