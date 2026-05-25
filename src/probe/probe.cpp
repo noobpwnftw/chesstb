@@ -876,7 +876,13 @@ Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 	const size_t doff = dso >> 20;
 
 	auto buf = std::make_shared<std::vector<uint8_t>>(usz, 0);
-	if (!pc.decomp) pc.decomp = std::make_unique<LZMA_Decompress_Helper>(usz);
+	if (!pc.decomp) {
+		const size_t ppb = pc.block_positions;
+		const size_t eb = pc.entry_bytes;
+		const size_t max_payload = 8 + (ppb + 7) / 8
+			+ ppb * eb + 4 * (ppb + 1) + ppb * (1 + 16 + 100 * eb);
+		pc.decomp = std::make_unique<LZMA_Decompress_Helper>(max_payload);
+	}
 	const Const_Span<uint8_t> raw = pc.decomp->decompress(
 		Const_Span(pc.compressed_data + doff, dsz), usz);
 	std::memcpy(buf->data(), raw.data(), usz);
