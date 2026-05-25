@@ -885,14 +885,19 @@ protected:
 	// Reused by King_Slice_Manager::neighbors out-param.
 	King_Slice_Manager::Neighbor_List m_scratch_nbrs;
 
-	// Size per-color, per-group bookkeeping vectors once the table dimensions
-	// are known. Called from each derived ctor.
-	void init_group_state(size_t num_groups, size_t total_index_space)
+	// Size per-color paging bookkeeping once the table dimensions are known.
+	void init_group_state(size_t num_groups)
+	{
+		for (Color c : { WHITE, BLACK })
+			m_last_used[c].assign(num_groups, 0);
+	}
+
+	// Size the retro-iteration bitmaps.
+	void init_iter_state(size_t num_groups, size_t total_index_space)
 	{
 		const size_t num_chunks = (total_index_space + CHUNK_SIZE - 1) / CHUNK_SIZE;
 		for (Color c : { WHITE, BLACK })
 		{
-			m_last_used[c].assign(num_groups, 0);
 			m_iter_groups[c].assign(num_groups, 0);
 			m_iter_chunks[c].assign(num_chunks, 0);
 		}

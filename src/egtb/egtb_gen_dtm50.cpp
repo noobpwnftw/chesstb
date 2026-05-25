@@ -96,9 +96,7 @@ DTM50_Generator::DTM50_Generator(
 	const size_t total_bytes = bytes_per_color * 2;
 	if (m_paging_budget_bytes >= total_bytes) m_paging_budget_bytes = 0;
 
-	init_group_state(
-		m_table->m_dtm[WHITE][0].num_groups(),
-		m_table->m_dtm[WHITE][0].num_entries());
+	init_group_state(m_table->m_dtm[WHITE][0].num_groups());
 
 	for (Color c : { WHITE, BLACK })
 	for (Piece captured = PIECE_NONE; captured < PIECE_NB; captured = static_cast<Piece>(captured + 1))
@@ -504,11 +502,13 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 
 	// Outer = topo batch / fusion, inner = hmc 99..0; see header for the read
 	// dependency argument that this order satisfies.
+	size_t total_fusions = 0;
 	for (size_t bi = 0; bi < batches.size(); ++bi)
 	{
 		if (static_cast<int64_t>(bi) < resume_batch_idx) continue;
 		const auto& batch = batches[bi];
 		const auto fusions = compute_fusion_groups(m_table->m_dtm[WHITE][0], batch);
+		total_fusions += fusions.size();
 		if (pawnful)
 		{
 			std::printf("  batch %zu/%zu (%zu pairs in %zu fusion%s)\n",
@@ -519,6 +519,9 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 
 		for (size_t fi = 0; fi < fusions.size(); ++fi)
 		{
+			const bool is_resume_fusion =
+				static_cast<int64_t>(bi) == resume_batch_idx &&
+				static_cast<int64_t>(fi) == resume_fusion_idx;
 			if (static_cast<int64_t>(bi) == resume_batch_idx &&
 			    static_cast<int64_t>(fi) < resume_fusion_idx) continue;
 
@@ -535,15 +538,13 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 				std::unique(m_active_pawn_slices.begin(), m_active_pawn_slices.end()),
 				m_active_pawn_slices.end());
 
-			for (int hmc_signed = static_cast<int>(DTM50_HMC_COUNT) - 1; hmc_signed >= 0; --hmc_signed)
+			for (size_t i = DTM50_HMC_COUNT; i-- > 0; )
 			{
+				const uint16_t hmc = static_cast<uint16_t>(i);
 				// Within the resume fusion, layers 99..(resume_hmc+1) were
 				// already finished; resume at resume_hmc and run the rest fresh.
-				if (static_cast<int64_t>(bi) == resume_batch_idx &&
-				    static_cast<int64_t>(fi) == resume_fusion_idx &&
-				    static_cast<int64_t>(hmc_signed) > resume_hmc) continue;
+				if (is_resume_fusion && static_cast<int64_t>(hmc) > resume_hmc) continue;
 
-				const uint16_t hmc = static_cast<uint16_t>(hmc_signed);
 				m_current_hmc = hmc;
 
 				// Unbounded budget: pre-load every group of the layers this
@@ -573,7 +574,7 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 					m_table->m_dtm[BLACK][hmc + 2].evict_all(*thread_pool);
 				}
 
-				refresh_active_metadata(cur_layer(WHITE));
+				refresh_active_metadata(m_table->m_dtm[WHITE][0]);
 
 				try
 				{
@@ -601,10 +602,10 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 	}
 
 	const auto t_total_end = std::chrono::steady_clock::now();
-	std::printf("  gen (%zu hmc layers): done in %s (%zu pawn-slice pairs in %zu batches)\n",
+	std::printf("  gen (%zu hmc layers): done in %s (%zu pawn-slice pairs in %zu batches, %zu fusion groups)\n",
 		DTM50_HMC_COUNT,
 		format_elapsed_time(t_total_start, t_total_end).c_str(),
-		total_pairs, batches.size());
+		total_pairs, batches.size(), total_fusions);
 }
 
 // =============================================================================

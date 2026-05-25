@@ -98,7 +98,8 @@ DTM_Generator::DTM_Generator(
 	const size_t total_bytes = bytes_per_color * 2;
 	if (m_paging_budget_bytes >= total_bytes) m_paging_budget_bytes = 0;
 
-	init_group_state(
+	init_group_state(m_table->m_dtm[WHITE].num_groups());
+	init_iter_state(
 		m_table->m_dtm[WHITE].num_groups(),
 		m_table->m_dtm[WHITE].num_entries());
 
