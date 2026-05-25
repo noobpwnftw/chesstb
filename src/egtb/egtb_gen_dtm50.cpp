@@ -839,9 +839,18 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 	// One cache across all 2 × HMC_COUNT layer tables shares the paging
 	// budget; cap_groups = SIZE_MAX when unbounded keeps everything resident.
 	const size_t group_bytes = positions_per_group * sizeof(DTM_Final_Entry);
-	const size_t cap_groups = (m_paging_budget_bytes == 0 || group_bytes == 0)
-		? std::numeric_limits<size_t>::max()
-		: std::max<size_t>(1, m_paging_budget_bytes / group_bytes);
+	size_t cap_groups;
+	size_t max_workers;
+	if (m_paging_budget_bytes == 0 || group_bytes == 0)
+	{
+		cap_groups = std::numeric_limits<size_t>::max();
+		max_workers = 0;
+	}
+	else
+	{
+		cap_groups = std::max<size_t>(1, m_paging_budget_bytes / group_bytes);
+		max_workers = cap_groups;
+	}
 
 	std::vector<Sliced_EGTB_File_For_Gen<DTM_Final_Entry>*> all_tables;
 	all_tables.reserve(COLOR_NB * DTM50_HMC_COUNT);
@@ -854,10 +863,11 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 		return static_cast<size_t>(c) * DTM50_HMC_COUNT + h;
 	};
 
-	auto parallel_for_layers = [&](size_t h_lo, size_t h_hi, auto&& body) {
+	auto parallel_for_layers = [&](size_t h_lo, size_t h_hi, size_t worker_cap, auto&& body) {
 		const size_t n = h_hi - h_lo;
 		if (n == 0) return;
-		const size_t workers = std::min(thread_pool->num_workers(), n);
+		const size_t capped_n = (worker_cap == 0) ? n : std::min(n, worker_cap);
+		const size_t workers = std::min(thread_pool->num_workers(), capped_n);
 		std::atomic<size_t> next(h_lo);
 		thread_pool->run_sync_task_on_multiple_threads(workers, [&](size_t) {
 			for (;;)
@@ -884,7 +894,7 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 		std::array<uint64_t, Color_Ranks_RS::LUT_SIZE> score{};
 		std::array<std::array<uint8_t, Color_Ranks_RS::LUT_SIZE>, DTM50_HMC_COUNT> per_layer_seen{};
 
-		parallel_for_layers(0, DTM50_HMC_COUNT, [&](size_t h) {
+		parallel_for_layers(0, DTM50_HMC_COUNT, max_workers, [&](size_t h) {
 			const size_t ti = table_idx_of(me, h);
 			auto& tbl = m_table->m_dtm[me][h];
 			auto& seen = per_layer_seen[h];
@@ -990,7 +1000,7 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 				const size_t want_lo = group_id_of_pos(p_base);
 				const size_t want_hi = group_id_of_pos(p_base + this_bp - 1);
 
-				parallel_for_layers(0, DTM50_HMC_COUNT, [&](size_t h) {
+				parallel_for_layers(0, DTM50_HMC_COUNT, max_workers, [&](size_t h) {
 					Pinned_Group_Range<DTM_Final_Entry> pin(
 						cache, table_idx_of(me, h), want_lo, want_hi);
 					auto& tbl = m_table->m_dtm[me][h];
