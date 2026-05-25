@@ -242,6 +242,8 @@ NODISCARD Compressed_EGTB save_compress_wdl(
 	size_t max_workers = 0
 );
 
+// silent=true suppresses the per-block progress bar and the "singular" line;
+// callers (e.g. DTM50's per-hmc save loop) print their own one-line indicator.
 NODISCARD Compressed_EGTB save_compress_egtb(
 	In_Out_Param<Thread_Pool> thread_pool,
 	const Block_Source& src,
@@ -251,7 +253,8 @@ NODISCARD Compressed_EGTB save_compress_egtb(
 	size_t block_size,
 	size_t max_workers = 0,
 	Value_Rank_Table rank_table = {},
-	LZMA_Rank_Compress_Helper::Storage_Fn storage_fn = &dtc_storage_fn
+	LZMA_Rank_Compress_Helper::Storage_Fn storage_fn = &dtc_storage_fn,
+	bool silent = false
 );
 
 void save_wdl_table(

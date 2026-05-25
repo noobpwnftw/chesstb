@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
@@ -92,7 +93,8 @@ std::vector<std::vector<uint8_t>> compress_blocks(
 	size_t block_size,
 	std::unique_ptr<Compress_Helper> compressor_factory,
 	std::string task_name,
-	size_t max_workers
+	size_t max_workers,
+	bool silent
 )
 {
 	const size_t source_block_size = compressor_factory->source_bytes_per_block(block_size);
@@ -109,7 +111,8 @@ std::vector<std::vector<uint8_t>> compress_blocks(
 
 	constexpr size_t PRINT_PERIOD_BYTES = 1024 * 1024 * 8;
 	const size_t PRINT_PERIOD = ceil_div(PRINT_PERIOD_BYTES * effective_workers, block_size);
-	Concurrent_Progress_Bar progress_bar(num_blocks, PRINT_PERIOD, task_name);
+	std::optional<Concurrent_Progress_Bar> progress_bar;
+	if (!silent) progress_bar.emplace(num_blocks, PRINT_PERIOD, task_name);
 
 	thread_pool->run_sync_task_on_all_threads([&](size_t thread_id) {
 		if (thread_id >= effective_workers) return;
@@ -131,7 +134,7 @@ std::vector<std::vector<uint8_t>> compress_blocks(
 				block_id, Span<uint8_t>(scratch_buffer.get(), source_block_size));
 			if (block.size() == 0)
 			{
-				progress_bar += 1;
+				if (progress_bar) *progress_bar += 1;
 				continue;
 			}
 
@@ -142,11 +145,11 @@ std::vector<std::vector<uint8_t>> compress_blocks(
 
 			compressed_blocks[block_id] = std::vector(compressed_block_buffer.get(), compressed_block_buffer.get() + out_sz);
 
-			progress_bar += 1;
+			if (progress_bar) *progress_bar += 1;
 		}
 	});
 
-	progress_bar.set_finished();
+	if (progress_bar) progress_bar->set_finished();
 
 	return compressed_blocks;
 }

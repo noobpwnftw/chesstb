@@ -430,7 +430,14 @@ uint16_t DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 	}
 
 	const size_t PRINT_PERIOD = thread_pool->num_workers() * (1 << 20);
-	Concurrent_Progress_Bar progress_bar(total_indices, PRINT_PERIOD, "init_entries");
+	std::optional<Concurrent_Progress_Bar> progress_bar;
+	if (m_current_hmc == 0)
+		progress_bar.emplace(total_indices, PRINT_PERIOD, "init_entries");
+	else
+	{
+		std::printf("  build layer %2u\r", m_current_hmc);
+		std::fflush(stdout);
+	}
 
 	uint16_t max_init = 0;
 	for (size_t g : m_pair_group_ids)
@@ -448,7 +455,10 @@ uint16_t DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 			for (const Board_Index idx : group_it.indices())
 			{
 				if (++local_progress % PROGRESS_BAR_UPDATE_PERIOD == 0)
-					progress_bar += PROGRESS_BAR_UPDATE_PERIOD;
+				{
+					if (progress_bar)
+						*progress_bar += PROGRESS_BAR_UPDATE_PERIOD;
+				}
 				const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
 				if (!pid_in_pair[pid_of_idx])
 				{
@@ -519,7 +529,8 @@ uint16_t DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 		for (uint16_t v : rets) update_max(max_init, v);
 	}
 
-	progress_bar.set_finished();
+	if (progress_bar)
+		progress_bar->set_finished();
 
 	return max_init;
 }
@@ -1086,17 +1097,15 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 			m_table->m_dtm[BLACK][hmc + 2].evict_all(*thread_pool);
 		}
 
-		size_t total_fusions = 0;
 		for (size_t bi = 0; bi < batches.size(); ++bi)
 		{
 			if (hmc == resume_hmc && static_cast<int64_t>(bi) < resume_batch_idx) continue;
 			const auto& batch = batches[bi];
 			const auto fusions = compute_fusion_groups(cur_layer(WHITE), batch);
-			total_fusions += fusions.size();
-			if (pawnful)
+			if (pawnful && hmc == 0)
 			{
-				std::printf("  hmc=%u batch %zu/%zu (%zu pairs in %zu fusion%s)\n",
-					hmc, bi + 1, batches.size(), batch.size(),
+				std::printf("  batch %zu/%zu (%zu pairs in %zu fusion%s)\n",
+					bi + 1, batches.size(), batch.size(),
 					fusions.size(), fusions.size() == 1 ? "" : "s");
 				std::fflush(stdout);
 			}
@@ -1177,7 +1186,6 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 			m_table->m_phase[WHITE].close();
 			m_table->m_phase[BLACK].close();
 		}
-		(void)total_fusions;
 	};
 
 	// Per-layer schedule: 0, then 99 down to 1.
@@ -1412,6 +1420,8 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 
 	for (uint16_t hmc = 0; hmc < DTM50_HMC_COUNT; ++hmc)
 	{
+		std::printf("  save layer %2u\r", hmc); std::fflush(stdout);
+
 		auto& dtm_w = m_table->m_dtm[WHITE][hmc];
 		auto& dtm_b = m_table->m_dtm[BLACK][hmc];
 
@@ -1458,7 +1468,7 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 			Block_Source src = make_dtm_block_source(m_table->m_dtm[me][hmc], cache, me, DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
 			dtm_save[me] = save_compress_egtb(
 				thread_pool, src, me, m_info, dtm_entry_bytes[me], DTM_BLOCK_SIZE, max_workers,
-				dtm_rank[me], &dtm_storage_fn);
+				dtm_rank[me], &dtm_storage_fn, /*silent=*/true);
 		}
 
 		save_egtb_table(m_epsi, dtm_save, paths.dtm50_save_path(m_epsi, hmc), colors, EGTB_Magic::DTM50_MAGIC);

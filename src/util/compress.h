@@ -342,11 +342,13 @@ struct Block_Source
 // (the others early-return). 0 = use all pool workers. Used by the paged
 // save path: under a memory budget, the underlying source can only afford
 // so many groups resident concurrently; capping workers caps that pressure.
+// silent=true skips the per-block progress bar (caller does its own reporting).
 NODISCARD std::vector<std::vector<uint8_t>> compress_blocks(
 	In_Out_Param<Thread_Pool> thread_pool,
 	const Block_Source& src,
 	size_t block_size,
 	std::unique_ptr<Compress_Helper> compressor,
 	std::string task_name,
-	size_t max_workers = 0
+	size_t max_workers = 0,
+	bool silent = false
 );

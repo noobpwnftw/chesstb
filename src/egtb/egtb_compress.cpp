@@ -229,14 +229,15 @@ Compressed_EGTB save_compress_egtb(
 	size_t block_size,
 	size_t max_workers,
 	Value_Rank_Table rank_table,
-	LZMA_Rank_Compress_Helper::Storage_Fn storage_fn
+	LZMA_Rank_Compress_Helper::Storage_Fn storage_fn,
+	bool silent
 )
 {
 	const std::string task_name = std::string("save_compress_egtb ") + std::to_string(static_cast<int>(color));
 
 	if (info.win_cnt[color] + info.lose_cnt[color] == 0)
 	{
-		printf("%s: singular\n", task_name.c_str());
+		if (!silent) printf("%s: singular\n", task_name.c_str());
 		return Compressed_EGTB::make_singular(WDL_Entry::DRAW);
 	}
 
@@ -246,7 +247,8 @@ Compressed_EGTB save_compress_egtb(
 		block_size,
 		std::make_unique<LZMA_Rank_Compress_Helper>(rank_table, entry_bytes, storage_fn),
 		task_name,
-		max_workers
+		max_workers,
+		silent
 	);
 
 	return Compressed_EGTB(
