@@ -977,11 +977,11 @@ NODISCARD bool gather_dtm50_info(
 				for (size_t p = p_lo; p < p_hi; ++p)
 				{
 					const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(p));
-					const uint16_t v = dtm_value_for_storage(e);
 					// DRAW/ILLEGAL are routed via the WDL companion; the rank
 					// table only needs W/L storage values (LOSS-in-0 still adds
 					// storage 0 normally).
-					if (v != DTM_Final_Entry::ILLEGAL_VAL && !e.is_draw()) seen[v] = 1;
+					if (!e.is_illegal() && !e.is_draw())
+						seen[dtm_value_for_storage(e)] = 1;
 					if (gather_info)
 					{
 						const uint64_t w = epsi.orbit_weight(didx);
