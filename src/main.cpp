@@ -344,26 +344,22 @@ int main(int argc, char** argv)
 	std::cout << closured.size() << " piece configurations in plan"
 	          << (opt.mem_mib > 0 ? " (--mem " + std::to_string(opt.mem_mib) + " MiB)" : "")
 	          << (opt.build_dtm ? " (+dtm)" : "")
+	          << (opt.build_dtm50 ? " (+dtm50)" : "")
 	          << ":\n";
 	for (const Piece_Config& ps : closured)
 	{
 		const bool has_wdl = paths.find_wdl_file(ps);
 		const bool has_dtc = paths.find_dtc_file(ps);
 		const bool has_dtm = opt.build_dtm ? paths.find_dtm_file(ps) : true;
+		const bool has_dtm50 = opt.build_dtm50 ? paths.find_dtm50_file(ps) : true;
 		const size_t est = estimate_dtc_ram_bytes(ps);
-		if (opt.build_dtm)
-			std::printf("  %-8s  WDL %c  DTC %c  DTM %c  ~%6.1f MiB\n",
-				ps.name().c_str(),
-				has_wdl ? '+' : '-',
-				has_dtc ? '+' : '-',
-				has_dtm ? '+' : '-',
-				est / (1024.0 * 1024.0));
-		else
-			std::printf("  %-8s  WDL %c  DTC %c  ~%6.1f MiB\n",
-				ps.name().c_str(),
-				has_wdl ? '+' : '-',
-				has_dtc ? '+' : '-',
-				est / (1024.0 * 1024.0));
+		std::string line = "  " + ps.name();
+		line.resize(10, ' ');
+		line += "  WDL "; line += has_wdl ? '+' : '-';
+		line += "  DTC "; line += has_dtc ? '+' : '-';
+		if (opt.build_dtm)   { line += "  DTM ";   line += has_dtm   ? '+' : '-'; }
+		if (opt.build_dtm50) { line += "  DTM50 "; line += has_dtm50 ? '+' : '-'; }
+		std::printf("%s  ~%6.1f MiB\n", line.c_str(), est / (1024.0 * 1024.0));
 	}
 
 	Thread_Pool pool(opt.num_threads);
@@ -460,7 +456,8 @@ int main(int argc, char** argv)
 			}
 
 			const auto t_end = std::chrono::steady_clock::now();
-			std::cout << "  " << ps.name() << " DTM50 done in " << format_elapsed_time(t_start, t_end) << "\n";
+			std::cout << "  " << ps.name() << " DTM50 done in " << format_elapsed_time(t_start, t_end)
+			          << "  (DTM50 " << std::filesystem::file_size(paths.dtm50_save_path(ps)) << " B)\n";
 		}
 	}
 	const auto t_total_end = std::chrono::steady_clock::now();
