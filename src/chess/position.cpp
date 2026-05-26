@@ -33,35 +33,68 @@ Piece Position::do_move(Move m)
 	ASSERT(mover != PIECE_NONE);
 	ASSERT(piece_color(mover) == m_turn);
 
+	const Color us   = m_turn;
+	const Color them = color_opp(us);
 	Piece captured = PIECE_NONE;
 
-	if (m.is_ep_capture())
+	if (m.is_promotion())
+	{
+		if (!is_empty(to))
+		{
+			captured = m_squares[to];
+			ASSERT(piece_color(captured) == them);
+			remove_piece(to);
+		}
+		remove_piece(from);
+		put_piece(piece_make(us, m.promotion()), to);
+	}
+	else if (m.is_ep_capture())
 	{
 		// Captured pawn is on the same file as `to` but on `from`'s rank.
 		const Square cap_sq = sq_make(sq_rank(from), sq_file(to));
 		captured = m_squares[cap_sq];
 		ASSERT(captured != PIECE_NONE);
 		ASSERT(piece_type(captured) == PAWN);
-		remove_piece(cap_sq);
+		const Bitboard from_to = square_bb(from) ^ square_bb(to);
+		const Bitboard cap_bb  = square_bb(cap_sq);
+		m_pieces[mover]              ^= from_to;
+		m_pieces[piece_occupy(us)]   ^= from_to;
+		m_pieces[captured]           ^= cap_bb;
+		m_pieces[piece_occupy(them)] ^= cap_bb;
+		// `to` was empty (EP target); both `from` and `cap_sq` clear.
+		m_occupied ^= from_to ^ cap_bb;
+		m_piece_counts[captured] -= 1;
+		m_squares[to]     = mover;
+		m_squares[from]   = PIECE_NONE;
+		m_squares[cap_sq] = PIECE_NONE;
 	}
 	else if (!is_empty(to))
 	{
 		captured = m_squares[to];
-		ASSERT(piece_color(captured) != m_turn);
-		remove_piece(to);
-	}
-
-	remove_piece(from);
-	if (m.is_promotion())
-	{
-		put_piece(piece_make(m_turn, m.promotion()), to);
+		ASSERT(piece_color(captured) == them);
+		const Bitboard from_to = square_bb(from) ^ square_bb(to);
+		const Bitboard to_bb   = square_bb(to);
+		m_pieces[mover]              ^= from_to;
+		m_pieces[piece_occupy(us)]   ^= from_to;
+		m_pieces[captured]           ^= to_bb;
+		m_pieces[piece_occupy(them)] ^= to_bb;
+		// `to` stays occupied through the swap; only `from` flips.
+		m_occupied ^= square_bb(from);
+		m_piece_counts[captured] -= 1;
+		m_squares[to]   = mover;
+		m_squares[from] = PIECE_NONE;
 	}
 	else
 	{
-		put_piece(mover, to);
+		const Bitboard from_to = square_bb(from) ^ square_bb(to);
+		m_pieces[mover]            ^= from_to;
+		m_pieces[piece_occupy(us)] ^= from_to;
+		m_occupied                 ^= from_to;
+		m_squares[to]   = mover;
+		m_squares[from] = PIECE_NONE;
 	}
 
-	m_turn = color_opp(m_turn);
+	m_turn = them;
 	return captured;
 }
 
@@ -70,25 +103,59 @@ void Position::undo_move(Move m, Piece captured)
 	m_turn = color_opp(m_turn);
 	const Square from = m.from();
 	const Square to   = m.to();
+	const Color us   = m_turn;
+	const Color them = color_opp(us);
 
-	const Piece placed = m_squares[to];
-	ASSERT(placed != PIECE_NONE);
-	remove_piece(to);
 	if (m.is_promotion())
-		put_piece(piece_make(m_turn, PAWN), from);
-	else
-		put_piece(placed, from);
-
-	if (m.is_ep_capture())
+	{
+		const Piece placed = m_squares[to];
+		ASSERT(placed != PIECE_NONE);
+		remove_piece(to);
+		put_piece(piece_make(us, PAWN), from);
+		if (captured != PIECE_NONE)
+			put_piece(captured, to);
+	}
+	else if (m.is_ep_capture())
 	{
 		ASSERT(captured != PIECE_NONE);
 		ASSERT(piece_type(captured) == PAWN);
+		const Piece mover = m_squares[to];
 		const Square cap_sq = sq_make(sq_rank(from), sq_file(to));
-		put_piece(captured, cap_sq);
+		const Bitboard from_to = square_bb(from) ^ square_bb(to);
+		const Bitboard cap_bb  = square_bb(cap_sq);
+		m_pieces[mover]              ^= from_to;
+		m_pieces[piece_occupy(us)]   ^= from_to;
+		m_pieces[captured]           ^= cap_bb;
+		m_pieces[piece_occupy(them)] ^= cap_bb;
+		m_occupied ^= from_to ^ cap_bb;
+		m_piece_counts[captured] += 1;
+		m_squares[from]   = mover;
+		m_squares[to]     = PIECE_NONE;
+		m_squares[cap_sq] = captured;
 	}
 	else if (captured != PIECE_NONE)
 	{
-		put_piece(captured, to);
+		const Piece mover = m_squares[to];
+		const Bitboard from_to = square_bb(from) ^ square_bb(to);
+		const Bitboard to_bb   = square_bb(to);
+		m_pieces[mover]              ^= from_to;
+		m_pieces[piece_occupy(us)]   ^= from_to;
+		m_pieces[captured]           ^= to_bb;
+		m_pieces[piece_occupy(them)] ^= to_bb;
+		m_occupied ^= square_bb(from);
+		m_piece_counts[captured] += 1;
+		m_squares[from] = mover;
+		m_squares[to]   = captured;
+	}
+	else
+	{
+		const Piece mover = m_squares[to];
+		const Bitboard from_to = square_bb(from) ^ square_bb(to);
+		m_pieces[mover]            ^= from_to;
+		m_pieces[piece_occupy(us)] ^= from_to;
+		m_occupied                 ^= from_to;
+		m_squares[from] = mover;
+		m_squares[to]   = PIECE_NONE;
 	}
 }
 
