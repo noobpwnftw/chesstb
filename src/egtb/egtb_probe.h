@@ -37,10 +37,12 @@ NODISCARD inline bool tb_file_is_full_format(const std::filesystem::path& path, 
 
 	const uint32_t key_and_table_num = r.read<uint32_t>();
 	const Fixed_Vector<Color, 2> colors = egtb_table_colors(key_and_table_num & 3);
-	// DTC and DTM both go through save_egtb_table, so they share the inline
-	// rank-table header layout; WDL uses the older flat header.
+	// DTC, DTM, and DTM50 share a 23-byte normal-flag color header plus inline
+	// rank table (field names differ but byte counts match); WDL uses the older
+	// flat header.
 	const bool egtb_table = expected_magic == EGTB_Magic::DTC_MAGIC
-	                     || expected_magic == EGTB_Magic::DTM_MAGIC;
+	                     || expected_magic == EGTB_Magic::DTM_MAGIC
+	                     || expected_magic == EGTB_Magic::DTM50_MAGIC;
 
 	for (size_t i = 0; i < colors.size(); ++i)
 	{
@@ -129,15 +131,11 @@ struct EGTB_Paths
 	// dtm50/<name>.lzdtm50 — one packed file per material, all 100 hmc layers.
 	NODISCARD bool find_dtm50_file(const Piece_Config& ps, std::filesystem::path* tb = nullptr) const
 	{
-		const std::string fn = ps.name() + DTM50_EXT;
-		for (const auto& dir : m_dtm50_paths)
-		{
-			const auto path = path_join(dir, fn);
-			if (!std::filesystem::exists(path)) continue;
-			if (tb) *tb = path;
-			return true;
-		}
-		return false;
+		std::filesystem::path found;
+		if (!find_tb_file(ps, DTM50_EXT, m_dtm50_paths, &found)) return false;
+		if (!tb_file_is_full_format(found, EGTB_Magic::DTM50_MAGIC)) return false;
+		if (tb) *tb = std::move(found);
+		return true;
 	}
 
 	NODISCARD std::filesystem::path wdl_save_path(const Piece_Config& ps) const { return path_join(m_wdl_paths[0], ps.name() + WDL_EXT); }
