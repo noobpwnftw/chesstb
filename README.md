@@ -111,21 +111,48 @@ construction those cells can't carry mate-in-≤1.
 ### Pack layout
 
 All 100 hmc layers go into a single `dtm50/<material>.lzdtm50`. The pack
-exploits the fact that, for most positions, the value is constant across
-the hmc axis: a fortress draw is DRAW at every layer, a fast mate is
-WIN(d) at every layer until the 50MR cliff. So per output block we split
-positions into
+exploits two structural properties of DTM50 across the hmc axis: for
+most positions the value sequence is constant or nearly so, and where it
+does change it is monotone non-decreasing (tighter 50MR budget can only
+make a mate longer) and ends in a single irreversible flip to DRAW once
+no winning line fits. Per output block each position is classified into
+one of four states, packed as a 2-bit-per-position vector:
 
-- **trivial** -- single value covers all 100 layers; stored once as a
-  rank index into the per-color value table.
-- **non-trivial** -- a 100-bit changepoint bitmap (bit h = 1 iff layer h
-  differs from layer h-1) plus the value at each changepoint.
+- **CONST** -- value identical at every layer (draws, fast mates, mate
+  cells). One rank id in a packed const stream.
+- **SINGLE** -- exactly one transition. `[h, r0, r1]` where h ∈ [1, 99].
+- **DOUBLE** -- two transitions. `[h1, h2, r0, r1, r2]`.
+- **MULTI** -- three or more transitions. `[k, 100-bit changepoint
+  bitmap, k ranks]`.
 
-A probe at hmc = k masks the bitmap to bits ≤ k, popcounts to find the
-applicable changepoint index, and reads the value there. The non-trivial
-fraction is small on real materials, so total storage is ~one rank per
-position plus a sparse side table -- roughly an order of magnitude under
-the equivalent 100-file-per-material per-hmc layout.
+Each non-CONST state also carries a per-position "ends in DRAW" hint
+bit; when set, the trailing rank is omitted and the decoder synthesizes
+DRAW directly. This is the dominant terminal pattern for W/L positions
+(run out of 50MR budget -> DRAW) and typically eliminates one rank from
+the majority of non-CONST entries. The hint piggybacks on the MSB of
+the last h byte (or the k byte for MULTI), free of bandwidth.
+
+A probe at hmc = k locates the position's state via a stride-256 prefix
+index over the 2-bit vector (built once at block-decompress time, cached
+alongside the block bytes), then follows the state's payload to pick the
+rank. CONST is a direct lookup; SINGLE/DOUBLE compare hmc to h/h1/h2;
+MULTI does the original mask + popcount over the changepoint bitmap.
+Random-access cost is O(STRIDE) state walking + O(1) per-stream offset
+math, independent of block size.
+
+The rank table is frequency-sorted W/L storage values only -- DRAW
+(storage 0) and ILLEGAL are WDL-companion-authoritative don't-cares
+that never occupy a rank slot. The draw-end hint synthesizes DRAW
+without a table lookup, and the upstream WDL guard ensures ILLEGAL
+never reaches the DTM50 read path. Blocks where every cell across every
+layer is DRAW or ILLEGAL emit zero compressed bytes -- a `usz==0`
+sentinel in the offset table tells the probe (and the generator-side
+flat sub-loader) to fill DRAW directly without paging the block in.
+Common for drawn-fortress materials and around large illegal-by-
+occupancy regions of the index space.
+
+Total storage is roughly an order of magnitude under the equivalent
+100-file-per-material per-hmc layout.
 
 ```sh
 ./chesstb -r KBNK --builddtm50

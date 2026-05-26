@@ -524,7 +524,14 @@ DTC_Final_Entry DTC_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 
 	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
 	if ((dso & 0xFFFFF) == 0)
-		return DTC_Final_Entry::make_illegal();
+	{
+		// Skip-block sentinel: every cell is DRAW or ILLEGAL (encoder folds
+		// both into a run-stitch don't-care). ILLEGAL never reaches this read
+		// — upstream WDL-table guard short-circuits before consulting DTC —
+		// and W/L would have forced a non-zero stored value at some cell, so
+		// returning DRAW is safe and matches the WDL companion's verdict.
+		return DTC_Final_Entry::make_draw();
+	}
 
 	thread_local TL_Block_FIFO tl;
 	const uint8_t* data = nullptr;
@@ -732,7 +739,14 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 
 	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
 	if ((dso & 0xFFFFF) == 0)
-		return DTM_Final_Entry::make_illegal();
+	{
+		// Skip-block sentinel: every cell is DRAW or ILLEGAL (encoder folds
+		// both into a run-stitch don't-care). ILLEGAL never reaches this read
+		// — upstream WDL-table guard short-circuits before consulting DTM —
+		// and W/L would have forced a non-zero stored value at some cell, so
+		// returning DRAW is safe and matches the WDL companion's verdict.
+		return DTM_Final_Entry::make_draw();
+	}
 
 	thread_local TL_Block_FIFO tl;
 	const uint8_t* data = nullptr;
@@ -864,44 +878,14 @@ void DTM50_Probe_File::load(const Piece_Config& ps, const std::filesystem::path&
 	}
 }
 
-Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
-{
-	for (size_t i = 0; i < pc.live; ++i)
-		if (pc.block_id[i] == block_id) return pc.data[i];
-
-	uint64_t dso, usz;
-	std::memcpy(&dso, pc.offset_tb + block_id * 16,     8);
-	std::memcpy(&usz, pc.offset_tb + block_id * 16 + 8, 8);
-	const size_t dsz  = dso & 0xFFFFFu;
-	const size_t doff = dso >> 20;
-
-	auto buf = std::make_shared<std::vector<uint8_t>>(usz, 0);
-	if (!pc.decomp) {
-		const size_t ppb = pc.block_positions;
-		const size_t eb = pc.entry_bytes;
-		const size_t max_payload = 8 + (ppb + 7) / 8
-			+ ppb * eb + 4 * (ppb + 1) + ppb * (1 + 16 + 100 * eb);
-		pc.decomp = std::make_unique<LZMA_Decompress_Helper>(max_payload);
-	}
-	const Const_Span<uint8_t> raw = pc.decomp->decompress(
-		Const_Span(pc.compressed_data + doff, dsz), usz);
-	std::memcpy(buf->data(), raw.data(), usz);
-
-	size_t slot;
-	if (pc.live < BLOCK_CACHE_SLOTS) { slot = pc.live++; }
-	else { slot = pc.next_slot; pc.next_slot = (pc.next_slot + 1) % BLOCK_CACHE_SLOTS; }
-	pc.block_id[slot] = block_id;
-	pc.data[slot] = buf;
-	return buf;
-}
-
 namespace {
 
-// Inclusive popcount: count set bits in `bm[0..bit]`.
-NODISCARD INLINE size_t popcount_prefix_inclusive(const uint8_t* bm, size_t bit)
+// Exclusive popcount: count set bits in the first `bit_count` bits of `bm`.
+NODISCARD INLINE size_t popcount_prefix_exclusive(const uint8_t* bm, size_t bit_count)
 {
-	const size_t full_bytes = bit / 8;
-	const size_t partial_bits = (bit & 7) + 1;
+	if (bit_count == 0) return 0;
+	const size_t full_bytes  = bit_count / 8;
+	const size_t partial     = bit_count & 7;
 	size_t pc = 0;
 	const size_t full_qw = full_bytes / 8;
 	for (size_t i = 0; i < full_qw; ++i)
@@ -912,12 +896,177 @@ NODISCARD INLINE size_t popcount_prefix_inclusive(const uint8_t* bm, size_t bit)
 	}
 	for (size_t i = full_qw * 8; i < full_bytes; ++i)
 		pc += __builtin_popcount(bm[i]);
-	const uint8_t last = bm[full_bytes] & static_cast<uint8_t>((1u << partial_bits) - 1u);
-	pc += __builtin_popcount(last);
+	if (partial > 0)
+	{
+		const uint8_t last = bm[full_bytes] & static_cast<uint8_t>((1u << partial) - 1u);
+		pc += __builtin_popcount(last);
+	}
 	return pc;
 }
 
+// Prefix counts of each per-position state in the 2-bit state vector, plus the
+// state at `pos`. State encoding (matches encoder in egtb_gen_dtm50.cpp):
+//   00 CONST   01 SINGLE   10 DOUBLE   11 MULTI
+// Within each byte: position p occupies bits (2p mod 8) and (2p mod 8)+1.
+struct State_Prefix
+{
+	uint32_t n_const;
+	uint32_t n_single;
+	uint32_t n_double;
+	uint32_t n_multi;
+	uint8_t  state_at_pos;
+};
+
+// Stride table built at block-decompress time. Each entry holds the cumulative
+// per-state count at position `stride_id * DTM50_PREFIX_STRIDE`. At read time
+// state_prefix only walks at most STRIDE-1 positions of state_bits from the
+// stride snapshot, replacing the O(block_positions) scan with O(STRIDE).
+constexpr size_t DTM50_PREFIX_STRIDE = 256;
+
+struct DTM50_Prefix_Entry
+{
+	uint32_t n_const;
+	uint32_t n_single;
+	uint32_t n_double;
+	uint32_t n_multi;
+};
+static_assert(sizeof(DTM50_Prefix_Entry) == 16);
+
+// Sum the SINGLE/DOUBLE/MULTI bits in [bit_lo, bit_hi). Caller decrements
+// `nonc` from the position span to recover the CONST count.
+INLINE void popcount_state_range(
+	const uint8_t* sb, size_t bit_lo, size_t bit_hi,
+	uint32_t& ns, uint32_t& nd, uint32_t& nm)
+{
+	constexpr uint64_t EVEN_MASK = 0x5555555555555555ull;
+	size_t bit = bit_lo;
+	while (bit + 64 <= bit_hi)
+	{
+		uint64_t w;
+		std::memcpy(&w, sb + bit / 8, 8);
+		const uint64_t lo = w & EVEN_MASK;
+		const uint64_t hi = (w >> 1) & EVEN_MASK;
+		ns += __builtin_popcountll(lo & ~hi);  // 01
+		nd += __builtin_popcountll(hi & ~lo);  // 10
+		nm += __builtin_popcountll(lo & hi);   // 11
+		bit += 64;
+	}
+	if (bit < bit_hi)
+	{
+		const size_t rem = bit_hi - bit;
+		uint64_t w = 0;
+		std::memcpy(&w, sb + bit / 8, (rem + 7) / 8);
+		const uint64_t mask = (rem == 64) ? ~uint64_t{0} : ((uint64_t{1} << rem) - 1);
+		w &= mask;
+		const uint64_t lo = w & EVEN_MASK;
+		const uint64_t hi = (w >> 1) & EVEN_MASK;
+		ns += __builtin_popcountll(lo & ~hi);
+		nd += __builtin_popcountll(hi & ~lo);
+		nm += __builtin_popcountll(lo & hi);
+	}
+}
+
+void build_dtm50_prefix_index(
+	const uint8_t* state_bits, size_t num_positions,
+	DTM50_Prefix_Entry* out, size_t n_strides)
+{
+	uint32_t nc = 0, ns = 0, nd = 0, nm = 0;
+	for (size_t s = 0; s < n_strides; ++s)
+	{
+		out[s] = { nc, ns, nd, nm };
+		const size_t p_lo = s * DTM50_PREFIX_STRIDE;
+		const size_t p_hi = std::min(p_lo + DTM50_PREFIX_STRIDE, num_positions);
+		const uint32_t ns_before = ns;
+		const uint32_t nd_before = nd;
+		const uint32_t nm_before = nm;
+		popcount_state_range(state_bits, p_lo * 2, p_hi * 2, ns, nd, nm);
+		const uint32_t added_nonc = (ns - ns_before) + (nd - nd_before) + (nm - nm_before);
+		nc += static_cast<uint32_t>(p_hi - p_lo) - added_nonc;
+	}
+}
+
+NODISCARD INLINE State_Prefix state_prefix_indexed(
+	const uint8_t* state_bits, const DTM50_Prefix_Entry* prefix, size_t pos)
+{
+	const size_t stride_id = pos / DTM50_PREFIX_STRIDE;
+	const DTM50_Prefix_Entry snap = prefix[stride_id];
+	const size_t bit_lo = stride_id * DTM50_PREFIX_STRIDE * 2;
+	const size_t bit_pos = pos * 2;
+
+	uint32_t ns = snap.n_single;
+	uint32_t nd = snap.n_double;
+	uint32_t nm = snap.n_multi;
+	const uint32_t ns_before = ns;
+	const uint32_t nd_before = nd;
+	const uint32_t nm_before = nm;
+	popcount_state_range(state_bits, bit_lo, bit_pos, ns, nd, nm);
+	const uint32_t added_nonc = (ns - ns_before) + (nd - nd_before) + (nm - nm_before);
+	const uint32_t walk_positions = static_cast<uint32_t>(pos - stride_id * DTM50_PREFIX_STRIDE);
+	const uint32_t nc = snap.n_const + walk_positions - added_nonc;
+	const uint8_t state_at_pos = (state_bits[bit_pos / 8] >> (bit_pos % 8)) & 3u;
+	return State_Prefix{ nc, ns, nd, nm, state_at_pos };
+}
+
 }  // namespace
+
+// Cached buffer layout for a non-skipped block:
+//   uint32 payload_size                              decompressed LZMA size
+//   uint8  payload[payload_size]                     raw block payload
+//   DTM50_Prefix_Entry prefix[n_strides]             precomputed state index
+// The 4-byte prefix lets read() locate the prefix table from the cached
+// `Block_Ptr` alone, without consulting the offset table again. Skipped blocks
+// (uniform-DRAW, usz==0) are short-circuited in read() before reaching here.
+Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
+{
+	for (size_t i = 0; i < pc.live; ++i)
+		if (pc.block_id[i] == block_id) return pc.data[i];
+
+	uint64_t dso, usz;
+	std::memcpy(&dso, pc.offset_tb + block_id * 16,     8);
+	std::memcpy(&usz, pc.offset_tb + block_id * 16 + 8, 8);
+	ASSERT(usz != 0);  // caller must check the skip sentinel before this
+	const size_t dsz  = dso & 0xFFFFFu;
+	const size_t doff = dso >> 20;
+
+	if (!pc.decomp) {
+		const size_t ppb = pc.block_positions;
+		const size_t eb = pc.entry_bytes;
+		const size_t max_payload =
+			24                                                  // header
+			+ (ppb * 2 + 7) / 8                                 // state_bits
+			+ ppb * eb                                          // all CONST
+			+ (ppb + 7) / 8 + ppb * (1 + 2 * eb)                // all SINGLE
+			+ (ppb + 7) / 8 + ppb * (2 + 3 * eb)                // all DOUBLE
+			+ (ppb + 1) * 4 + ppb * (1 + 16 + DTM50_HMC_COUNT * eb);  // all MULTI
+		pc.decomp = std::make_unique<LZMA_Decompress_Helper>(max_payload);
+	}
+	const Const_Span<uint8_t> raw = pc.decomp->decompress(
+		Const_Span(pc.compressed_data + doff, dsz), usz);
+
+	// Parse num_positions from the freshly decompressed header to size the
+	// prefix-index tail of the buffer.
+	uint32_t np32;
+	std::memcpy(&np32, raw.data(), 4);
+	const size_t n_strides = (np32 + DTM50_PREFIX_STRIDE - 1) / DTM50_PREFIX_STRIDE;
+	const size_t prefix_bytes = n_strides * sizeof(DTM50_Prefix_Entry);
+
+	auto buf = std::make_shared<std::vector<uint8_t>>(4 + usz + prefix_bytes, 0);
+	const uint32_t payload_size32 = static_cast<uint32_t>(usz);
+	std::memcpy(buf->data(), &payload_size32, 4);
+	std::memcpy(buf->data() + 4, raw.data(), usz);
+
+	constexpr size_t HEADER_BYTES = 24;
+	const uint8_t* state_bits = buf->data() + 4 + HEADER_BYTES;
+	auto* prefix = reinterpret_cast<DTM50_Prefix_Entry*>(buf->data() + 4 + usz);
+	build_dtm50_prefix_index(state_bits, np32, prefix, n_strides);
+
+	size_t slot;
+	if (pc.live < BLOCK_CACHE_SLOTS) { slot = pc.live++; }
+	else { slot = pc.next_slot; pc.next_slot = (pc.next_slot + 1) % BLOCK_CACHE_SLOTS; }
+	pc.block_id[slot] = block_id;
+	pc.data[slot] = buf;
+	return buf;
+}
 
 DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, uint16_t hmc)
 {
@@ -929,12 +1078,22 @@ DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, 
 	const size_t block_id = static_cast<size_t>(pos) / ppb;
 	const size_t pos_in_block = static_cast<size_t>(pos) % ppb;
 
+	// Block-skip sentinel: usz == 0 ⇒ uniform-DRAW block, no payload. Such a
+	// block by construction can only hold canonical-DRAW positions (any W/L
+	// position would force stored != 0 at some layer), and ILLEGAL positions
+	// never reach this read() — the upstream WDL-table guard short-circuits
+	// before probe_dtm50_internal. So wdl is always DRAW/cursed/blessed here,
+	// all of which decode to DRAW regardless of hmc.
+	uint64_t usz;
+	std::memcpy(&usz, pc.offset_tb + block_id * 16 + 8, 8);
+	if (usz == 0) return DTM_Final_Entry::make_draw();
+
 	thread_local TL_Block_FIFO tl;
-	const uint8_t* payload = nullptr;
+	const uint8_t* buf_data = nullptr;
 	for (size_t i = 0; i < TL_Block_FIFO::N; ++i)
 		if (tl.epoch[i] == pc.epoch && tl.block_id[i] == block_id)
-			{ payload = tl.bytes[i]->data(); break; }
-	if (!payload)
+			{ buf_data = tl.bytes[i]->data(); break; }
+	if (!buf_data)
 	{
 		std::lock_guard<std::mutex> lk(pc.mu);
 		Block_Ptr blk = get_block_locked(pc, block_id);
@@ -942,50 +1101,153 @@ DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, 
 		tl.epoch[s]    = pc.epoch;
 		tl.block_id[s] = block_id;
 		tl.bytes[s]    = blk;
-		payload = blk->data();
+		buf_data = blk->data();
 	}
+	// Cached buffer layout (see get_block_locked): [uint32 payload_size,
+	// payload..., prefix_index...].
+	uint32_t payload_size;
+	std::memcpy(&payload_size, buf_data, 4);
+	const uint8_t* payload = buf_data + 4;
+	const auto* prefix = reinterpret_cast<const DTM50_Prefix_Entry*>(
+		buf_data + 4 + payload_size);
 
-	uint32_t num_positions, num_nontrivial;
-	std::memcpy(&num_positions,  payload,     4);
-	std::memcpy(&num_nontrivial, payload + 4, 4);
-	const size_t num_trivial = num_positions - num_nontrivial;
+	// Block header (24 bytes): np, ns, nd, nm, ss_bytes, ds_bytes.
+	uint32_t num_positions, num_single, num_double, num_multi, ss_bytes32, ds_bytes32;
+	std::memcpy(&num_positions, payload,      4);
+	std::memcpy(&num_single,    payload + 4,  4);
+	std::memcpy(&num_double,    payload + 8,  4);
+	std::memcpy(&num_multi,     payload + 12, 4);
+	std::memcpy(&ss_bytes32,    payload + 16, 4);
+	std::memcpy(&ds_bytes32,    payload + 20, 4);
 	const size_t eb = pc.entry_bytes;
-	const size_t tbm_bytes = (num_positions + 7) / 8;
-	const uint8_t* T              = payload + 8;
-	const uint8_t* trivial_ranks  = T + tbm_bytes;
-	const uint32_t* nontrivial_dir = reinterpret_cast<const uint32_t*>(trivial_ranks + num_trivial * eb);
-	const uint8_t* nontrivial_data = reinterpret_cast<const uint8_t*>(nontrivial_dir + num_nontrivial + 1);
+	const size_t num_const = num_positions - num_single - num_double - num_multi;
+	const size_t sb_bytes  = (num_positions * 2 + 7) / 8;
+	const size_t sh_bytes  = (num_single + 7) / 8;
+	const size_t dh_bytes  = (num_double + 7) / 8;
 
-	const bool is_nontrivial = (T[pos_in_block >> 3] >> (pos_in_block & 7)) & 1u;
-	const size_t set_count = popcount_prefix_inclusive(T, pos_in_block);
+	const uint8_t* p = payload + 24;
+	const uint8_t* state_bits   = p;                p += sb_bytes;
+	const uint8_t* const_stream = p;                p += num_const * eb;
+	const uint8_t* single_hints = p;                p += sh_bytes;
+	const uint8_t* single_stream = p;               p += ss_bytes32;
+	const uint8_t* double_hints = p;                p += dh_bytes;
+	const uint8_t* double_stream = p;               p += ds_bytes32;
+	const uint32_t* multi_dir = reinterpret_cast<const uint32_t*>(p);
+	p += (num_multi + 1) * 4;
+	const uint8_t* multi_data = p;
 
-	uint16_t rank;
-	if (is_nontrivial)
+	const State_Prefix sp = state_prefix_indexed(state_bits, prefix, pos_in_block);
+
+	// Per-state entry sizes for SINGLE/DOUBLE (variable: short = draw-end).
+	const size_t single_short = 1 + eb;
+	const size_t single_long  = 1 + 2 * eb;
+	const size_t double_short = 2 + 2 * eb;
+	const size_t double_long  = 2 + 3 * eb;
+
+	// DRAW is no longer pinned to a rank: the draw-end hint synthesizes
+	// stored=0 directly, bypassing the rank→storage lookup. At hmc=0 this is
+	// unreachable (h ≥ 1 so the draw-end branch can't fire); at hmc>0
+	// dtm50_layered_entry_from_storage's stored==0 short-circuit produces DRAW,
+	// which upstream recover_mate_at_hmc lifts back to WIN/LOSE if needed.
+	uint16_t stored;
+	switch (sp.state_at_pos)
 	{
-		const size_t ntri_idx = set_count - 1;
-		const uint8_t* blk = nontrivial_data + nontrivial_dir[ntri_idx];
-		uint64_t lo, hi;
-		std::memcpy(&lo, blk + 1, 8);
-		std::memcpy(&hi, blk + 9, 8);
-		// Mask bits ≤ hmc; hmc ∈ [0,99] so the high word may be partial.
-		uint64_t mask_lo, mask_hi;
-		if (hmc < 63) { mask_lo = (uint64_t{1} << (hmc + 1)) - 1; mask_hi = 0; }
-		else if (hmc == 63) { mask_lo = ~uint64_t{0}; mask_hi = 0; }
-		else { mask_lo = ~uint64_t{0}; mask_hi = (uint64_t{1} << (hmc - 63)) - 1; }
-		const size_t k = static_cast<size_t>(__builtin_popcountll(lo & mask_lo))
-		               + static_cast<size_t>(__builtin_popcountll(hi & mask_hi)) - 1;
-		const uint8_t* vals = blk + 17;
-		if (eb == 1) rank = vals[k];
-		else         { uint16_t r; std::memcpy(&r, vals + k * 2, 2); rank = r; }
-	}
-	else
-	{
-		const size_t triv_idx = (pos_in_block + 1) - set_count - 1;
-		if (eb == 1) rank = trivial_ranks[triv_idx];
-		else         { uint16_t r; std::memcpy(&r, trivial_ranks + triv_idx * 2, 2); rank = r; }
+		case 0: {
+			// CONST: one rank, regardless of hmc.
+			const size_t idx = sp.n_const;
+			uint16_t rank;
+			if (eb == 1) rank = const_stream[idx];
+			else { uint16_t r; std::memcpy(&r, const_stream + idx * 2, 2); rank = r; }
+			stored = pc.rank_to_value[rank];
+			break;
+		}
+		case 1: {
+			// SINGLE: one transition at h. hmc < h → r0; else r1 (or DRAW).
+			const size_t idx = sp.n_single;
+			const size_t n_short = popcount_prefix_exclusive(single_hints, idx);
+			const size_t byte_off = n_short * single_short + (idx - n_short) * single_long;
+			const uint8_t* entry = single_stream + byte_off;
+			const bool draw_end = (single_hints[idx >> 3] >> (idx & 7)) & 1u;
+			const uint16_t h = entry[0] & 0x7Fu;
+			if (hmc < h)
+			{
+				uint16_t rank;
+				if (eb == 1) rank = entry[1];
+				else { uint16_t r; std::memcpy(&r, entry + 1, 2); rank = r; }
+				stored = pc.rank_to_value[rank];
+			}
+			else if (draw_end)
+			{
+				stored = 0;
+			}
+			else
+			{
+				uint16_t rank;
+				if (eb == 1) rank = entry[1 + eb];
+				else { uint16_t r; std::memcpy(&r, entry + 1 + eb, 2); rank = r; }
+				stored = pc.rank_to_value[rank];
+			}
+			break;
+		}
+		case 2: {
+			// DOUBLE: transitions at h1 < h2.
+			const size_t idx = sp.n_double;
+			const size_t n_short = popcount_prefix_exclusive(double_hints, idx);
+			const size_t byte_off = n_short * double_short + (idx - n_short) * double_long;
+			const uint8_t* entry = double_stream + byte_off;
+			const bool draw_end = (double_hints[idx >> 3] >> (idx & 7)) & 1u;
+			const uint16_t h1 = entry[0];
+			const uint16_t h2 = entry[1] & 0x7Fu;
+			size_t rsel;
+			if      (hmc < h1) rsel = 0;
+			else if (hmc < h2) rsel = 1;
+			else               rsel = 2;
+			if (rsel == 2 && draw_end)
+			{
+				stored = 0;
+			}
+			else
+			{
+				const uint8_t* rp = entry + 2 + rsel * eb;
+				uint16_t rank;
+				if (eb == 1) rank = *rp;
+				else { uint16_t r; std::memcpy(&r, rp, 2); rank = r; }
+				stored = pc.rank_to_value[rank];
+			}
+			break;
+		}
+		default: {
+			// MULTI: full 100-bit changepoint bitmap; popcount(bits ≤ hmc) - 1.
+			const size_t idx = sp.n_multi;
+			const uint8_t* entry = multi_data + multi_dir[idx];
+			const uint8_t kbyte = entry[0];
+			const bool draw_end = (kbyte & 0x80u) != 0;
+			const size_t k = kbyte & 0x7Fu;
+			uint64_t lo, hi;
+			std::memcpy(&lo, entry + 1, 8);
+			std::memcpy(&hi, entry + 9, 8);
+			uint64_t mask_lo, mask_hi;
+			if      (hmc < 63)  { mask_lo = (uint64_t{1} << (hmc + 1)) - 1; mask_hi = 0; }
+			else if (hmc == 63) { mask_lo = ~uint64_t{0}; mask_hi = 0; }
+			else                { mask_lo = ~uint64_t{0}; mask_hi = (uint64_t{1} << (hmc - 63)) - 1; }
+			const size_t rsel = static_cast<size_t>(__builtin_popcountll(lo & mask_lo))
+			                  + static_cast<size_t>(__builtin_popcountll(hi & mask_hi)) - 1;
+			if (rsel == k - 1 && draw_end)
+			{
+				stored = 0;
+			}
+			else
+			{
+				const uint8_t* rp = entry + 17 + rsel * eb;
+				uint16_t rank;
+				if (eb == 1) rank = *rp;
+				else { uint16_t r; std::memcpy(&r, rp, 2); rank = r; }
+				stored = pc.rank_to_value[rank];
+			}
+			break;
+		}
 	}
 
-	const uint16_t stored = pc.rank_to_value[rank];
 	return hmc == 0
 		? dtm50_entry_from_storage(stored, wdl)
 		: dtm50_layered_entry_from_storage(stored, wdl);

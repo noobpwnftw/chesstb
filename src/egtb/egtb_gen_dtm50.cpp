@@ -618,17 +618,18 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 
 namespace {
 
-// =============================================================================
-// save_to_disk: pack 100 hmc layers into a single .lzdtm50 via a layer-axis
-// change-point encoding, plus a sidecar .info with hmc=0 stats.
+// save_to_disk: pack 100 hmc layers into a single .lzdtm50, plus a sidecar
+// .info with hmc=0 stats. See README "Pack layout" for the design rationale
+// (2-bit state classification, draw-end hint, uniform-DRAW skip sentinel,
+// rank table excludes DRAW). This block is the on-disk byte spec, kept here
+// alongside the encoder so the layout is one Ctrl-F away from save/load code.
 //
 // File layout:
 //   uint32  magic = EGTB_Magic::DTM50_MAGIC
 //   uint32  key_and_table_num
-//   per-color:
+//   per-color header:
 //     uint8  flag (SINGULAR bit set ⇒ singular-WDL color)
-//     if SINGULAR:
-//       uint8 singular_wdl
+//     if SINGULAR: uint8 singular_wdl
 //     else:
 //       uint8  entry_bytes  (1 or 2)
 //       uint32 block_positions
@@ -636,25 +637,33 @@ namespace {
 //       uint32 tail_positions
 //       uint64 data_size
 //       uint16 num_ranks
-//       uint16 rank_to_value[num_ranks]
-//   per-color (non-singular): offset_tb[block_cnt] of (uint64 dso, uint64 usz)
-//     where dso = (doff << 20) | dsz
+//       uint16 rank_to_value[num_ranks]    W/L storage values, frequency-sorted
+//   per-color offset table (non-singular): block_cnt × (uint64 dso, uint64 usz)
+//     dso = (doff << 20) | dsz;  usz == 0 ⇒ skip sentinel (uniform DRAW/ILLEGAL,
+//     no payload bytes; probe / flat loader fill DRAW).
 //   align 64
-//   per-color (non-singular): compressed data, ceil64-aligned tail
+//   per-color compressed data (non-singular), ceil64-aligned tail
 //   end-checksum (8 bytes, xxhash with EGTB_CHECKSUM_INIT_VALUE)
 //
 // Per-block uncompressed payload (LZMA-compressed before write):
 //   uint32 num_positions
-//   uint32 num_nontrivial
-//   uint8  T_bitmap[ceil(num_positions/8)]    bit i ⇒ position i has ≥1 transition
-//   uint8  trivial_ranks[(num_positions - num_nontrivial) * entry_bytes]
-//   uint32 nontrivial_dir[num_nontrivial + 1]  cumulative byte offsets
-//   uint8  nontrivial_data[...]
-//     per non-trivial position:
-//       uint8  change_count           (1..HMC_COUNT)
-//       uint8  changepoint_bitmap[16] (100 bits used)
-//       uint8  value_ranks[change_count * entry_bytes]
-// =============================================================================
+//   uint32 num_single, num_double, num_multi       (state==01/10/11 counts;
+//                                                   num_const = np - others)
+//   uint32 single_stream_bytes, double_stream_bytes
+//   uint8  state_bits[ceil(np*2/8)]                2 bpp: 00 CONST 01 SINGLE
+//                                                          10 DOUBLE 11 MULTI
+//   uint8  const_stream[num_const * eb]            ILLEGAL emits last_legal_rank
+//   uint8  single_hints[ceil(num_single/8)]        bit set ⇒ trailing rank is
+//                                                  DRAW (omitted from payload)
+//   uint8  single_stream[...]   per SINGLE: uint8 h|(draw_end ? 0x80 : 0),
+//                                           rank r0, [rank r1 if !draw_end]
+//   uint8  double_hints[ceil(num_double/8)]        bit set ⇒ r2 is DRAW
+//   uint8  double_stream[...]   per DOUBLE: uint8 h1, uint8 h2|(draw_end?0x80:0),
+//                                           rank r0, r1, [r2 if !draw_end]
+//   uint32 multi_dir[num_multi + 1]                cumulative byte offsets
+//   uint8  multi_stream[...]    per MULTI: uint8 k|(draw_end ? 0x80 : 0),
+//                                          uint8 cp_bitmap[16] (100 bits used),
+//                                          rank r0..r_{k-1}  (k-1 if draw_end)
 
 // 1 << 19 matches DTC/DTM's 1 MB raw block at 2 B/pos.
 constexpr uint32_t RS_BLOCK_POSITIONS = 1u << 19;
@@ -692,32 +701,72 @@ INLINE void write_rank_bytes(std::vector<uint8_t>& dst, uint16_t r, uint8_t eb)
 	}
 }
 
-// ILLEGAL positions emit the most recent legal rank so LZMA sees long same-rank
-// runs spanning illegal/legal stretches. Worker-owned; scratch is reused.
+// Per-position classification across the 100 hmc layers:
+//   state 00 = CONST   — value constant across all 100 layers (incl. ILLEGAL
+//                        which emits last_legal_rank to keep LZMA runs long)
+//   state 01 = SINGLE  — exactly one transition
+//   state 10 = DOUBLE  — exactly two transitions
+//   state 11 = MULTI   — three or more transitions
+//
+// The "ends in DRAW" terminator is the dominant pattern when a W/L position
+// runs out of 50MR budget. Each non-CONST state has a per-entry hint bit; when
+// set, the trailing rank value is omitted from the payload and the decoder
+// synthesizes DRAW directly (sets stored=0 and lets the wdl-aware decode
+// helpers do the right thing). For SINGLE/DOUBLE the hint piggybacks on the
+// MSB of the final h byte; for MULTI it piggybacks on the MSB of the
+// change_count byte (k ≤ 100 < 128). DRAW values are detected at encode time
+// via the NO_RANK sentinel from value_to_rank — DRAW (storage 0) is excluded
+// from the rank table unless it's also needed by LOSS-in-0.
+//
+// Random access: state_bits is 2 bits per position. To locate the j-th SINGLE,
+// the decoder popcounts the SINGLE-mask of state_bits[0..pos), then walks
+// single_hints[0..j) to compute the byte offset (2 B if hint set, 2+eb otherwise).
+// Same for DOUBLE. MULTI keeps its full directory because k varies.
+//
+// ILLEGAL positions emit the most recent legal rank into const_stream so LZMA
+// sees long same-rank runs spanning illegal/legal stretches. Worker-owned;
+// scratch is reused.
 struct RS_Block_Encoder
 {
+	// DTM50_Rank_Table::NO_RANK doubles as the encoder's "this value is DRAW
+	// and isn't in the rank table" sentinel. Monotonicity (DTM steps up then
+	// flips to DRAW, never back) guarantees DRAW only appears as a constant or
+	// as the terminal transition value, so the sentinel is only valid at the
+	// last cr[] slot or as cr[0] when k == 1.
+	static constexpr uint16_t DRAW_SENTINEL = DTM50_Rank_Table::NO_RANK;
+
 	const DTM50_Rank_Table* ranks = nullptr;
-	std::vector<uint8_t> T_bitmap;
-	std::vector<uint8_t> trivial_ranks;
-	std::vector<uint32_t> nontrivial_dir;
-	std::vector<uint8_t> nontrivial_data;
+	std::vector<uint8_t> state_bits;        // 2 bits/position
+	std::vector<uint8_t> const_stream;      // 1 rank/position in state==CONST
+	std::vector<uint8_t> single_hints;      // 1 bit per SINGLE position
+	std::vector<uint8_t> single_stream;     // variable: 2 B or 1+2·eb B
+	std::vector<uint8_t> double_hints;      // 1 bit per DOUBLE position
+	std::vector<uint8_t> double_stream;     // variable: 2+2·eb B or 2+3·eb B
+	std::vector<uint32_t> multi_dir;        // cumulative byte offsets
+	std::vector<uint8_t> multi_stream;      // [k|hint, 16B bm, (k-hint) ranks]
 	std::vector<uint8_t> out;
 
 	NODISCARD Const_Span<uint8_t> encode(const uint16_t* values, size_t num_positions)
 	{
 		ASSERT(ranks != nullptr);
 		const uint8_t eb = ranks->entry_bytes;
-		const size_t tbm_bytes = (num_positions + 7) / 8;
-		T_bitmap.assign(tbm_bytes, 0);
-		trivial_ranks.clear();
-		nontrivial_dir.clear();
-		nontrivial_dir.push_back(0);
-		nontrivial_data.clear();
+		const size_t sb_bytes = (num_positions * 2 + 7) / 8;
+		state_bits.assign(sb_bytes, 0);
+		const_stream.clear();
+		single_hints.clear();
+		single_stream.clear();
+		double_hints.clear();
+		double_stream.clear();
+		multi_dir.clear();
+		multi_dir.push_back(0);
+		multi_stream.clear();
 
-		std::array<uint16_t, DTM50_HMC_COUNT> changepoints{};
-		std::array<uint16_t, DTM50_HMC_COUNT> change_ranks{};
+		std::array<uint16_t, DTM50_HMC_COUNT> cp{};
+		std::array<uint16_t, DTM50_HMC_COUNT> cr{};
 
-		uint16_t last_legal_rank = 0;
+		uint16_t last_legal_rank = 0;  // any rank works; ILLEGAL never decodes
+		uint32_t num_single = 0;
+		uint32_t num_double = 0;
 
 		for (size_t i = 0; i < num_positions; ++i)
 		{
@@ -732,81 +781,165 @@ struct RS_Block_Encoder
 			}
 			if (is_illegal)
 			{
-				write_rank_bytes(trivial_ranks, last_legal_rank, eb);
+				// State 00; bits already zero. Emit last_legal_rank so LZMA
+				// sees a long same-rank run across illegal/legal stretches.
+				write_rank_bytes(const_stream, last_legal_rank, eb);
 				continue;
 			}
 
 			size_t k = 0;
-			uint16_t prev = ranks->rank_of(values[0 * num_positions + i]);
-			changepoints[k] = 0;
-			change_ranks[k] = prev;
-			++k;
+			uint16_t prev = ranks->value_to_rank[values[0 * num_positions + i]];
+			cp[k] = 0; cr[k] = prev; ++k;
 			for (int h = 1; h < DTM50_HMC_COUNT; ++h)
 			{
-				const uint16_t r = ranks->rank_of(values[h * num_positions + i]);
-				if (r != prev)
-				{
-					changepoints[k] = static_cast<uint16_t>(h);
-					change_ranks[k] = r;
-					prev = r;
-					++k;
-				}
+				const uint16_t r = ranks->value_to_rank[values[h * num_positions + i]];
+				if (r != prev) { cp[k] = static_cast<uint16_t>(h); cr[k] = r; prev = r; ++k; }
 			}
 
 			if (k == 1)
 			{
-				last_legal_rank = change_ranks[0];
-				write_rank_bytes(trivial_ranks, last_legal_rank, eb);
-				continue;
+				// CONST. state bits already zero. If the constant is DRAW the
+				// value isn't in the rank table — emit a placeholder rank 0
+				// (probe-time wdl=DRAW overrides the lookup result anyway).
+				const uint16_t r = (cr[0] == DRAW_SENTINEL) ? 0u : cr[0];
+				last_legal_rank = r;
+				write_rank_bytes(const_stream, r, eb);
 			}
-
-			T_bitmap[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
-			const size_t base = nontrivial_data.size();
-			nontrivial_data.push_back(static_cast<uint8_t>(k));
-			uint8_t bm[16] = { 0 };
-			for (size_t j = 0; j < k; ++j)
+			else if (k == 2)
 			{
-				const uint16_t h = changepoints[j];
-				bm[h / 8] |= static_cast<uint8_t>(1u << (h % 8));
+				set_state(i, 1);
+				const uint16_t h1 = cp[1];
+				ASSERT(h1 >= 1 && h1 <= 99);
+				ASSERT(cr[0] != DRAW_SENTINEL);  // monotonicity: DRAW is terminal
+				const bool draw_end = (cr[1] == DRAW_SENTINEL);
+				push_bit(single_hints, num_single, draw_end);
+				single_stream.push_back(
+					static_cast<uint8_t>(h1 | (draw_end ? 0x80u : 0u)));
+				write_rank_bytes(single_stream, cr[0], eb);
+				if (!draw_end) write_rank_bytes(single_stream, cr[1], eb);
+				++num_single;
+				last_legal_rank = draw_end ? cr[0] : cr[1];
 			}
-			nontrivial_data.insert(nontrivial_data.end(), bm, bm + 16);
-			for (size_t j = 0; j < k; ++j)
-				write_rank_bytes(nontrivial_data, change_ranks[j], eb);
-			nontrivial_dir.push_back(static_cast<uint32_t>(nontrivial_data.size() - base));
+			else if (k == 3)
+			{
+				set_state(i, 2);
+				const uint16_t h1 = cp[1], h2 = cp[2];
+				ASSERT(h1 >= 1 && h2 >= 2 && h1 < h2 && h2 <= 99);
+				ASSERT(cr[0] != DRAW_SENTINEL && cr[1] != DRAW_SENTINEL);
+				const bool draw_end = (cr[2] == DRAW_SENTINEL);
+				push_bit(double_hints, num_double, draw_end);
+				double_stream.push_back(static_cast<uint8_t>(h1));
+				double_stream.push_back(
+					static_cast<uint8_t>(h2 | (draw_end ? 0x80u : 0u)));
+				write_rank_bytes(double_stream, cr[0], eb);
+				write_rank_bytes(double_stream, cr[1], eb);
+				if (!draw_end) write_rank_bytes(double_stream, cr[2], eb);
+				++num_double;
+				last_legal_rank = draw_end ? cr[1] : cr[2];
+			}
+			else
+			{
+				set_state(i, 3);
+				const bool draw_end = (cr[k - 1] == DRAW_SENTINEL);
+				for (size_t j = 0; j + 1 < k; ++j)
+					ASSERT(cr[j] != DRAW_SENTINEL);  // intermediates are never DRAW
+				const size_t base = multi_stream.size();
+				multi_stream.push_back(
+					static_cast<uint8_t>(k | (draw_end ? 0x80u : 0u)));
+				uint8_t bm[16] = { 0 };
+				for (size_t j = 0; j < k; ++j)
+				{
+					const uint16_t h = cp[j];
+					bm[h / 8] |= static_cast<uint8_t>(1u << (h % 8));
+				}
+				multi_stream.insert(multi_stream.end(), bm, bm + 16);
+				const size_t to_write = draw_end ? (k - 1) : k;
+				for (size_t j = 0; j < to_write; ++j)
+					write_rank_bytes(multi_stream, cr[j], eb);
+				multi_dir.push_back(static_cast<uint32_t>(multi_stream.size() - base));
+				last_legal_rank = draw_end ? cr[k - 2] : cr[k - 1];
+			}
 		}
 
-		for (size_t i = 1; i < nontrivial_dir.size(); ++i)
-			nontrivial_dir[i] += nontrivial_dir[i - 1];
+		for (size_t i = 1; i < multi_dir.size(); ++i)
+			multi_dir[i] += multi_dir[i - 1];
 
-		const uint32_t num_nontrivial = static_cast<uint32_t>(nontrivial_dir.size() - 1);
-		const uint32_t num_trivial = static_cast<uint32_t>(num_positions) - num_nontrivial;
+		const uint32_t np32 = static_cast<uint32_t>(num_positions);
+		const uint32_t num_multi = static_cast<uint32_t>(multi_dir.size() - 1);
+		// num_const derives as np - num_single - num_double - num_multi.
+		const size_t sh_bytes = (num_single + 7) / 8;
+		const size_t dh_bytes = (num_double + 7) / 8;
+		ASSERT(single_hints.size() == sh_bytes);
+		ASSERT(double_hints.size() == dh_bytes);
+
+		const uint32_t ss_bytes32 = static_cast<uint32_t>(single_stream.size());
+		const uint32_t ds_bytes32 = static_cast<uint32_t>(double_stream.size());
 
 		const size_t total =
-			8
-			+ tbm_bytes
-			+ static_cast<size_t>(num_trivial) * eb
-			+ nontrivial_dir.size() * 4
-			+ nontrivial_data.size();
+			4 + 4 + 4 + 4 + 4 + 4                  // np, ns, nd, nm, ss_bytes, ds_bytes
+			+ sb_bytes                              // state_bits (2 bpp)
+			+ const_stream.size()                   // const_stream
+			+ sh_bytes + single_stream.size()       // SINGLE: hint bitmap + variable payload
+			+ dh_bytes + double_stream.size()       // DOUBLE: hint bitmap + variable payload
+			+ multi_dir.size() * 4                  // multi_dir (cumulative offsets)
+			+ multi_stream.size();                  // multi_stream
+
 		out.assign(total, 0);
 		size_t off = 0;
-		const uint32_t np32 = static_cast<uint32_t>(num_positions);
-		std::memcpy(out.data() + off, &np32, 4); off += 4;
-		std::memcpy(out.data() + off, &num_nontrivial, 4); off += 4;
-		std::memcpy(out.data() + off, T_bitmap.data(), tbm_bytes); off += tbm_bytes;
-		if (!trivial_ranks.empty())
+		std::memcpy(out.data() + off, &np32,        4); off += 4;
+		std::memcpy(out.data() + off, &num_single,  4); off += 4;
+		std::memcpy(out.data() + off, &num_double,  4); off += 4;
+		std::memcpy(out.data() + off, &num_multi,   4); off += 4;
+		std::memcpy(out.data() + off, &ss_bytes32,  4); off += 4;
+		std::memcpy(out.data() + off, &ds_bytes32,  4); off += 4;
+		std::memcpy(out.data() + off, state_bits.data(), sb_bytes); off += sb_bytes;
+		if (!const_stream.empty())
 		{
-			std::memcpy(out.data() + off, trivial_ranks.data(), trivial_ranks.size());
-			off += trivial_ranks.size();
+			std::memcpy(out.data() + off, const_stream.data(), const_stream.size());
+			off += const_stream.size();
 		}
-		std::memcpy(out.data() + off, nontrivial_dir.data(), nontrivial_dir.size() * 4);
-		off += nontrivial_dir.size() * 4;
-		if (!nontrivial_data.empty())
+		if (sh_bytes != 0)
 		{
-			std::memcpy(out.data() + off, nontrivial_data.data(), nontrivial_data.size());
-			off += nontrivial_data.size();
+			std::memcpy(out.data() + off, single_hints.data(), sh_bytes);
+			off += sh_bytes;
+		}
+		if (!single_stream.empty())
+		{
+			std::memcpy(out.data() + off, single_stream.data(), single_stream.size());
+			off += single_stream.size();
+		}
+		if (dh_bytes != 0)
+		{
+			std::memcpy(out.data() + off, double_hints.data(), dh_bytes);
+			off += dh_bytes;
+		}
+		if (!double_stream.empty())
+		{
+			std::memcpy(out.data() + off, double_stream.data(), double_stream.size());
+			off += double_stream.size();
+		}
+		std::memcpy(out.data() + off, multi_dir.data(), multi_dir.size() * 4);
+		off += multi_dir.size() * 4;
+		if (!multi_stream.empty())
+		{
+			std::memcpy(out.data() + off, multi_stream.data(), multi_stream.size());
+			off += multi_stream.size();
 		}
 		ASSERT(off == total);
 		return Const_Span<uint8_t>(out.data(), out.size());
+	}
+
+private:
+	INLINE void set_state(size_t pos, uint8_t s)
+	{
+		const size_t bit_off = pos * 2;
+		state_bits[bit_off / 8] |= static_cast<uint8_t>((s & 3u) << (bit_off % 8));
+	}
+
+	static INLINE void push_bit(std::vector<uint8_t>& bm, uint32_t bit_idx, bool v)
+	{
+		if ((bit_idx % 8) == 0) bm.push_back(0);
+		if (v) bm.back() |= static_cast<uint8_t>(1u << (bit_idx % 8));
 	}
 };
 
@@ -876,7 +1009,13 @@ NODISCARD bool gather_dtm50_info(
 				{
 					const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(p));
 					const uint16_t v = dtm_value_for_storage(e);
-					if (v != DTM_Final_Entry::ILLEGAL_VAL) seen[v] = 1;
+					// DRAW (storage 0) and ILLEGAL are WDL-companion-authoritative
+					// don't-cares: the encoder synthesizes DRAW via the draw-end
+					// hint (non-CONST) or a placeholder rank (CONST), so storage 0
+					// never needs to be in the rank table on DRAW's account.
+					// LOSS-in-0 also stores as 0; if any exist they bring storage 0
+					// into the histogram organically.
+					if (v != DTM_Final_Entry::ILLEGAL_VAL && !e.is_draw()) seen[v] = 1;
 					if (gather_info)
 					{
 						const uint64_t w = epsi.orbit_weight(didx);
@@ -896,13 +1035,19 @@ NODISCARD bool gather_dtm50_info(
 		for (size_t v = 0; v < DTM50_Rank_Table::LUT_SIZE; ++v)
 			if (per_layer_seen[h][v]) ++score[v];
 
+	// Detect "no W/L values seen at all" (whole-table DRAW/ILLEGAL) → caller
+	// marks the color singular-DRAW. We exclude DRAW from `seen` above, so this
+	// also fires when every position is canonical-DRAW.
 	std::vector<uint16_t> values;
 	values.reserve(64);
 	for (size_t v = 0; v < DTM50_Rank_Table::LUT_SIZE; ++v)
 		if (score[v] != 0) values.push_back(static_cast<uint16_t>(v));
-
 	if (values.empty()) return false;
 
+	// Frequency sort. No DRAW pinning: the encoder uses NO_RANK as a sentinel
+	// for DRAW values not in the table, the decoder's draw-end branches set
+	// stored=0 directly, and CONST canonical-DRAW positions emit a placeholder
+	// rank (overridden at probe by dtm50_entry_from_storage's wdl=DRAW arm).
 	std::sort(values.begin(), values.end(),
 		[&](uint16_t a, uint16_t b) {
 			if (score[a] != score[b]) return score[a] > score[b];
@@ -975,6 +1120,14 @@ void save_compress_dtm50(
 			const size_t want_lo = group_id_of_pos(p_base);
 			const size_t want_hi = group_id_of_pos(p_base + this_bp - 1);
 
+			// "No live W/L information" → block-skip sentinel candidate.
+			// DRAW stores as 0; ILLEGAL stores as ILLEGAL_VAL. Both are safe to
+			// collapse to DRAW at probe time: DRAW round-trips, and ILLEGAL
+			// cells never reach the probe (upstream WDL guard) nor get read
+			// from the flat loader's array (only legal child indices are
+			// resolved by callers). Any other value means at least one cell is
+			// W/L at some layer and we must encode the block normally.
+			bool uniform_skip = true;
 			for (int h = 0; h < DTM50_HMC_COUNT; ++h)
 			{
 				DTM50_Pinned_Range pin(cache, dtm50_table_idx_of(color, h), want_lo, want_hi);
@@ -983,8 +1136,21 @@ void save_compress_dtm50(
 				for (size_t k = 0; k < this_bp; ++k)
 				{
 					const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(p_base + k));
-					row[k] = dtm_value_for_storage(e);
+					const uint16_t v = dtm_value_for_storage(e);
+					row[k] = v;
+					if (v != 0 && v != DTM_Final_Entry::ILLEGAL_VAL)
+						uniform_skip = false;
 				}
+			}
+
+			if (uniform_skip)
+			{
+				// Emit zero compressed bytes. save_dtm50_table writes
+				// (dso=offset, usz=0); probe / flat loader check usz==0.
+				out.usizes[b] = 0;
+				out.compressed_blocks[b].clear();
+				progress_bar += this_bp * DTM50_HMC_COUNT;
+				continue;
 			}
 
 			const Const_Span<uint8_t> payload = encoder.encode(chunk.data(), this_bp);

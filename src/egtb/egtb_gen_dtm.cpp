@@ -1106,7 +1106,11 @@ void gather_dtm_info(
 				info.add_result(color, e.wdl(), w);
 				if (e.is_win())
 					info.maybe_update_longest_win(color, idx, e.value());
-				if (!e.is_illegal())
+				// DRAW and ILLEGAL are both WDL-shortcuttable at probe time
+				// (the .lzw companion decides class first; DTM bytes for these
+				// cells are never read). Excluding them from the histogram lets
+				// the rank table allocate its short codes to W/L values.
+				if (!e.is_illegal() && !e.is_draw())
 				{
 					// DTM halves storage in both tiers (parity invariant), so a
 					// single histogram over halved values suffices. hist_2b is

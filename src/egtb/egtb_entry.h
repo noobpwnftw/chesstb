@@ -262,8 +262,15 @@ NODISCARD constexpr uint16_t dtc_value_for_storage(DTC_Final_Entry e)
 
 // Decode pairs with the round-up encode in dtc_value_for_storage:
 // recovers v=101, 103, ... exactly; v=102, 104, ... as v-1.
+//
+// DRAW positions go through here too but their stored bits are don't-care:
+// the encoder folds DRAW into the same run-stitch class as ILLEGAL, so a DRAW
+// cell carries the stitched W/L neighbor value, not zero. Synthesize DRAW from
+// the WDL companion's verdict instead of returning the garbage stored bits.
+// (dtm_entry_from_storage already does this via its default arm.)
 NODISCARD constexpr DTC_Final_Entry dtc_entry_from_storage(DTC_Final_Entry stored, WDL_Entry w, size_t entry_bytes)
 {
+	if (w == WDL_Entry::DRAW) return DTC_Final_Entry::make_draw();
 	return (entry_bytes == 1 && (w == WDL_Entry::CURSED_WIN || w == WDL_Entry::BLESSED_LOSS))
 		? DTC_Final_Entry::make_score(static_cast<DTC_Score>((static_cast<uint16_t>(stored.value()) << 1) - 1))
 		: stored;

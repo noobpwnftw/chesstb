@@ -1,5 +1,6 @@
 #pragma once
 
+#include "egtb/egtb_compress.h"
 #include "egtb/egtb_gen.h"
 #include "egtb/egtb_entry.h"
 #include "egtb/egtb_probe.h"
@@ -37,8 +38,6 @@
 //
 // hmc=99 of each fusion runs the full chess-legality check per cell; every
 // lower-hmc layer piggybacks the ILLEGAL flag from opp[k+1] at the same idx.
-
-inline constexpr int DTM50_HMC_COUNT = 100;
 
 struct DTM50_Interrupted
 {

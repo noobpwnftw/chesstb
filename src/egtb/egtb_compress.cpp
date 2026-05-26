@@ -198,9 +198,17 @@ size_t LZMA_Rank_Compress_Helper::compress(Span<uint8_t> dest, Const_Span<uint8_
 
 	// Single storage callback covers both tiers. DTC's 2B path returns raw
 	// VALUE_MASK bits; DTM's path always halves (parity-lossless).
+	//
+	// Collapse DRAW (m_data == 0 for both DTC and DTM) into the same sentinel
+	// as ILLEGAL so prepare_entries_for_compression run-stitches both classes
+	// with neighboring W/L values. Probe-time is unaffected: the .lzw
+	// companion shortcuts DRAW/ILLEGAL before any DTC/DTM byte is consulted,
+	// so the stitched value is never read back. m_data == 0 is a sufficient
+	// DRAW test because finalized W/L entries always have a class flag set
+	// (DTC_FLAG_WIN/LOSS, DTM_FLAG_WIN/LOSS) and ILLEGAL has m_data == VALUE_MASK.
 	const uint16_t illegal_v = m_storage_fn(DTC_Final_Entry::ILLEGAL_VAL, m_entry_bytes);
 	for (size_t i = 0; i < entries; ++i)
-		work[i] = m_storage_fn(in[i], m_entry_bytes);
+		work[i] = (in[i] == 0) ? illegal_v : m_storage_fn(in[i], m_entry_bytes);
 
 	if (!prepare_entries_for_compression<uint16_t>(Span<uint16_t>(work, entries), illegal_v))
 		return 0;
@@ -945,9 +953,13 @@ void load_dtm_sub_flat(
 
 					if (dsz == 0)
 					{
-						// All-ILLEGAL block.
-						for (size_t k = 0; k < positions; ++k)
-							out[pos + k] = DTM_Final_Entry::make_illegal();
+						// Don't-care block: every cell is DRAW or ILLEGAL (the
+						// encoder folds both classes into the same run-stitch
+						// sentinel). Blank-fill DRAW — same justification as the
+						// singular-DRAW path above: ILLEGAL slots are allocated
+						// but never probed (sub-TB callers always resolve to a
+						// legal child idx).
+						std::memset(out + pos, 0, positions * sizeof(DTM_Final_Entry));
 						continue;
 					}
 
@@ -1102,10 +1114,16 @@ void load_dtm50_sub_flat(
 		const size_t eb = entry_bytes[i];
 		std::atomic<size_t> next_block(0);
 
-		// Decompress buffer must hold the worst-case payload (every position
-		// non-trivial with all 100 layers distinct).
-		const size_t max_payload = 8 + (ppb + 7) / 8
-			+ ppb * eb + 4 * (ppb + 1) + ppb * (1 + 16 + 100 * eb);
+		// Decompress buffer must hold the worst-case payload across all four
+		// state regions (positions are mutually exclusive across states, so this
+		// strictly overestimates).
+		const size_t max_payload =
+			24                                                  // header
+			+ (ppb * 2 + 7) / 8                                 // state_bits
+			+ ppb * eb                                          // all CONST
+			+ (ppb + 7) / 8 + ppb * (1 + 2 * eb)                // all SINGLE
+			+ (ppb + 7) / 8 + ppb * (2 + 3 * eb)                // all DOUBLE
+			+ (ppb + 1) * 4 + ppb * (1 + 16 + DTM50_HMC_COUNT * eb);  // all MULTI
 
 		thread_pool->run_sync_task_on_all_threads([&](size_t thread_id) {
 			LZMA_Decompress_Helper dc_helper(max_payload);
@@ -1125,51 +1143,112 @@ void load_dtm50_sub_flat(
 					(bidx == blocks - 1 && tail_positions[i] != 0) ? tail_positions[i] : ppb;
 				const size_t base_pos = bidx * ppb;
 
+				// Block-skip sentinel: usz==0 → uniform-DRAW block, no payload.
+				// Same logic as the singular-DRAW path above — ILLEGAL cells in
+				// the flat array are allocated but never probed (sub-TB callers
+				// always resolve to legal child indices), so writing DRAW for
+				// every cell in the range is safe.
+				if (usz == 0)
+				{
+					std::memset(out + base_pos, 0,
+						this_bp * sizeof(DTM_Final_Entry));
+					continue;
+				}
+
 				const Const_Span<uint8_t> raw = dc_helper.decompress(
 					Const_Span<uint8_t>(data[i] + doff, dsz), usz);
 
 				const uint8_t* p = raw.data();
-				uint32_t np32, ntri32;
-				std::memcpy(&np32,  p,     4);
-				std::memcpy(&ntri32, p + 4, 4);
+				uint32_t np32, num_single, num_double, num_multi, ss_bytes32, ds_bytes32;
+				std::memcpy(&np32,       p,      4);
+				std::memcpy(&num_single, p + 4,  4);
+				std::memcpy(&num_double, p + 8,  4);
+				std::memcpy(&num_multi,  p + 12, 4);
+				std::memcpy(&ss_bytes32, p + 16, 4);
+				std::memcpy(&ds_bytes32, p + 20, 4);
 				ASSERT(np32 == this_bp);
-				const size_t num_nontrivial = ntri32;
-				const size_t num_trivial = this_bp - num_nontrivial;
-				p += 8;
+				const size_t num_const  = np32 - num_single - num_double - num_multi;
+				const size_t sb_bytes   = (np32 * 2 + 7) / 8;
+				const size_t sh_bytes   = (num_single + 7) / 8;
+				const size_t dh_bytes   = (num_double + 7) / 8;
+				p += 24;
 
-				const uint8_t* T = p;
-				p += (this_bp + 7) / 8;
-				const uint8_t* trivial_ranks = p;
-				p += num_trivial * eb;
-				const uint32_t* ntri_dir = reinterpret_cast<const uint32_t*>(p);
-				p += (num_nontrivial + 1) * 4;
-				const uint8_t* ntri_data = p;
+				const uint8_t* state_bits   = p;                            p += sb_bytes;
+				const uint8_t* const_stream = p;                            p += num_const * eb;
+				const uint8_t* single_hints = p;                            p += sh_bytes;
+				const uint8_t* single_stream = p;                           p += ss_bytes32;
+				const uint8_t* double_hints = p;                            p += dh_bytes;
+				const uint8_t* double_stream = p;                           p += ds_bytes32;
+				const uint32_t* multi_dir = reinterpret_cast<const uint32_t*>(p);
+				p += (num_multi + 1) * 4;
+				const uint8_t* multi_data = p;
 
-				size_t triv_cursor = 0;
-				size_t ntri_cursor = 0;
+				// Sequential walk: track running indices into each per-state
+				// stream + byte offsets for the variable-length SINGLE/DOUBLE
+				// streams. r0 sits at a fixed offset within each entry:
+				//   CONST  → const_stream[idx * eb]
+				//   SINGLE → entry[1]              (skip h)
+				//   DOUBLE → entry[2]              (skip h1, h2)
+				//   MULTI  → entry[17]             (skip k + 16B bitmap)
+				// hmc=0 always reads r0 of every entry; the draw-end hint
+				// (which would synthesize stored=0) can't fire at hmc=0
+				// because h ≥ 1 puts hmc=0 strictly before the first
+				// transition, selecting r0 unconditionally.
+				const size_t single_short = 1 + eb;
+				const size_t single_long  = 1 + 2 * eb;
+				const size_t double_short = 2 + 2 * eb;
+				const size_t double_long  = 2 + 3 * eb;
+				size_t const_idx = 0, single_idx = 0, double_idx = 0, multi_idx = 0;
+				size_t single_off = 0, double_off = 0;
+
 				for (size_t k = 0; k < this_bp; ++k)
 				{
+					const size_t bit_off = k * 2;
+					const uint8_t state = (state_bits[bit_off / 8] >> (bit_off % 8)) & 3u;
 					uint16_t rank;
-					if (T[k >> 3] & (uint8_t)(1u << (k & 7)))
+					switch (state)
 					{
-						// Non-trivial: hmc=0 is always changepoint 0, at
-						// offset 17 (1 count + 16 bitmap).
-						const uint8_t* blk = ntri_data + ntri_dir[ntri_cursor];
-						if (eb == 1) rank = blk[17];
-						else         std::memcpy(&rank, blk + 17, 2);
-						++ntri_cursor;
-					}
-					else
-					{
-						if (eb == 1) rank = trivial_ranks[triv_cursor];
-						else         std::memcpy(&rank, trivial_ranks + triv_cursor * 2, 2);
-						++triv_cursor;
+						case 0: {
+							if (eb == 1) rank = const_stream[const_idx];
+							else { uint16_t r; std::memcpy(&r, const_stream + const_idx * 2, 2); rank = r; }
+							++const_idx;
+							break;
+						}
+						case 1: {
+							const uint8_t* entry = single_stream + single_off;
+							if (eb == 1) rank = entry[1];
+							else { uint16_t r; std::memcpy(&r, entry + 1, 2); rank = r; }
+							const bool draw_end =
+								(single_hints[single_idx >> 3] >> (single_idx & 7)) & 1u;
+							single_off += draw_end ? single_short : single_long;
+							++single_idx;
+							break;
+						}
+						case 2: {
+							const uint8_t* entry = double_stream + double_off;
+							if (eb == 1) rank = entry[2];
+							else { uint16_t r; std::memcpy(&r, entry + 2, 2); rank = r; }
+							const bool draw_end =
+								(double_hints[double_idx >> 3] >> (double_idx & 7)) & 1u;
+							double_off += draw_end ? double_short : double_long;
+							++double_idx;
+							break;
+						}
+						default: {
+							const uint8_t* entry = multi_data + multi_dir[multi_idx];
+							if (eb == 1) rank = entry[17];
+							else { uint16_t r; std::memcpy(&r, entry + 17, 2); rank = r; }
+							++multi_idx;
+							break;
+						}
 					}
 					const uint16_t stored = r2v[rank];
 					const WDL_Entry w = wdl.read(i,
 						static_cast<Board_Index>(base_pos + k), thread_id);
 					out[base_pos + k] = dtm50_entry_from_storage(stored, w);
 				}
+				ASSERT(const_idx == num_const && single_idx == num_single
+				    && double_idx == num_double && multi_idx == num_multi);
 			}
 		});
 

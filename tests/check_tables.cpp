@@ -1,6 +1,8 @@
 // Check disk-table invariants for every legal canonical position.
 //
-//   DTC:   DRAW=0, wins >0, losses are 0 only at mate, cursed iff dtc>100.
+//   DTC:   wins >0, losses are 0 only at mate, cursed iff dtc>100.
+//          (DRAW cells aren't checked — encoder run-stitches them with W/L
+//           neighbors and the WDL companion is authoritative for class.)
 //   DTM:   wins >0, losses are 0 only at mate, WIN odd, LOSE even.
 //   DTM50: layer-0 class equals fold_dtm50_wdl(wdl) (cursed/blessed → DRAW);
 //          WIN/LOSE values follow the same nonzero + parity invariants as DTM.
@@ -91,7 +93,6 @@ struct Shard
 	uint64_t per_wdl[8] = {};
 
 	size_t v_missing_dtc = 0;
-	size_t v_dtc_draw_nonzero = 0;
 	size_t v_dtc_win_zero = 0;
 	size_t v_dtc_lose_zero_non_mate = 0;
 	size_t v_dtc_cursed_range = 0;
@@ -192,16 +193,19 @@ bool check_material(const Options& opt, const std::string& name)
 				const WDL_Entry w = pr.wdl;
 				s.per_wdl[static_cast<size_t>(w)] += 1;
 
-				if (have_dtc && w != WDL_Entry::ILLEGAL)
+				// DRAW and ILLEGAL are WDL-companion-authoritative; their DTC/
+				// DTM/DTM50 stored bits are don't-care (encoder run-stitches
+				// them with W/L neighbors for compression). Gate the entire
+				// per-table value-invariant block.
+				if (w == WDL_Entry::ILLEGAL || w == WDL_Entry::DRAW) continue;
+				++s.classified;
+
+				if (have_dtc)
 				{
 					if (!pr.has_dtc) { ++s.v_missing_dtc; }
 					else
 					{
 						const uint16_t dtc_v = static_cast<uint16_t>(pr.dtc.value());
-						if (w == WDL_Entry::DRAW && dtc_v != 0) {
-							++s.v_dtc_draw_nonzero;
-							push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtc_v, "DTC_DRAW_NONZERO");
-						}
 						if (is_win_class(w) && dtc_v == 0) {
 							++s.v_dtc_win_zero;
 							push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtc_v, "DTC_WIN_ZERO");
@@ -221,9 +225,6 @@ bool check_material(const Options& opt, const std::string& name)
 						}
 					}
 				}
-
-				if (w == WDL_Entry::ILLEGAL || w == WDL_Entry::DRAW) continue;
-				++s.classified;
 
 				if (have_dtm)
 				{
@@ -303,7 +304,6 @@ bool check_material(const Options& opt, const std::string& name)
 		t.classified           += sh.classified;
 		for (size_t i = 0; i < 8; ++i) t.per_wdl[i] += sh.per_wdl[i];
 		t.v_missing_dtc              += sh.v_missing_dtc;
-		t.v_dtc_draw_nonzero         += sh.v_dtc_draw_nonzero;
 		t.v_dtc_win_zero             += sh.v_dtc_win_zero;
 		t.v_dtc_lose_zero_non_mate   += sh.v_dtc_lose_zero_non_mate;
 		t.v_dtc_cursed_range         += sh.v_dtc_cursed_range;
@@ -324,7 +324,7 @@ bool check_material(const Options& opt, const std::string& name)
 	}
 
 	const size_t violations =
-		t.v_missing_dtc + t.v_dtc_draw_nonzero + t.v_dtc_win_zero
+		t.v_missing_dtc + t.v_dtc_win_zero
 		+ t.v_dtc_lose_zero_non_mate + t.v_dtc_cursed_range
 		+ t.v_dtc_noncursed_range + t.v_missing_dtm + t.v_dtm_win_zero
 		+ t.v_dtm_lose_zero_non_mate + t.v_dtm_parity_win
@@ -352,8 +352,6 @@ bool check_material(const Options& opt, const std::string& name)
 	if (t.v_missing_dtc)
 		std::printf("    %zu  legal cells with no DTC entry (file missing or dropped color)\n",
 			t.v_missing_dtc);
-	if (t.v_dtc_draw_nonzero)
-		std::printf("    %zu  DRAW cells with dtc!=0\n", t.v_dtc_draw_nonzero);
 	if (t.v_dtc_win_zero)
 		std::printf("    %zu  WIN cells with dtc=0\n", t.v_dtc_win_zero);
 	if (t.v_dtc_lose_zero_non_mate)

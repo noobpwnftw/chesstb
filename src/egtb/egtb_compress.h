@@ -25,6 +25,13 @@ constexpr uint64_t EGTB_CHECKSUM_INIT_VALUE = 0xf0f0f0f0f0f0;
 
 constexpr size_t WDL_BLOCK_SIZE = 64 * 1024;
 
+// Number of hmc (50MR half-move counter) layers stored per DTM50 sub-table.
+// Lives here rather than egtb_gen_dtm50.h because both the generator-side
+// flat sub-loader (egtb_compress.cpp) and the probe-side block decoder
+// (probe.cpp) need it for the .lzdtm50 block-payload format math, and neither
+// can pull in egtb_gen_dtm50.h.
+inline constexpr int DTM50_HMC_COUNT = 100;
+
 // Per-color histograms gathered alongside W/D/L tally. hist_1b is indexed by
 // dtc_value_for_storage(e) (cursed halved); hist_2b is indexed by raw e.value().
 // Both are populated in one gather pass; the entry_bytes decision picks which

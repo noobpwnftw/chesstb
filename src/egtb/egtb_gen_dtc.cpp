@@ -1154,7 +1154,12 @@ static Block_Source make_wdl_block_source(
 						const uint16_t v = static_cast<uint16_t>(e.value());
 						if (v > longest_value) { longest_value = v; longest_idx = cur_raw; }
 					}
-					if (!e.is_illegal())
+					// DRAW and ILLEGAL are both WDL-shortcuttable at probe time
+					// (the .lzw companion decides class first; DTC bytes for
+					// these cells are never read). Excluding them from the
+					// histogram lets the rank table allocate its short codes
+					// to values that actually matter for W/L decoding.
+					if (!e.is_illegal() && !e.is_draw())
 					{
 						++hist1_local[static_cast<size_t>(dtc_value_for_storage(e))];
 						++hist2_local[static_cast<size_t>(static_cast<uint16_t>(e.value()))];
