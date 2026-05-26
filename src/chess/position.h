@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 // Chess position. Holds piece bitboards (indexed by Piece, with WHITE_OCCUPY /
@@ -31,11 +32,7 @@ struct Position
 	// Zero everything.
 	void clear()
 	{
-		for (auto& bb : m_pieces) bb = Bitboard::make_empty();
-		m_occupied = Bitboard::make_empty();
-		for (auto& c  : m_piece_counts) c = 0;
-		for (auto& s  : m_squares) s = PIECE_NONE;
-		m_turn = WHITE;
+		std::memset(this, 0, sizeof(*this));
 	}
 
 	NODISCARD INLINE Color turn() const { return m_turn; }

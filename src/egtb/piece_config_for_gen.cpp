@@ -7,6 +7,7 @@
 
 #include "util/defines.h"
 
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,8 @@ const King_Slice_Manager& get_slice_manager(Symmetry_Group sym)
 bool Piece_Config_For_Gen::try_init()
 {
 	const auto counts = piece_counts();
+	for (size_t i = 0; i < PIECE_NB; ++i)
+		m_piece_counts_cached[i] = static_cast<int8_t>(counts[i]);
 	m_symmetry = pick_symmetry(*this);
 	m_king_slice_manager = &get_slice_manager(m_symmetry);
 
@@ -273,8 +276,8 @@ bool Piece_Config_For_Gen::fill_board(
 	const Decomposed_Board_Index& index, Out_Param<Position> board,
 	Out_Param<std::array<Piece_Group::Placement, PIECE_CLASS_NB>> placements) const
 {
-	board->clear();
-	for (auto& p : *placements) p = Piece_Group::Placement{};
+	std::memset(board->m_pieces, 0, sizeof(board->m_pieces));
+	std::memset(board->m_squares, 0, sizeof(board->m_squares));
 
 	const King_Slice_Manager& sm = slice_manager();
 	if constexpr (!ASSUME_LEGAL)
@@ -284,32 +287,47 @@ bool Piece_Config_For_Gen::fill_board(
 			return false;
 	}
 	const auto [wk, bk] = sm.kings_of_slice[index.king_slice_id];
-	board->put_piece(WHITE_KING, wk);
-	board->put_piece(BLACK_KING, bk);
-	(*placements)[WHITE_KINGS].add(wk);
-	(*placements)[BLACK_KINGS].add(bk);
+
+	Bitboard white_occ = Bitboard::make_empty();
+	Bitboard black_occ = Bitboard::make_empty();
+
+	const Bitboard wk_bb = square_bb(wk);
+	const Bitboard bk_bb = square_bb(bk);
+	board->m_squares[wk] = WHITE_KING;
+	board->m_squares[bk] = BLACK_KING;
+	board->m_pieces[WHITE_KING] = wk_bb;
+	board->m_pieces[BLACK_KING] = bk_bb;
+	white_occ |= wk_bb;
+	black_occ |= bk_bb;
+	(*placements)[WHITE_KINGS].set_single(wk);
+	(*placements)[BLACK_KINGS].set_single(bk);
 
 	const Pawn_Slice_Manager& psm = pawn_slice_manager();
 	if (psm.has_pawns())
 	{
 		const auto pd = psm.decompose(index.pawn_slice_id);
-		auto place_pawns = [&](Piece_Class c, Piece_Group::Placement_Index idx) -> bool {
+		auto place_pawns = [&](Piece_Class c, Piece_Group::Placement_Index idx,
+		                       Bitboard& color_occ) -> bool {
 			if (!is_populated(c)) return true;
 			const Piece_Group& g = group(c);
 			const auto& placement = g.squares(idx);
 			(*placements)[c] = placement;
 			const Piece pc = g.piece();
+			Bitboard bb = Bitboard::make_empty();
 			for (size_t k = 0; k < placement.size(); ++k)
 			{
 				const Square sq = placement[k];
 				if constexpr (!ASSUME_LEGAL)
 					if (!board->is_empty(sq)) return false;
-				board->put_piece(pc, sq);
+				board->m_squares[sq] = pc;
+				bb |= square_bb(sq);
 			}
+			board->m_pieces[pc] = bb;
+			color_occ |= bb;
 			return true;
 		};
-		if (!place_pawns(WHITE_PAWNS, pd.white_idx)) return false;
-		if (!place_pawns(BLACK_PAWNS, pd.black_idx)) return false;
+		if (!place_pawns(WHITE_PAWNS, pd.white_idx, white_occ)) return false;
+		if (!place_pawns(BLACK_PAWNS, pd.black_idx, black_occ)) return false;
 	}
 
 	for (size_t i = 0; i < m_num_populated_classes; ++i)
@@ -319,15 +337,25 @@ bool Piece_Config_For_Gen::fill_board(
 		const auto& placement = g.squares(index.within[c]);
 		(*placements)[c] = placement;
 		const Piece pc = g.piece();
+		Bitboard bb = Bitboard::make_empty();
 		for (size_t k = 0; k < placement.size(); ++k)
 		{
 			const Square sq = placement[k];
 			if constexpr (!ASSUME_LEGAL)
 				if (!board->is_empty(sq)) return false;
-			board->put_piece(pc, sq);
+			board->m_squares[sq] = pc;
+			bb |= square_bb(sq);
 		}
+		board->m_pieces[pc] = bb;
+		Bitboard& color_occ = (piece_color(pc) == WHITE) ? white_occ : black_occ;
+		color_occ |= bb;
 	}
 
+	board->m_pieces[WHITE_OCCUPY] = white_occ;
+	board->m_pieces[BLACK_OCCUPY] = black_occ;
+	board->m_occupied = white_occ | black_occ;
+	std::memcpy(board->m_piece_counts, m_piece_counts_cached,
+	            sizeof(board->m_piece_counts));
 	return true;
 }
 

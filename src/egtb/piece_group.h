@@ -118,6 +118,12 @@ struct Piece_Group
 			m_squares[m_size++] = s;
 		}
 
+		INLINE void set_single(Square s)
+		{
+			m_squares[0] = s;
+			m_size = 1;
+		}
+
 		INLINE void sort()
 		{
 			std::sort(m_squares, m_squares + m_size);

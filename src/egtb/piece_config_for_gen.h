@@ -269,6 +269,7 @@ private:
 	const Piece_Group* m_groups[PIECE_CLASS_NB]{};
 	size_t m_num_positions_by_group[PIECE_CLASS_NB]{};
 	size_t m_weights[PIECE_CLASS_NB]{};
+	int8_t m_piece_counts_cached[PIECE_NB]{};
 	// Only initialized for classes with weight > 1 (all but the first populated).
 	Divider<uint64_t> m_weights_div[PIECE_CLASS_NB]{};
 
