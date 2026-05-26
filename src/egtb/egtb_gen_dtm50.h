@@ -101,27 +101,19 @@ private:
 	std::map<Material_Key, std::shared_ptr<DTM50_Sub_File_Flat>> m_sub_dtm;
 	const DTM50_Sub_File_Flat* m_sub_dtm_by_move[COLOR_NB][PIECE_NB][PIECE_TYPE_NB]{};
 
-	// Layer being built. Helpers dispatch off it; gen() sets it per layer.
-	uint16_t m_current_hmc = 0;
-
-	NODISCARD INLINE Sliced_EGTB_File_For_Gen<DTM_Final_Entry>& cur_layer(Color c) const
-	{
-		return m_table->m_dtm[c][m_current_hmc];
-	}
-
 	NODISCARD INLINE DTM_Final_Entry read_dtm(Board_Index pos, Color stm, uint16_t hmc) const
 	{
 		return m_table->m_dtm[stm][hmc].read(pos);
 	}
-	INLINE void write_dtm(Board_Index pos, Color stm, DTM_Final_Entry e)
+	INLINE void write_dtm(Board_Index pos, Color stm, uint16_t hmc, DTM_Final_Entry e)
 	{
-		cur_layer(stm).write(e, pos);
+		m_table->m_dtm[stm][hmc].write(e, pos);
 	}
 
 	NODISCARD DTM_Final_Entry read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
-	NODISCARD DTM_Final_Entry read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
-	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
+	NODISCARD DTM_Final_Entry read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, uint16_t hmc, size_t thread_id) const;
+	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, uint16_t hmc, size_t thread_id) const;
 
-	NODISCARD DTM_Final_Entry make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id) const;
-	void init_entries(In_Out_Param<Thread_Pool> thread_pool);
+	NODISCARD DTM_Final_Entry make_initial_entry(Position_For_Gen& pos_gen, uint16_t hmc, size_t thread_id) const;
+	void init_entries(In_Out_Param<Thread_Pool> thread_pool, uint16_t hmc);
 };

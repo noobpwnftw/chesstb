@@ -139,7 +139,7 @@ DTM_Final_Entry DTM50_Generator::read_sub_tb(const Position_For_Gen& pos_gen, Mo
 	return (sub == nullptr) ? DTM_Final_Entry::make_draw() : sub->read(sub_color, sub_idx, thread_id);
 }
 
-DTM_Final_Entry DTM50_Generator::read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const
+DTM_Final_Entry DTM50_Generator::read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, uint16_t hmc, size_t thread_id) const
 {
 	const Position& parent = pos_gen.board_unchecked();
 	const bool is_cap = move.is_ep_capture() || !parent.is_empty(move.to());
@@ -158,7 +158,7 @@ DTM_Final_Entry DTM50_Generator::read_post_move_dtm(const Position_For_Gen& pos_
 	if (is_pawn_push)
 		return read_dtm(post_idx, opp, 0);
 
-	const uint16_t target_hmc = static_cast<uint16_t>(m_current_hmc + 1);
+	const uint16_t target_hmc = static_cast<uint16_t>(hmc + 1);
 	if (target_hmc >= DTM50_HMC_COUNT)
 	{
 		Position child = parent;
@@ -195,9 +195,9 @@ INLINE bool dtm_better_for_mover(DTM_Final_Entry a, DTM_Final_Entry b)
 
 }  // namespace
 
-DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const
+DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, uint16_t hmc, size_t thread_id) const
 {
-	const DTM_Final_Entry no_ep = read_post_move_dtm(pos_gen, dp_move, thread_id);
+	const DTM_Final_Entry no_ep = read_post_move_dtm(pos_gen, dp_move, hmc, thread_id);
 
 	const Position& parent = pos_gen.board_unchecked();
 	const Color mover = parent.turn();
@@ -253,7 +253,7 @@ DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(const Position_For_G
 // Initial classification.
 // =============================================================================
 
-DTM_Final_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id) const
+DTM_Final_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, uint16_t hmc, size_t thread_id) const
 {
 	if (!pos_gen.is_legal(Position_For_Gen::Legality_Lower_Bound::CHESS_LEGAL))
 		return DTM_Final_Entry::make_illegal();
@@ -276,8 +276,8 @@ DTM_Final_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, s
 		any_legal = true;
 		const bool is_pawn = piece_type(pos.piece_at(m.from())) == PAWN;
 		const DTM_Final_Entry child_e = is_pawn && is_pawn_double_push(m)
-			? effective_opp_dtm_after_dp(pos_gen, m, thread_id)
-			: read_post_move_dtm(pos_gen, m, thread_id);
+			? effective_opp_dtm_after_dp(pos_gen, m, hmc, thread_id)
+			: read_post_move_dtm(pos_gen, m, hmc, thread_id);
 		if (child_e.is_illegal()) continue;
 		if (child_e.is_loss())
 		{
@@ -303,7 +303,7 @@ DTM_Final_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, s
 	return DTM_Final_Entry::make_draw();
 }
 
-void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
+void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool, uint16_t hmc)
 {
 	const auto& psm = m_epsi.pawn_slice_manager();
 	const size_t nks = m_epsi.num_king_slices();
@@ -364,16 +364,18 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 			}
 		}
 		m_scratch_need[BLACK] = m_scratch_need[WHITE];
-		apply_working_set(thread_pool, &cur_layer(WHITE), &cur_layer(BLACK), m_scratch_need[WHITE], m_scratch_need[BLACK]);
+		apply_working_set(thread_pool,
+			&m_table->m_dtm[WHITE][hmc], &m_table->m_dtm[BLACK][hmc],
+			m_scratch_need[WHITE], m_scratch_need[BLACK]);
 		// opp[0] for pawn-push reads, opp[k+1] for non-pawn quiet + ILLEGAL.
 		apply_working_set(thread_pool,
 			&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
 			m_scratch_need[WHITE], m_scratch_need[BLACK]);
-		if (m_current_hmc + 1 < DTM50_HMC_COUNT)
+		if (hmc + 1 < DTM50_HMC_COUNT)
 		{
 			apply_working_set(thread_pool,
-				&m_table->m_dtm[WHITE][m_current_hmc + 1],
-				&m_table->m_dtm[BLACK][m_current_hmc + 1],
+				&m_table->m_dtm[WHITE][hmc + 1],
+				&m_table->m_dtm[BLACK][hmc + 1],
 				m_scratch_need[WHITE], m_scratch_need[BLACK]);
 		}
 	};
@@ -381,7 +383,7 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 	// Progress bar only on hmc=99: the full legality check per cell dominates
 	// its runtime. Every other layer piggybacks ILLEGAL from opp[k+1].
 	std::optional<Concurrent_Progress_Bar> progress_bar;
-	if (m_current_hmc == DTM50_HMC_COUNT - 1)
+	if (hmc == DTM50_HMC_COUNT - 1)
 	{
 		const size_t wss = m_epsi.within_slice_size();
 		size_t total_indices = 0;
@@ -396,14 +398,12 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 	}
 	else
 	{
-		std::printf("  build layer %2u\r", m_current_hmc);
+		std::printf("  build layer %2u\r", hmc);
 		std::fflush(stdout);
 	}
 
 	for (size_t g : m_pair_group_ids)
 	{
-		if (egtb_is_interrupt_requested())
-			throw DTM50_Interrupted{ 0, 0, m_current_hmc };
 		page_in_for_init_group(g);
 		Shared_Board_Index_Iterator group_it = make_slice_group_iterator(g, spg);
 
@@ -433,8 +433,8 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 
 				if (!pos_gen.is_legal())
 				{
-					write_dtm(idx, WHITE, DTM_Final_Entry::make_illegal());
-					write_dtm(idx, BLACK, DTM_Final_Entry::make_illegal());
+					write_dtm(idx, WHITE, hmc, DTM_Final_Entry::make_illegal());
+					write_dtm(idx, BLACK, hmc, DTM_Final_Entry::make_illegal());
 					continue;
 				}
 				if (slice_has_stab[pos_gen.index().king_slice_id])
@@ -442,8 +442,8 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 					const Board_Index canon = board_index_of_position(m_epsi, pos_gen.board());
 					if (canon != idx)
 					{
-						write_dtm(idx, WHITE, DTM_Final_Entry::make_illegal());
-						write_dtm(idx, BLACK, DTM_Final_Entry::make_illegal());
+						write_dtm(idx, WHITE, hmc, DTM_Final_Entry::make_illegal());
+						write_dtm(idx, BLACK, hmc, DTM_Final_Entry::make_illegal());
 						continue;
 					}
 				}
@@ -456,13 +456,13 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 					pos_gen.set_turn(us);
 					// Chess-legality is hmc-invariant; reuse opp[k+1]'s ILLEGAL
 					// flag. hmc=99 has no k+1 and computes fresh.
-					if (m_current_hmc + 1 < DTM50_HMC_COUNT
-					    && read_dtm(idx, us, m_current_hmc + 1).is_illegal())
+					if (hmc + 1 < DTM50_HMC_COUNT
+					    && read_dtm(idx, us, hmc + 1).is_illegal())
 					{
-						write_dtm(idx, us, DTM_Final_Entry::make_illegal());
+						write_dtm(idx, us, hmc, DTM_Final_Entry::make_illegal());
 						continue;
 					}
-					write_dtm(idx, us, make_initial_entry(pos_gen, tid));
+					write_dtm(idx, us, hmc, make_initial_entry(pos_gen, hmc, tid));
 				}
 			}
 		});
@@ -544,47 +544,49 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 				std::unique(m_active_pawn_slices.begin(), m_active_pawn_slices.end()),
 				m_active_pawn_slices.end());
 
-			for (size_t i = DTM50_HMC_COUNT; i-- > 0; )
+			for (uint16_t hmc = DTM50_HMC_COUNT; hmc-- > 0; )
 			{
-				const uint16_t hmc = static_cast<uint16_t>(i);
 				// Within the resume fusion, layers 99..(resume_hmc+1) were
 				// already finished; resume at resume_hmc and run the rest fresh.
 				if (is_resume_fusion && static_cast<int64_t>(hmc) > resume_hmc) continue;
 
-				m_current_hmc = hmc;
-
-				// Unbounded budget: pre-load every group of the layers this
-				// step reads (cur layer + opp[0] + opp[k+1]). Bounded mode
-				// does the per-group equivalent in page_in_for_init_group.
-				if (m_paging_budget_bytes == 0)
-				{
-					const size_t ng = cur_layer(WHITE).num_groups();
-					std::vector<uint8_t> all_needed(ng, 1);
-					apply_working_set(thread_pool, &cur_layer(WHITE), &cur_layer(BLACK), all_needed, all_needed);
-					apply_working_set(thread_pool,
-						&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
-						all_needed, all_needed);
-					if (hmc + 1 < DTM50_HMC_COUNT)
-					{
-						apply_working_set(thread_pool,
-							&m_table->m_dtm[WHITE][hmc + 1], &m_table->m_dtm[BLACK][hmc + 1],
-							all_needed, all_needed);
-					}
-				}
-
-				// k+2 was the previous step's read layer; no future step in
-				// this fusion needs it.
-				if (hmc + 2 < DTM50_HMC_COUNT)
-				{
-					m_table->m_dtm[WHITE][hmc + 2].evict_all(*thread_pool);
-					m_table->m_dtm[BLACK][hmc + 2].evict_all(*thread_pool);
-				}
-
-				refresh_active_metadata(m_table->m_dtm[WHITE][0]);
-
 				try
 				{
-					init_entries(thread_pool);
+					if (egtb_is_interrupt_requested())
+						throw DTM50_Interrupted{ 0, 0, hmc };
+
+					// Unbounded budget: pre-load every group of the layers this
+					// step reads (cur layer + opp[0] + opp[k+1]). Bounded mode
+					// does the per-group equivalent in page_in_for_init_group.
+					if (m_paging_budget_bytes == 0)
+					{
+						const size_t ng = m_table->m_dtm[WHITE][hmc].num_groups();
+						std::vector<uint8_t> all_needed(ng, 1);
+						apply_working_set(thread_pool,
+							&m_table->m_dtm[WHITE][hmc], &m_table->m_dtm[BLACK][hmc],
+							all_needed, all_needed);
+						apply_working_set(thread_pool,
+							&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
+							all_needed, all_needed);
+						if (hmc + 1 < DTM50_HMC_COUNT)
+						{
+							apply_working_set(thread_pool,
+								&m_table->m_dtm[WHITE][hmc + 1], &m_table->m_dtm[BLACK][hmc + 1],
+								all_needed, all_needed);
+						}
+					}
+
+					// k+2 was the previous step's read layer; no future step in
+					// this fusion needs it.
+					if (hmc + 2 < DTM50_HMC_COUNT)
+					{
+						m_table->m_dtm[WHITE][hmc + 2].evict_all(*thread_pool);
+						m_table->m_dtm[BLACK][hmc + 2].evict_all(*thread_pool);
+					}
+
+					refresh_active_metadata(m_table->m_dtm[WHITE][0]);
+
+					init_entries(thread_pool, hmc);
 				}
 				catch (const DTM50_Interrupted& e)
 				{
