@@ -1040,9 +1040,11 @@ void save_compress_dtm50(
 	const size_t bcnt = ceil_div(num_positions, bp);
 	const size_t tail = num_positions - (bcnt - 1) * bp;
 
-	const size_t color_units = num_positions * DTM50_HMC_COUNT;
-	const size_t print_period = thread_pool->num_workers() * (1u << 20);
-	Concurrent_Progress_Bar progress_bar(color_units, print_period,
+	constexpr size_t PRINT_PERIOD_BYTES = 1024 * 1024 * 8;
+	const size_t raw_block_bytes = bp * DTM50_HMC_COUNT * sizeof(DTM_Final_Entry);
+	const size_t print_period = std::max<size_t>(
+		1, ceil_div(PRINT_PERIOD_BYTES * thread_pool->num_workers(), raw_block_bytes));
+	Concurrent_Progress_Bar progress_bar(bcnt, print_period,
 		std::string("save_compress_dtm50 ") + std::to_string(static_cast<int>(color)));
 
 	out.block_positions = block_positions;
@@ -1105,7 +1107,7 @@ void save_compress_dtm50(
 				// usz=0 in the offset table is the skip sentinel.
 				out.usizes[b] = 0;
 				out.compressed_blocks[b].clear();
-				progress_bar += this_bp * DTM50_HMC_COUNT;
+				progress_bar += 1;
 				continue;
 			}
 
