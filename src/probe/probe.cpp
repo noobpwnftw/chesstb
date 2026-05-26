@@ -1625,11 +1625,11 @@ WDL_Entry Probe_Tables::Impl::probe_wdl_internal(const Piece_Config& ps, const P
 DTC_Final_Entry Probe_Tables::Impl::probe_dtc_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth)
 {
 	DTC_Probe_File* d = open_dtc(ps);
-	if (!d) return DTC_Final_Entry::make_score(DTC_SCORE_ZERO);
+	if (!d) return DTC_Final_Entry::make_illegal();
 
 	const Piece_Config_For_Gen& epsi = get_epsi(ps);
 	const Board_Index idx = board_index_of_position(epsi, pos);
-	if (idx == BOARD_INDEX_NONE) return DTC_Final_Entry::make_score(DTC_SCORE_ZERO);
+	if (idx == BOARD_INDEX_NONE) return DTC_Final_Entry::make_illegal();
 
 	const Color stm = pos.turn();
 	return d->is_dropped[stm]
@@ -1640,7 +1640,7 @@ DTC_Final_Entry Probe_Tables::Impl::probe_dtc_internal(const Piece_Config& ps, c
 DTM_Final_Entry Probe_Tables::Impl::probe_dtm_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth)
 {
 	DTM_Probe_File* d = open_dtm(ps);
-	if (!d) return DTM_Final_Entry::make_draw();
+	if (!d) return DTM_Final_Entry::make_illegal();
 
 	const Piece_Config_For_Gen& epsi = get_epsi(ps);
 	const Board_Index idx = board_index_of_position(epsi, pos);
