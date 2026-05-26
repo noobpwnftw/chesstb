@@ -1118,7 +1118,7 @@ void save_compress_dtm50(
 
 			out.usizes[b] = payload.size();
 			out.compressed_blocks[b] = std::move(compressed);
-			progress_bar += this_bp * DTM50_HMC_COUNT;
+			progress_bar += 1;
 		}
 	});
 
