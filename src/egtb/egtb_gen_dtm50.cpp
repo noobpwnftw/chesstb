@@ -833,7 +833,7 @@ INLINE size_t dtm50_table_idx_of(Color c, int h)
 
 // h=0 feeds EGTB_Info (the canonical fresh-50MR view); other layers only
 // contribute to the rank score. Returns false iff every layer is all-ILLEGAL.
-NODISCARD bool gather_dtm50_color(
+NODISCARD bool gather_dtm50_info(
 	const Piece_Config_For_Gen& epsi,
 	DTM50_Table& table,
 	DTM50_Save_Cache& cache,
@@ -917,7 +917,7 @@ NODISCARD bool gather_dtm50_color(
 
 // Per-block pin loop holds one layer's group-range at a time so peak pin-count
 // stays at effective_workers × group_range, same as DTM/DTC under tight budgets.
-void save_compress_dtm50_color(
+void save_compress_dtm50(
 	In_Out_Param<Thread_Pool> thread_pool,
 	DTM50_Table& table,
 	DTM50_Save_Cache& cache,
@@ -926,12 +926,16 @@ void save_compress_dtm50_color(
 	size_t positions_per_group,
 	uint32_t block_positions,
 	size_t max_workers,
-	Concurrent_Progress_Bar& progress_bar,
 	DTM50_Compressed_Color& out)
 {
 	const size_t bp = static_cast<size_t>(block_positions);
 	const size_t bcnt = ceil_div(num_positions, bp);
 	const size_t tail = num_positions - (bcnt - 1) * bp;
+
+	const size_t color_units = num_positions * DTM50_HMC_COUNT;
+	const size_t print_period = thread_pool->num_workers() * (1u << 20);
+	Concurrent_Progress_Bar progress_bar(color_units, print_period,
+		std::string("save_compress_dtm50 ") + std::to_string(static_cast<int>(color)));
 
 	out.block_positions = block_positions;
 	out.block_cnt = static_cast<uint32_t>(bcnt);
@@ -995,6 +999,8 @@ void save_compress_dtm50_color(
 	out.total_compressed_size = 0;
 	for (const auto& cb : out.compressed_blocks)
 		out.total_compressed_size += cb.size();
+
+	progress_bar.set_finished();
 }
 
 void save_dtm50_table(
@@ -1130,7 +1136,7 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 
 	for (Color me : colors)
 	{
-		const bool any = gather_dtm50_color(
+		const bool any = gather_dtm50_info(
 			m_epsi, *m_table, cache, me, num_positions, positions_per_group,
 			thread_pool, max_workers, m_info, color_out[me].ranks);
 
@@ -1141,16 +1147,9 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 			continue;
 		}
 
-		const size_t color_units = num_positions * DTM50_HMC_COUNT;
-		const size_t print_period = thread_pool->num_workers() * (1u << 20);
-		Concurrent_Progress_Bar progress_bar(color_units, print_period,
-			std::string("save_compress_dtm50_color ") + std::to_string(static_cast<int>(me)));
-
-		save_compress_dtm50_color(
+		save_compress_dtm50(
 			thread_pool, *m_table, cache, me, num_positions, positions_per_group,
-			RS_BLOCK_POSITIONS, max_workers, progress_bar, color_out[me]);
-
-		progress_bar.set_finished();
+			RS_BLOCK_POSITIONS, max_workers, color_out[me]);
 	}
 
 	const auto out_path = paths.dtm50_save_path(m_epsi);
