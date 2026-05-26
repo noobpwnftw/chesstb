@@ -89,12 +89,8 @@ DTM50_Generator::DTM50_Generator(
 	std::filesystem::create_directories(tmp_dir);
 	m_table->m_is_symmetric = m_is_symmetric;
 
-	// Gen holds 1–3 layers at the hmc peak (k, k+1, opp[0]); save_to_disk
-	// holds all HMC_COUNT layers × 2 colors at once to assemble the change-
-	// point encoding — the 100× amplifier between the two phases. We clamp
-	// the budget to "unbounded" only when it can fit the save peak, so save's
-	// Save_Group_Cache doesn't silently page-thrash on budgets that were
-	// "more than enough" for gen alone.
+	// Budget is "unbounded" only if it fits the save-time peak (all HMC_COUNT
+	// layers × 2 colors), not just the gen peak (~3 layers).
 	const size_t bytes_per_color =
 		m_table->m_dtm[WHITE][0].num_slices()
 		* m_table->m_dtm[WHITE][0].within_slice_size()
@@ -151,9 +147,8 @@ DTM_Final_Entry DTM50_Generator::read_post_move_dtm(const Position_For_Gen& pos_
 	const Board_Index post_idx = next_quiet_index(pos_gen, move);
 	if (post_idx == BOARD_INDEX_NONE) return DTM_Final_Entry::make_illegal();
 
-	// Pawn push → opp[hmc=0]; non-pawn quiet → opp[hmc=k+1]; k=99 has no k+1
-	// so the move targets virtual hmc=100 (50MR draw unless mate). See header
-	// for the build-order argument that makes both reads finalized.
+	// Pawn push → opp[0]; non-pawn quiet → opp[k+1]; k=99 targets virtual
+	// hmc=100 (50MR draw unless mate). See header for build-order argument.
 	const bool is_pawn_push = piece_type(parent.piece_at(move.from())) == PAWN;
 	if (is_pawn_push)
 		return read_dtm(post_idx, opp, 0);
@@ -175,9 +170,8 @@ DTM_Final_Entry DTM50_Generator::read_post_move_dtm(const Position_For_Gen& pos_
 
 namespace {
 
-// Comparator: returns true if `a` is strictly better for the side that's about
-// to MAKE the move (i.e., we want the highest-class outcome; tiebreak by smaller
-// dtm if WIN, larger dtm if LOSS).
+// True if `a` is strictly better for the mover: highest class, then shorter
+// WIN / longer LOSS.
 INLINE bool dtm_better_for_mover(DTM_Final_Entry a, DTM_Final_Entry b)
 {
 	auto rank = [](DTM_Final_Entry e) -> int {
@@ -209,7 +203,7 @@ DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(const Position_For_G
 	const Rank ep_target_rank = (opp == WHITE) ? RANK_6 : RANK_3;
 	const File push_file = sq_file(dp_move.to());
 
-	DTM_Final_Entry best_ep_for_opp = DTM_Final_Entry::make_loss(0);  // worst possible for opp; bumped on first EP
+	DTM_Final_Entry best_ep_for_opp = DTM_Final_Entry::make_loss(0);  // worst for opp; bumped on first EP
 	bool any_ep = false;
 
 	std::optional<Position_For_Gen> p_gen_for_ep;
@@ -231,8 +225,8 @@ DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(const Position_For_G
 			if (child_idx == BOARD_INDEX_NONE) continue;
 			p_gen_for_ep.emplace(m_epsi, child_idx, opp);
 		}
-		// read_sub_tb returns the post-EP DTM from the new STM's (mover's)
-		// perspective. Invert class AND add 1 ply to account for opp's EP move.
+		// read_sub_tb returns the post-EP DTM from mover's perspective; invert
+		// class and add 1 ply for opp's EP move.
 		const DTM_Final_Entry after_ep = read_sub_tb(*p_gen_for_ep, ep_move, thread_id);
 		DTM_Final_Entry opp_at_pre_ep;
 		if (after_ep.is_illegal())          continue;
@@ -307,22 +301,19 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool, uint16
 {
 	const auto& psm = m_epsi.pawn_slice_manager();
 	const size_t nks = m_epsi.num_king_slices();
-	// Slice topology is layer-independent (every layer has the same shape) —
-	// any layer can provide slices_per_group/num_groups metadata.
+	// Slice topology is layer-independent; any layer's metadata works.
 	const size_t spg = m_table->m_dtm[WHITE][0].slices_per_group();
 	const size_t ntotal = m_epsi.num_slices();
 	const size_t ngroups = m_table->m_dtm[WHITE][0].num_groups();
 	const auto& pid_in_pair = m_pid_in_pair;
 
-	// push_target_slices allocates; cache once per init call.
+	// push_target_slices allocates; cache once.
 	std::vector<std::vector<int32_t>> targets_by_pid(m_epsi.num_pawn_slices());
 	for (int32_t pid : m_active_pawn_slices)
 		targets_by_pid[static_cast<size_t>(pid)] = psm.push_target_slices(pid);
 
-	// Per-group working set: cur group + opp's king-neighbor groups (non-pawn
-	// quiet reads cross king-slices) + opp's push-target groups (in-M pawn
-	// push reads). Init writes both colors, so needs[B] == needs[W]. Same
-	// pattern as page_in_for_group in DTM/DTC.
+	// Working set per group: cur + king-neighbor (non-pawn quiet) + push-target
+	// (pawn push) groups. needs[B] == needs[W]; mirrors page_in_for_group in DTM/DTC.
 	const auto& kingsm = m_epsi.slice_manager();
 	const bool has_pawns = psm.has_pawns();
 
@@ -367,7 +358,7 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool, uint16
 		apply_working_set(thread_pool,
 			&m_table->m_dtm[WHITE][hmc], &m_table->m_dtm[BLACK][hmc],
 			m_scratch_need[WHITE], m_scratch_need[BLACK]);
-		// opp[0] for pawn-push reads, opp[k+1] for non-pawn quiet + ILLEGAL.
+		// opp[0]: pawn-push reads. opp[k+1]: non-pawn quiet + ILLEGAL reuse.
 		apply_working_set(thread_pool,
 			&m_table->m_dtm[WHITE][0], &m_table->m_dtm[BLACK][0],
 			m_scratch_need[WHITE], m_scratch_need[BLACK]);
@@ -380,8 +371,8 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool, uint16
 		}
 	};
 
-	// Progress bar only on hmc=99: the full legality check per cell dominates
-	// its runtime. Every other layer piggybacks ILLEGAL from opp[k+1].
+	// Progress bar only on hmc=99: its per-cell legality check dominates;
+	// other layers reuse ILLEGAL from opp[k+1].
 	std::optional<Concurrent_Progress_Bar> progress_bar;
 	if (hmc == DTM50_HMC_COUNT - 1)
 	{
@@ -454,8 +445,7 @@ void DTM50_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool, uint16
 				for (Color us : { WHITE, BLACK })
 				{
 					pos_gen.set_turn(us);
-					// Chess-legality is hmc-invariant; reuse opp[k+1]'s ILLEGAL
-					// flag. hmc=99 has no k+1 and computes fresh.
+					// Chess-legality is hmc-invariant; reuse opp[k+1]'s ILLEGAL.
 					if (hmc + 1 < DTM50_HMC_COUNT
 					    && read_dtm(idx, us, hmc + 1).is_illegal())
 					{
@@ -506,8 +496,8 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 		}
 	}
 
-	// Outer = topo batch / fusion, inner = hmc 99..0; see header for the read
-	// dependency argument that this order satisfies.
+	// Outer = topo batch / fusion, inner = hmc 99..0; see header for the
+	// read-dependency argument.
 	size_t total_fusions = 0;
 	for (size_t bi = 0; bi < batches.size(); ++bi)
 	{
@@ -546,8 +536,7 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 
 			for (uint16_t hmc = DTM50_HMC_COUNT; hmc-- > 0; )
 			{
-				// Within the resume fusion, layers 99..(resume_hmc+1) were
-				// already finished; resume at resume_hmc and run the rest fresh.
+				// Resume fusion: layers above resume_hmc are already done.
 				if (is_resume_fusion && static_cast<int64_t>(hmc) > resume_hmc) continue;
 
 				try
@@ -555,9 +544,8 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 					if (egtb_is_interrupt_requested())
 						throw DTM50_Interrupted{ 0, 0, hmc };
 
-					// Unbounded budget: pre-load every group of the layers this
-					// step reads (cur layer + opp[0] + opp[k+1]). Bounded mode
-					// does the per-group equivalent in page_in_for_init_group.
+					// Unbounded budget: pre-load every group of the read layers
+					// (cur + opp[0] + opp[k+1]). Bounded mode pages per group.
 					if (m_paging_budget_bytes == 0)
 					{
 						const size_t ng = m_table->m_dtm[WHITE][hmc].num_groups();
@@ -576,8 +564,7 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 						}
 					}
 
-					// k+2 was the previous step's read layer; no future step in
-					// this fusion needs it.
+					// k+2 was the prior step's read layer; no future step needs it.
 					if (hmc + 2 < DTM50_HMC_COUNT)
 					{
 						m_table->m_dtm[WHITE][hmc + 2].evict_all(*thread_pool);
@@ -618,11 +605,9 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 
 namespace {
 
-// save_to_disk: pack 100 hmc layers into a single .lzdtm50, plus a sidecar
-// .info with hmc=0 stats. See README "Pack layout" for the design rationale
-// (2-bit state classification, draw-end hint, uniform-DRAW skip sentinel,
-// rank table excludes DRAW). This block is the on-disk byte spec, kept here
-// alongside the encoder so the layout is one Ctrl-F away from save/load code.
+// save_to_disk: pack 100 hmc layers into one .lzdtm50 plus a .info sidecar
+// (hmc=0 stats). Design rationale (2-bit state, draw-end hint, uniform-skip
+// sentinel, DRAW excluded from rank table) lives in README "Pack layout".
 //
 // File layout:
 //   uint32  magic = EGTB_Magic::DTM50_MAGIC
@@ -701,38 +686,25 @@ INLINE void write_rank_bytes(std::vector<uint8_t>& dst, uint16_t r, uint8_t eb)
 	}
 }
 
-// Per-position classification across the 100 hmc layers:
-//   state 00 = CONST   — value constant across all 100 layers (incl. ILLEGAL
-//                        which emits last_legal_rank to keep LZMA runs long)
-//   state 01 = SINGLE  — exactly one transition
-//   state 10 = DOUBLE  — exactly two transitions
-//   state 11 = MULTI   — three or more transitions
+// Per-position state across the 100 layers: 00=CONST, 01=SINGLE (1 transition),
+// 10=DOUBLE (2), 11=MULTI (3+). ILLEGAL is folded into CONST as last_legal_rank
+// to keep LZMA runs long.
 //
-// The "ends in DRAW" terminator is the dominant pattern when a W/L position
-// runs out of 50MR budget. Each non-CONST state has a per-entry hint bit; when
-// set, the trailing rank value is omitted from the payload and the decoder
-// synthesizes DRAW directly (sets stored=0 and lets the wdl-aware decode
-// helpers do the right thing). For SINGLE/DOUBLE the hint piggybacks on the
-// MSB of the final h byte; for MULTI it piggybacks on the MSB of the
-// change_count byte (k ≤ 100 < 128). DRAW values are detected at encode time
-// via the NO_RANK sentinel from value_to_rank — DRAW (storage 0) is excluded
-// from the rank table unless it's also needed by LOSS-in-0.
+// Draw-end hint: trailing-DRAW is the dominant pattern when W/L runs out of
+// 50MR. Non-CONST states carry a hint bit; when set, the final rank is omitted
+// and the decoder synthesizes DRAW (stored=0). Hint bit lives in MSB of the
+// final h byte (SINGLE/DOUBLE) or of the change-count byte (MULTI, k<=100).
+// DRAW is excluded from the rank table (NO_RANK sentinel) unless LOSS-in-0
+// independently needs storage 0.
 //
-// Random access: state_bits is 2 bits per position. To locate the j-th SINGLE,
-// the decoder popcounts the SINGLE-mask of state_bits[0..pos), then walks
-// single_hints[0..j) to compute the byte offset (2 B if hint set, 2+eb otherwise).
-// Same for DOUBLE. MULTI keeps its full directory because k varies.
-//
-// ILLEGAL positions emit the most recent legal rank into const_stream so LZMA
-// sees long same-rank runs spanning illegal/legal stretches. Worker-owned;
-// scratch is reused.
+// Random access: state_bits popcount → j-th SINGLE/DOUBLE; single_hints/
+// double_hints walked to compute the variable byte offset. MULTI uses
+// multi_dir since k varies.
 struct RS_Block_Encoder
 {
-	// DTM50_Rank_Table::NO_RANK doubles as the encoder's "this value is DRAW
-	// and isn't in the rank table" sentinel. Monotonicity (DTM steps up then
-	// flips to DRAW, never back) guarantees DRAW only appears as a constant or
-	// as the terminal transition value, so the sentinel is only valid at the
-	// last cr[] slot or as cr[0] when k == 1.
+	// NO_RANK doubles as the DRAW sentinel here. Monotonicity (DTM rises then
+	// flips to DRAW once) means DRAW only appears as cr[k-1], or as cr[0] when
+	// k == 1.
 	static constexpr uint16_t DRAW_SENTINEL = DTM50_Rank_Table::NO_RANK;
 
 	const DTM50_Rank_Table* ranks = nullptr;
@@ -781,8 +753,7 @@ struct RS_Block_Encoder
 			}
 			if (is_illegal)
 			{
-				// State 00; bits already zero. Emit last_legal_rank so LZMA
-				// sees a long same-rank run across illegal/legal stretches.
+				// CONST (state 00). Emit last_legal_rank to extend LZMA runs.
 				write_rank_bytes(const_stream, last_legal_rank, eb);
 				continue;
 			}
@@ -798,9 +769,8 @@ struct RS_Block_Encoder
 
 			if (k == 1)
 			{
-				// CONST. state bits already zero. If the constant is DRAW the
-				// value isn't in the rank table — emit a placeholder rank 0
-				// (probe-time wdl=DRAW overrides the lookup result anyway).
+				// CONST. DRAW emits placeholder rank 0; probe's wdl=DRAW path
+				// ignores the rank lookup.
 				const uint16_t r = (cr[0] == DRAW_SENTINEL) ? 0u : cr[0];
 				last_legal_rank = r;
 				write_rank_bytes(const_stream, r, eb);
@@ -842,7 +812,7 @@ struct RS_Block_Encoder
 				set_state(i, 3);
 				const bool draw_end = (cr[k - 1] == DRAW_SENTINEL);
 				for (size_t j = 0; j + 1 < k; ++j)
-					ASSERT(cr[j] != DRAW_SENTINEL);  // intermediates are never DRAW
+					ASSERT(cr[j] != DRAW_SENTINEL);
 				const size_t base = multi_stream.size();
 				multi_stream.push_back(
 					static_cast<uint8_t>(k | (draw_end ? 0x80u : 0u)));
@@ -866,7 +836,6 @@ struct RS_Block_Encoder
 
 		const uint32_t np32 = static_cast<uint32_t>(num_positions);
 		const uint32_t num_multi = static_cast<uint32_t>(multi_dir.size() - 1);
-		// num_const derives as np - num_single - num_double - num_multi.
 		const size_t sh_bytes = (num_single + 7) / 8;
 		const size_t dh_bytes = (num_double + 7) / 8;
 		ASSERT(single_hints.size() == sh_bytes);
@@ -966,8 +935,8 @@ INLINE size_t dtm50_table_idx_of(Color c, int h)
 		+ static_cast<size_t>(h);
 }
 
-// h=0 feeds EGTB_Info (the canonical fresh-50MR view); other layers only
-// contribute to the rank score. Returns false iff every layer is all-ILLEGAL.
+// h=0 feeds EGTB_Info (the canonical reset-50MR view); other layers only
+// contribute to the rank score. Returns false iff no W/L storage values appear.
 NODISCARD bool gather_dtm50_info(
 	const Piece_Config_For_Gen& epsi,
 	DTM50_Table& table,
@@ -1009,12 +978,9 @@ NODISCARD bool gather_dtm50_info(
 				{
 					const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(p));
 					const uint16_t v = dtm_value_for_storage(e);
-					// DRAW (storage 0) and ILLEGAL are WDL-companion-authoritative
-					// don't-cares: the encoder synthesizes DRAW via the draw-end
-					// hint (non-CONST) or a placeholder rank (CONST), so storage 0
-					// never needs to be in the rank table on DRAW's account.
-					// LOSS-in-0 also stores as 0; if any exist they bring storage 0
-					// into the histogram organically.
+					// DRAW/ILLEGAL are routed via the WDL companion; the rank
+					// table only needs W/L storage values (LOSS-in-0 still adds
+					// storage 0 normally).
 					if (v != DTM_Final_Entry::ILLEGAL_VAL && !e.is_draw()) seen[v] = 1;
 					if (gather_info)
 					{
@@ -1035,19 +1001,14 @@ NODISCARD bool gather_dtm50_info(
 		for (size_t v = 0; v < DTM50_Rank_Table::LUT_SIZE; ++v)
 			if (per_layer_seen[h][v]) ++score[v];
 
-	// Detect "no W/L values seen at all" (whole-table DRAW/ILLEGAL) → caller
-	// marks the color singular-DRAW. We exclude DRAW from `seen` above, so this
-	// also fires when every position is canonical-DRAW.
+	// No W/L values anywhere → caller marks color singular-DRAW.
 	std::vector<uint16_t> values;
 	values.reserve(64);
 	for (size_t v = 0; v < DTM50_Rank_Table::LUT_SIZE; ++v)
 		if (score[v] != 0) values.push_back(static_cast<uint16_t>(v));
 	if (values.empty()) return false;
 
-	// Frequency sort. No DRAW pinning: the encoder uses NO_RANK as a sentinel
-	// for DRAW values not in the table, the decoder's draw-end branches set
-	// stored=0 directly, and CONST canonical-DRAW positions emit a placeholder
-	// rank (overridden at probe by dtm50_entry_from_storage's wdl=DRAW arm).
+	// Frequency sort; DRAW is intentionally absent (NO_RANK sentinel).
 	std::sort(values.begin(), values.end(),
 		[&](uint16_t a, uint16_t b) {
 			if (score[a] != score[b]) return score[a] > score[b];
@@ -1062,8 +1023,8 @@ NODISCARD bool gather_dtm50_info(
 	return true;
 }
 
-// Per-block pin loop holds one layer's group-range at a time so peak pin-count
-// stays at effective_workers × group_range, same as DTM/DTC under tight budgets.
+// Per-block pin loop holds one layer-range at a time; peak pin-count is
+// effective_workers × group_range (matches DTM/DTC under tight budgets).
 void save_compress_dtm50(
 	In_Out_Param<Thread_Pool> thread_pool,
 	DTM50_Table& table,
@@ -1120,13 +1081,10 @@ void save_compress_dtm50(
 			const size_t want_lo = group_id_of_pos(p_base);
 			const size_t want_hi = group_id_of_pos(p_base + this_bp - 1);
 
-			// "No live W/L information" → block-skip sentinel candidate.
-			// DRAW stores as 0; ILLEGAL stores as ILLEGAL_VAL. Both are safe to
-			// collapse to DRAW at probe time: DRAW round-trips, and ILLEGAL
-			// cells never reach the probe (upstream WDL guard) nor get read
-			// from the flat loader's array (only legal child indices are
-			// resolved by callers). Any other value means at least one cell is
-			// W/L at some layer and we must encode the block normally.
+			// Block-skip if no W/L cells: probe collapses DRAW/ILLEGAL to DRAW.
+			// MUST test entry class, not storage 0 — storage 0 also covers
+			// WIN-in-1 / LOSS-in-0, so `v == 0` would silently drop the only
+			// live cells in drawn-heavy sub-tables (KBKB, KNKN, KNNK, ...).
 			bool uniform_skip = true;
 			for (int h = 0; h < DTM50_HMC_COUNT; ++h)
 			{
@@ -1136,17 +1094,15 @@ void save_compress_dtm50(
 				for (size_t k = 0; k < this_bp; ++k)
 				{
 					const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(p_base + k));
-					const uint16_t v = dtm_value_for_storage(e);
-					row[k] = v;
-					if (v != 0 && v != DTM_Final_Entry::ILLEGAL_VAL)
+					row[k] = dtm_value_for_storage(e);
+					if (e.is_win() || e.is_loss())
 						uniform_skip = false;
 				}
 			}
 
 			if (uniform_skip)
 			{
-				// Emit zero compressed bytes. save_dtm50_table writes
-				// (dso=offset, usz=0); probe / flat loader check usz==0.
+				// usz=0 in the offset table is the skip sentinel.
 				out.usizes[b] = 0;
 				out.compressed_blocks[b].clear();
 				progress_bar += this_bp * DTM50_HMC_COUNT;

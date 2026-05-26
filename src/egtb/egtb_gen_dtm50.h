@@ -26,18 +26,15 @@
 
 // DTM50 = plies-to-mate under 50MR. 100 per-hmc layers per color.
 //
-// Build is one-shot forward classification of every cell at every layer.
-// Pawn slices iterate in topo order; within each slice's fusion the hmc
-// loop runs 99..0. The order makes every read a finalized read:
-//   - non-pawn quiet at hmc=k targets opp[k+1] of the *same* slice
-//     (built in the previous inner step; k=99 has no k+1 and falls back
-//     to an inline mate check standing in for virtual hmc=100 = 50MR draw),
-//   - pawn push (zeroing) at any hmc targets opp[0] of a *push-destination*
-//     slice in a prior fusion (already finalized in topo order),
-//   - capture / promotion reads the sub-tablebase.
+// Forward classification, one pass per (slice, hmc). Pawn slices in topo order;
+// hmc loop runs 99..0. Every read targets an already-finalized cell:
+//   - non-pawn quiet at hmc=k → opp[k+1] same slice (k=99 falls back to inline
+//     mate check standing in for virtual hmc=100 = 50MR draw),
+//   - pawn push at any hmc → opp[0] of a push-destination slice in a prior fusion,
+//   - cap/promo → sub-tablebase.
 //
-// hmc=99 of each fusion runs the full chess-legality check per cell; every
-// lower-hmc layer piggybacks the ILLEGAL flag from opp[k+1] at the same idx.
+// Only hmc=99 runs full chess-legality per cell; lower hmcs inherit ILLEGAL
+// from opp[k+1] at the same idx.
 
 struct DTM50_Interrupted
 {

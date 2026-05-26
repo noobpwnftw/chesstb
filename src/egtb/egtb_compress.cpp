@@ -10,9 +10,8 @@
 #include "util/memory.h"
 
 namespace {
-// Fill ILLEGAL (don't-care) runs with a neighbor value to maximize merged run
-// length for downstream compression. Returns false iff every cell is ILLEGAL
-// (caller skips compression; range is unreachable).
+// Run-stitch ILLEGAL spans with a neighboring value so the don't-care cells
+// disappear into surrounding runs. Returns false if every cell is ILLEGAL.
 template <typename T>
 NODISCARD bool prepare_entries_for_compression(Span<T> data, T illegal_val)
 {
@@ -141,7 +140,8 @@ std::optional<LZ4_Dict> make_dict_for_wdl(
 	{
 		const size_t bid = i * split;
 		const auto blk = src.get(bid, Span<uint8_t>(scratch.get(), block_size));
-		// num_blocks_to_use <= block_cnt = total/block_size, so sampled ids never hit the trailing-partial block.
+		// num_blocks_to_use <= block_cnt = total/block_size, so sampled ids
+		// never hit the trailing partial block.
 		ASSERT(blk.size() == block_size);
 		std::memcpy(dist_buf.get() + i * block_size, blk.data(), block_size);
 	}
@@ -196,16 +196,9 @@ size_t LZMA_Rank_Compress_Helper::compress(Span<uint8_t> dest, Const_Span<uint8_
 	const uint16_t* const v2r = m_rank_table->value_to_rank.data();
 	auto* const work = reinterpret_cast<uint16_t*>(m_scratch.data());
 
-	// Single storage callback covers both tiers. DTC's 2B path returns raw
-	// VALUE_MASK bits; DTM's path always halves (parity-lossless).
-	//
-	// Collapse DRAW (m_data == 0 for both DTC and DTM) into the same sentinel
-	// as ILLEGAL so prepare_entries_for_compression run-stitches both classes
-	// with neighboring W/L values. Probe-time is unaffected: the .lzw
-	// companion shortcuts DRAW/ILLEGAL before any DTC/DTM byte is consulted,
-	// so the stitched value is never read back. m_data == 0 is a sufficient
-	// DRAW test because finalized W/L entries always have a class flag set
-	// (DTC_FLAG_WIN/LOSS, DTM_FLAG_WIN/LOSS) and ILLEGAL has m_data == VALUE_MASK.
+	// Collapse DRAW (m_data == 0 for both DTC and DTM) into the ILLEGAL
+	// sentinel so the run-stitch pass folds both don't-care classes. Probe
+	// reads them via the .lzw companion and never consults these bytes.
 	const uint16_t illegal_v = m_storage_fn(DTC_Final_Entry::ILLEGAL_VAL, m_entry_bytes);
 	for (size_t i = 0; i < entries; ++i)
 		work[i] = (in[i] == 0) ? illegal_v : m_storage_fn(in[i], m_entry_bytes);
@@ -326,8 +319,6 @@ void save_wdl_table(
 		file_size += t.total_compressed_size();
 		file_size = ceil_to_multiple(file_size, (size_t)64);
 	}
-
-	// file_size is found.
 
 	Memory_Mapped_File write_map;
 	if (!write_map.create(file_path.c_str(), file_size + 8))
@@ -466,8 +457,6 @@ void save_egtb_table(
 		file_size += t.total_compressed_size();
 		file_size = ceil_to_multiple(file_size, (size_t)64);
 	}
-
-	// file_size is found.
 
 	Memory_Mapped_File write_map;
 	write_map.create(file_path.c_str(), file_size + 8);
@@ -704,10 +693,7 @@ void load_wdl_table(
 	}
 }
 
-// File format is identical to save_egtb_table (DTC writer): per-color header
-// {flag, entry_bytes, tail_size, block_size, block_cnt, data_size, num_ranks,
-// ranks[]}, followed by per-color packed 8-byte block-offset table, 64-byte
-// align, then compressed-data regions. See save_egtb_table for the wire layout.
+// Wire format: see save_egtb_table.
 void load_dtm_table(
 	Out_Param<DTM_File_For_Probe> dtm,
 	const Piece_Config& ps,
@@ -796,11 +782,9 @@ void load_dtm_table(
 	}
 }
 
-// Same wire format as load_dtm_table, but instead of stashing block pointers
-// for lazy LZMA-decode-on-read, this version eagerly decompresses every block,
-// remaps rank→storage value, resolves WDL class → DTM_Final_Entry inline, and
-// streams the result into a per-color tmp file that's then mmap'd into flat->m_files.
-// Read becomes a flat indexed memcpy — no per-thread cache, no LZMA on the hot path.
+// Eager-decode variant of load_dtm_table: every block decompresses up front,
+// resolves WDL class inline, and lands in a mmap'd per-color tmp file. Sub-TB
+// reads become a flat indexed memcpy; no LZMA on the read path.
 void load_dtm_sub_flat(
 	Out_Param<DTM_Sub_File_Flat> flat,
 	const EGTB_Paths& egtb_files,
@@ -816,9 +800,8 @@ void load_dtm_sub_flat(
 		throw std::runtime_error("Could not find a WDL file for " + ps.name()
 			+ " (DTM consumes DTC's wdl/ output)");
 
-	// Companion WDL for class resolution. Sized for parallel reads from the
-	// per-block decode workers below — each worker probes wdl.read() with its
-	// own thread_id.
+	// Companion WDL for class resolution; per-block workers below read it
+	// concurrently via their own thread_id.
 	const WDL_File_For_Probe wdl(egtb_files, ps, thread_pool);
 
 	Memory_Mapped_File map_file;
@@ -910,10 +893,8 @@ void load_dtm_sub_flat(
 
 		if (is_singular[i])
 		{
-			// Singular DTM ⇒ DRAW everywhere. ILLEGAL cells are allocated but
-			// never probed (sub-TB callers always resolve to a legal child idx),
-			// so just blank-fill DRAW. DTM_Final_Entry's default 0 == DRAW;
-			// memset is equivalent to per-cell make_draw() but constant-time.
+			// DRAW everywhere; ILLEGAL slots are allocated but never read
+			// (sub-TB callers resolve to legal child indices).
 			std::memset(out, 0, file_bytes);
 		}
 		else
@@ -923,11 +904,8 @@ void load_dtm_sub_flat(
 			if (src_sz != num_positions * entry_bytes[i])
 				throw std::runtime_error("DTM decompressed size mismatch " + dtm_path.string());
 
-			// Each block writes a disjoint output slice (every non-tail block
-			// writes exactly positions_per_block entries at idx*positions_per_block),
-			// so workers can decode in parallel without coordination. Atomic
-			// fetch_add gives dynamic load-balance — cheap all-ILLEGAL blocks
-			// (dsz == 0) don't stall workers stuck on slower LZMA blocks.
+			// Blocks write disjoint output slices; atomic fetch_add load-
+			// balances cheap dsz==0 skip blocks against LZMA-heavy ones.
 			const auto& r2v = rank_to_value[i];
 			const size_t blocks = block_cnt[i];
 			const size_t positions_per_block = block_size[i] / entry_bytes[i];
@@ -951,14 +929,10 @@ void load_dtm_sub_flat(
 					const size_t positions = decode_sz / entry_bytes[i];
 					const size_t pos = idx * positions_per_block;
 
+					// Skip block: encoder collapsed an all-don't-care span; see
+					// singular-DRAW arm above for why DRAW-fill is correct.
 					if (dsz == 0)
 					{
-						// Don't-care block: every cell is DRAW or ILLEGAL (the
-						// encoder folds both classes into the same run-stitch
-						// sentinel). Blank-fill DRAW — same justification as the
-						// singular-DRAW path above: ILLEGAL slots are allocated
-						// but never probed (sub-TB callers always resolve to a
-						// legal child idx).
 						std::memset(out + pos, 0, positions * sizeof(DTM_Final_Entry));
 						continue;
 					}
@@ -994,7 +968,7 @@ void load_dtm_sub_flat(
 }
 
 // Eagerly decompress and remap the hmc=0 column of the rs-pack into a flat
-// mmap'd array — that's the only column higher-piece DTM50 gens read.
+// mmap'd array; higher-piece DTM50 generators read only that column.
 // File / block layout is defined in egtb_gen_dtm50.cpp::save_to_disk.
 void load_dtm50_sub_flat(
 	Out_Param<DTM50_Sub_File_Flat> flat,
@@ -1101,8 +1075,7 @@ void load_dtm50_sub_flat(
 
 		if (is_singular[i])
 		{
-			// Singular ⇒ DRAW everywhere. ILLEGAL cells are allocated but never
-			// probed (sub-TB callers always resolve to legal child indices).
+			// DRAW everywhere; see load_dtm_sub_flat singular arm.
 			std::memset(out, 0, file_bytes);
 			flat->m_files[i] = std::move(out_map);
 			continue;
@@ -1114,9 +1087,8 @@ void load_dtm50_sub_flat(
 		const size_t eb = entry_bytes[i];
 		std::atomic<size_t> next_block(0);
 
-		// Decompress buffer must hold the worst-case payload across all four
-		// state regions (positions are mutually exclusive across states, so this
-		// strictly overestimates).
+		// Strict upper bound: sums the worst case for each state region (they're
+		// mutually exclusive per position, so this overestimates).
 		const size_t max_payload =
 			24                                                  // header
 			+ (ppb * 2 + 7) / 8                                 // state_bits
@@ -1143,11 +1115,7 @@ void load_dtm50_sub_flat(
 					(bidx == blocks - 1 && tail_positions[i] != 0) ? tail_positions[i] : ppb;
 				const size_t base_pos = bidx * ppb;
 
-				// Block-skip sentinel: usz==0 → uniform-DRAW block, no payload.
-				// Same logic as the singular-DRAW path above — ILLEGAL cells in
-				// the flat array are allocated but never probed (sub-TB callers
-				// always resolve to legal child indices), so writing DRAW for
-				// every cell in the range is safe.
+				// Skip sentinel: all-don't-care span, DRAW-fill (see above).
 				if (usz == 0)
 				{
 					std::memset(out + base_pos, 0,
@@ -1183,17 +1151,11 @@ void load_dtm50_sub_flat(
 				p += (num_multi + 1) * 4;
 				const uint8_t* multi_data = p;
 
-				// Sequential walk: track running indices into each per-state
-				// stream + byte offsets for the variable-length SINGLE/DOUBLE
-				// streams. r0 sits at a fixed offset within each entry:
-				//   CONST  → const_stream[idx * eb]
-				//   SINGLE → entry[1]              (skip h)
-				//   DOUBLE → entry[2]              (skip h1, h2)
-				//   MULTI  → entry[17]             (skip k + 16B bitmap)
-				// hmc=0 always reads r0 of every entry; the draw-end hint
-				// (which would synthesize stored=0) can't fire at hmc=0
-				// because h ≥ 1 puts hmc=0 strictly before the first
-				// transition, selecting r0 unconditionally.
+				// hmc=0 read: r0 lives at a fixed entry offset per state
+				// (CONST: 0, SINGLE: 1, DOUBLE: 2, MULTI: 17). Sequential walk
+				// keeps per-state running indices + variable-length stream
+				// offsets for SINGLE/DOUBLE. Draw-end hint can't fire here:
+				// h >= 1 so hmc=0 is always strictly before the first transition.
 				const size_t single_short = 1 + eb;
 				const size_t single_long  = 1 + 2 * eb;
 				const size_t double_short = 2 + 2 * eb;

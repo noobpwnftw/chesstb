@@ -153,9 +153,8 @@ DTM_Final_Entry DTM_Generator::read_post_move_dtm(const Position_For_Gen& pos_ge
 
 namespace {
 
-// Comparator: returns true if `a` is strictly better for the side that's about
-// to MAKE the move (i.e., we want the highest-class outcome; tiebreak by smaller
-// dtm if WIN, larger dtm if LOSS).
+// True iff `a` is strictly better for the mover: highest class, then
+// smaller dtm on WIN / larger dtm on LOSS.
 INLINE bool dtm_better_for_mover(DTM_Final_Entry a, DTM_Final_Entry b)
 {
 	auto rank = [](DTM_Final_Entry e) -> int {
@@ -187,7 +186,7 @@ DTM_Final_Entry DTM_Generator::effective_opp_dtm_after_dp(const Position_For_Gen
 	const Rank ep_target_rank = (opp == WHITE) ? RANK_6 : RANK_3;
 	const File push_file = sq_file(dp_move.to());
 
-	DTM_Final_Entry best_ep_for_opp = DTM_Final_Entry::make_loss(0);  // worst possible for opp; bumped on first EP
+	DTM_Final_Entry best_ep_for_opp = DTM_Final_Entry::make_loss(0);  // worst for opp; first EP overrides
 	bool any_ep = false;
 
 	std::optional<Position_For_Gen> p_gen_for_ep;
@@ -209,8 +208,7 @@ DTM_Final_Entry DTM_Generator::effective_opp_dtm_after_dp(const Position_For_Gen
 			if (child_idx == BOARD_INDEX_NONE) continue;
 			p_gen_for_ep.emplace(m_epsi, child_idx, opp);
 		}
-		// read_sub_tb returns the post-EP DTM from the new STM's (mover's)
-		// perspective. Invert class AND add 1 ply to account for opp's EP move.
+		// Post-EP DTM is from new STM (mover) — invert class and +1 ply for opp's EP.
 		const DTM_Final_Entry after_ep = read_sub_tb(*p_gen_for_ep, ep_move, thread_id);
 		DTM_Final_Entry opp_at_pre_ep;
 		if (after_ep.is_illegal())          continue;
@@ -260,8 +258,7 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 		if (!is_cap && !m.is_promotion())
 		{
 			any_in_material = true;
-			// Pawn push crosses pawn slices — post-push child lives in an
-			// already-built slice that doesn't iterate, so retro can't bridge.
+			// Pawn push crosses slices; child lives in a non-iterating built slice → retro can't bridge.
 			if (piece_type(pos.piece_at(m.from())) == PAWN)
 				any_pawn_eval = true;
 			continue;
@@ -282,14 +279,14 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 		}
 		else
 		{
-			// DRAW sub-outcome — blocks both pure-WIN and forced-LOSS classification.
+			// DRAW blocks both pure-WIN and forced-LOSS classification.
 			saw_draw = true;
 		}
 	}
 	if (!any_legal)
 	{
-		// Stalemate is plain Intermediate (m_data=0). No pre-quiet pred can land
-		// on a no-move position, so this never gets overwritten by retro.
+		// Stalemate: plain Intermediate. No pre-quiet pred lands on a no-move
+		// position, so retro never overwrites it.
 		if (in_check) return DTM_Final_Entry::make_loss(0);
 		return DTM_Intermediate_Entry{};
 	}
@@ -299,13 +296,12 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 
 	if (!any_in_material && !saw_draw)
 	{
-		// All cap/promo moves resolve to opp-WIN; no in-material escape; no draw.
-		// Position is forced LOSS at the max sub child dtm + 1.
+		// All cap/promo → opp-WIN, no in-material escape, no draw → forced LOSS at max child dtm + 1.
 		if (*worst_loss_dtm > 0)
 			return DTM_Final_Entry::make_loss(*worst_loss_dtm);
 	}
 	// Intermediate; *worst_loss_dtm seeds m_max_dtm so iterate runs long enough
-	// for check_loss to fire at the cap/promo-driven classification ply.
+	// for check_loss at the cap/promo classification ply.
 	return any_pawn_eval
 		? DTM_Intermediate_Entry::make_pawn_eval()
 		: DTM_Intermediate_Entry{};
@@ -325,8 +321,8 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 	for (int32_t pid : m_active_pawn_slices)
 		targets_by_pid[static_cast<size_t>(pid)] = psm.push_target_slices(pid);
 
-	// Init working set: both colors at g, plus (push_target_pid, same_kid) for
-	// the read_post_move_dtm path. Init writes both colors, so needs[B] == needs[W].
+	// Working set: both colors at g + (push_target_pid, same_kid) for read_post_move_dtm.
+	// Init writes both colors, so needs[B] == needs[W].
 	auto page_in_for_init_group = [&](size_t g) {
 		if (m_paging_budget_bytes == 0) return;
 		m_scratch_need[WHITE].assign(ngroups, 0);
@@ -431,9 +427,7 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 							}
 						},
 						[&](DTM_Intermediate_Entry entry) {
-							// DTM_Intermediate_Entry implicit-converts to DTM_Final_Entry
-							// (bit-identical 16-bit storage).
-							write_dtm(idx, us, entry);
+							write_dtm(idx, us, entry);  // implicit-converts to Final (bit-identical)
 							update_max(local_max, worst_loss_dtm);
 						},
 					}, make_initial_entry(pos_gen, tid, out_param(worst_loss_dtm)));
@@ -473,19 +467,16 @@ DTM_Generator::Iter_Action DTM_Generator::action_for_entry(DTM_Final_Entry e, ui
 		return Iter_Action::SKIP;
 	}
 
-	// WIN(ply) and WIN(ply-1) both fire MARK_CHANGED so predecessors' check_loss
-	// finds a fully-classified child. The two plies cover same-ply (e.g. just
-	// overwritten by retro at this ply) and prior-ply settlings. ply >= 1 here
-	// since the ply == 0 branch returned above.
+	// WIN(ply) and WIN(ply-1) both MARK_CHANGED so pred check_loss sees a
+	// fully-classified child (same-ply just-overwritten + prior-ply settled).
 	if (e.is_win() && (e.value() == ply || e.value() == ply - 1))
 		return Iter_Action::MARK_CHANGED;
 
 	if (e.is_loss() && e.value() == ply)
 		return Iter_Action::MARK_WIN_PREDS;
 
-	// Pawnful stale WIN: init may have seeded WIN(value > ply) from cap/promo.
-	// A faster mate via in-material pawn pushes can overwrite this. Same handler
-	// as PAWN_EVAL — it just won't fall through to check_loss for non-draw e.
+	// Stale WIN(value > ply) from init cap/promo seed; faster in-material pawn
+	// push can overwrite. Routes through PAWN_EVAL handler (no check_loss fallthrough).
 	if (has_pawns && e.is_win() && e.value() > ply)
 		return Iter_Action::PAWN_EVAL;
 
@@ -532,8 +523,7 @@ DTM_Generator::Loss_Verification_Result DTM_Generator::check_loss(
 		}
 		else
 		{
-			// Quiet in-material move (incl. single pawn push) — child is in the
-			// current table.
+			// Quiet in-material (incl. single pawn push); child is in current table.
 			const Board_Index child = next_quiet_index(pos_gen, m);
 			if (child == BOARD_INDEX_NONE) return r;
 			const DTM_Final_Entry ce = read_dtm(child, opp);
@@ -583,8 +573,7 @@ void DTM_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
 		if (pred == BOARD_INDEX_NONE) continue;
 		const auto e = read_dtm(pred, opp);
 		if (!e.is_draw() || e.has_change()) continue;
-		// Atomic OR: a concurrent retro_mark_wins overwrite to Final clears the
-		// flag naturally (we always write fresh class+value).
+		// Atomic OR; a concurrent retro_mark_wins overwrite to Final clears it.
 		m_table->m_dtm[opp].lock_add_flags(pred, DTM_FLAG_CHANGE);
 		mark_iter(opp, pred, m_table->m_dtm[opp]);
 	}
@@ -605,10 +594,9 @@ bool DTM_Generator::retro_mark_wins(Position_For_Gen& pos_gen,
 		const DTM_Final_Entry cur = read_dtm(pred, opp);
 		if (cur.is_illegal()) continue;
 		if (cur.is_loss()) continue;  // never demote a classified LOSS
-		// Overwrite Intermediate (DRAW with optional CHANGE bit) OR a stale WIN
-		// with larger dtm. The latter is DTM-specific: init seeded WIN from
-		// cap/promo at sub_dtm+1; retrograde may find a smaller dtm via in-
-		// material quiet moves and must improve the seed.
+		// Overwrite Intermediate OR stale WIN with larger dtm. The stale-WIN
+		// case is DTM-specific: init seeds WIN(sub_dtm+1) from cap/promo; retro
+		// may find a smaller dtm via in-material quiets and must improve it.
 		if (cur.is_win() && cur.value() <= target_dtm) continue;
 		write_dtm(pred, opp, new_e);
 		wrote = true;
@@ -655,7 +643,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 					const DTM_Final_Entry e = read_dtm(idx, stm);
 					if (e.is_illegal()) continue;
 
-					// Only flagged Intermediates revisit; bare DRAW SKIPs forever.
+					// Only flagged Intermediates revisit; bare DRAW skips forever.
 					if (e.is_draw() && (e.has_change() || e.has_pawn_eval()))
 						chunk.any_intermediate = true;
 					else
@@ -693,8 +681,8 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 					case Iter_Action::CHANGE_REVERIFY:
 					case Iter_Action::PAWN_EVAL:
 					{
-						// Forward pawn-WIN: a push reaching opp-LOSS(ply-1) makes
-						// this cell WIN(ply); also improves stale WIN(value > ply).
+						// Forward pawn-WIN: push to opp-LOSS(ply-1) → WIN(ply);
+						// also improves stale WIN(value > ply).
 						bool pawn_marked = false;
 						if (has_pawns)
 						{
@@ -731,9 +719,9 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 						const auto res = check_loss(pos_gen, ml, ply, tid);
 						if (!res.is_loss)
 						{
-							// Only the CHANGE path counts as a write — clearing the
-							// flag keeps iterate alive for one more ply. PAWN_EVAL
-							// with no change can't bump wrote or iterate overshoots.
+							// Only CHANGE clears count as wrote — keeps iterate
+							// alive one more ply. PAWN_EVAL-no-change must not
+							// bump wrote, else iterate overshoots.
 							if (e.has_change())
 							{
 								write_dtm(idx, stm, e.without_change());
@@ -755,7 +743,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 				if (chunk.any_intermediate) local.any_intermediate = true;
 				update_max(local.max_classified, chunk.max_classified);
 
-				// Evict only full-CHUNK_SIZE chunks — head/tail share their bit.
+				// Evict full-CHUNK_SIZE chunks only; head/tail share a bit.
 				if (static_cast<size_t>(chunk_end) - static_cast<size_t>(chunk_start) == CHUNK_SIZE
 				    && !chunk.any_intermediate && chunk.max_classified + 1 < ply)
 					m_iter_chunks[stm][cid] = 0;
@@ -770,9 +758,8 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 			if (r.any_intermediate) any_intermediate = true;
 			update_max(max_classified, r.max_classified);
 		}
-		// Evict: no Intermediate cells remain and every classified cell's value
-		// is strictly behind ply-1, so no action_for_entry can fire at this ply
-		// or any future ply. Any later write reinstates the bit via mark_iter.
+		// Evict: no Intermediates and every classified value < ply-1 → no
+		// action_for_entry will fire here again. Later writes reinstate via mark_iter.
 		if (!any_intermediate && max_classified + 1 < ply)
 			m_iter_groups[stm][g] = 0;
 	}
@@ -800,20 +787,16 @@ void DTM_Generator::iterate(In_Out_Param<Thread_Pool> thread_pool, uint16_t fini
 		const Iter_Result rb = run_iter(thread_pool, BLACK, finished_ply);
 		update_max(m_max_dtm, rw.max_v);
 		update_max(m_max_dtm, rb.max_v);
-		// A silent ply is only a safe stop AFTER we've passed every classified
-		// dtm value. Init-seeded WIN(d) (from cap/promo to opp-LOSE with deep
-		// sub-DTM) sits dormant until ply hits d-1, so we cannot terminate
-		// before then.
+		// Silent ply is safe to stop on only past every classified dtm value:
+		// init-seeded WIN(d) from cap/promo sits dormant until ply hits d-1.
 		if (!rw.wrote && !rb.wrote && finished_ply > m_max_dtm) break;
 		check_interrupt(finished_ply);
 	}
 }
 
 // =============================================================================
-// Paging (working-set load/evict). apply_working_set lives in egtb_gen.h
-// (templated, shared with DTC); page_in_for_group is DTM-specific because it
-// folds opp's push-target groups into the working set for PAWN_EVAL inside
-// run_iter.
+// Paging. apply_working_set is shared (egtb_gen.h); page_in_for_group is
+// DTM-specific because it folds opp's push-target groups in for PAWN_EVAL.
 // =============================================================================
 
 void DTM_Generator::page_in_for_group(In_Out_Param<Thread_Pool> thread_pool,
@@ -860,9 +843,8 @@ void DTM_Generator::page_in_for_group(In_Out_Param<Thread_Pool> thread_pool,
 			}
 			if (has_pawns)
 			{
-				// PAWN_EVAL inside run_iter reads opp's push-target groups at
-				// the same king-slice. DTC doesn't need this — pawns there are
-				// handled forward-only at init.
+				// PAWN_EVAL reads opp's push-target groups at same king-slice.
+				// DTC handles pawns forward-only at init, so doesn't need this.
 				for (int32_t tpid : psm.push_target_slices(pid))
 				{
 					const size_t target =
@@ -910,7 +892,7 @@ void DTM_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths&
 		}
 	}
 
-	// Unbounded budget: pre-resident-load every group; paging is a no-op.
+	// Unbounded budget: pre-load every group; paging is a no-op.
 	if (m_paging_budget_bytes == 0)
 	{
 		const size_t ng = m_table->m_dtm[WHITE].num_groups();
@@ -1106,15 +1088,11 @@ void gather_dtm_info(
 				info.add_result(color, e.wdl(), w);
 				if (e.is_win())
 					info.maybe_update_longest_win(color, idx, e.value());
-				// DRAW and ILLEGAL are both WDL-shortcuttable at probe time
-				// (the .lzw companion decides class first; DTM bytes for these
-				// cells are never read). Excluding them from the histogram lets
-				// the rank table allocate its short codes to W/L values.
+				// DRAW/ILLEGAL: WDL companion is authoritative — exclude from
+				// histogram so rank table spends short codes on W/L values.
 				if (!e.is_illegal() && !e.is_draw())
 				{
-					// DTM halves storage in both tiers (parity invariant), so a
-					// single histogram over halved values suffices. hist_2b is
-					// unused for DTM and stays zero-initialized.
+					// hist_2b unused (DTM halves in both tiers); stays zeroed.
 					const uint16_t v = dtm_value_for_storage(e);
 					if (v < Value_Histogram::HIST_BINS) ++hist.hist_1b[v];
 				}
@@ -1215,8 +1193,6 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 			m_info.draw_cnt[me]    = probe.legal_cnt;
 			m_info.illegal_cnt[me] = probe.illegal_cnt;
 			std::printf("save dtm %d: singular DRAW\n", static_cast<int>(me));
-			// Reuse Compressed_EGTB's singular shape; DTM consumer treats the
-			// singular DRAW just like DTC does.
 			dtm_save[me] = Compressed_EGTB::make_singular(WDL_Entry::DRAW);
 		}
 		else
@@ -1231,8 +1207,7 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 		}
 	}
 
-	// Both tiers store the same halved value, so a single rank table covers
-	// both — the tier choice only affects rank-index width on disk.
+	// Both tiers store the same halved value; tier only affects rank-index width.
 	Value_Rank_Table dtm_rank[COLOR_NB];
 	size_t dtm_entry_bytes[COLOR_NB]{};
 	for (Color me : colors)

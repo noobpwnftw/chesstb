@@ -30,10 +30,10 @@
 
 namespace {
 
-// Enough slots to avoid thrashing during derive_dropped child probes.
+// Sized for derive_dropped child probes.
 constexpr size_t BLOCK_CACHE_SLOTS = 32;
 
-// Identifies a Per_Color across heap-address reuse for the TL cache key.
+// TL-cache key: distinguishes Per_Color instances across heap reuse.
 inline uint64_t next_probe_epoch()
 {
 	static std::atomic<uint64_t> ctr{0};
@@ -61,9 +61,8 @@ constexpr const char* DTC_EXT = ".lzdtc";
 constexpr const char* DTM_EXT = ".lzdtm";
 constexpr const char* DTM50_EXT = ".lzdtm50";
 constexpr size_t DTM50_HMC_COUNT = 100;
-// Sentinel for internal probe_impl callers that don't want DTM50 populated
-// (root probers using DTZ-only ordering). Public probe() defaults rule50 to
-// 0 so default callers still get the fresh-window DTM50 layer.
+// Sentinel for root probers using DTZ-only ordering; public probe() defaults
+// rule50 to 0.
 constexpr unsigned PROBE_IMPL_SKIP_DTM50 = ~0u;
 
 
@@ -118,7 +117,6 @@ Position mirror_for_canonical(const Position& pos)
 	return swapped;
 }
 
-// Per-color block cache with on-demand decompression.
 struct WDL_Probe_File
 {
 	struct Block_Index_Entry
@@ -525,11 +523,8 @@ DTC_Final_Entry DTC_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
 	if ((dso & 0xFFFFF) == 0)
 	{
-		// Skip-block sentinel: every cell is DRAW or ILLEGAL (encoder folds
-		// both into a run-stitch don't-care). ILLEGAL never reaches this read
-		// — upstream WDL-table guard short-circuits before consulting DTC —
-		// and W/L would have forced a non-zero stored value at some cell, so
-		// returning DRAW is safe and matches the WDL companion's verdict.
+		// Skip-block: uniform DRAW/ILLEGAL. ILLEGAL never reaches here
+		// (WDL guard upstream); W/L would have forced a non-zero cell.
 		return DTC_Final_Entry::make_draw();
 	}
 
@@ -553,7 +548,7 @@ DTC_Final_Entry DTC_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	return dtc_entry_from_storage(stored, wdl, pc.entry_bytes);
 }
 
-// DTM uses the DTC container layout with a different magic and decoder.
+// Same container as DTC; different magic + decoder.
 struct DTM_Probe_File
 {
 	struct Per_Color
@@ -740,11 +735,7 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
 	if ((dso & 0xFFFFF) == 0)
 	{
-		// Skip-block sentinel: every cell is DRAW or ILLEGAL (encoder folds
-		// both into a run-stitch don't-care). ILLEGAL never reaches this read
-		// — upstream WDL-table guard short-circuits before consulting DTM —
-		// and W/L would have forced a non-zero stored value at some cell, so
-		// returning DRAW is safe and matches the WDL companion's verdict.
+		// Skip-block: see DTC_Probe_File::read.
 		return DTM_Final_Entry::make_draw();
 	}
 
@@ -768,18 +759,17 @@ DTM_Final_Entry DTM_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl)
 	return dtm_entry_from_storage(stored, wdl);
 }
 
-// DTM50 packed file: one file per material, all hmc layers in a single block
-// stream via layer-axis change-point encoding (see save_to_disk in
-// egtb_gen_dtm50.cpp for the on-disk layout). read() dispatches by hmc.
+// DTM50: all hmc layers in a single change-point-encoded stream. On-disk
+// layout: see save_to_disk in egtb_gen_dtm50.cpp.
 struct DTM50_Probe_File
 {
 	struct Per_Color
 	{
 		size_t entry_bytes = 0;          // 1 or 2 bytes per rank
-		size_t block_positions = 0;      // positions per non-tail block
-		size_t tail_positions = 0;       // positions in last block, 0 if no tail
+		size_t block_positions = 0;
+		size_t tail_positions = 0;       // 0 if no tail
 		size_t block_cnt = 0;
-		const uint8_t* offset_tb = nullptr;   // 16-byte entries: (dso, usz)
+		const uint8_t* offset_tb = nullptr;   // 16B entries: (dso, usz)
 		const uint8_t* compressed_data = nullptr;
 		std::vector<uint16_t> rank_to_value;
 
@@ -880,7 +870,7 @@ void DTM50_Probe_File::load(const Piece_Config& ps, const std::filesystem::path&
 
 namespace {
 
-// Exclusive popcount: count set bits in the first `bit_count` bits of `bm`.
+// Popcount of the first `bit_count` bits of `bm`.
 NODISCARD INLINE size_t popcount_prefix_exclusive(const uint8_t* bm, size_t bit_count)
 {
 	if (bit_count == 0) return 0;
@@ -904,10 +894,9 @@ NODISCARD INLINE size_t popcount_prefix_exclusive(const uint8_t* bm, size_t bit_
 	return pc;
 }
 
-// Prefix counts of each per-position state in the 2-bit state vector, plus the
-// state at `pos`. State encoding (matches encoder in egtb_gen_dtm50.cpp):
+// 2-bit state vector (see egtb_gen_dtm50.cpp):
 //   00 CONST   01 SINGLE   10 DOUBLE   11 MULTI
-// Within each byte: position p occupies bits (2p mod 8) and (2p mod 8)+1.
+// Position p occupies bits 2p, 2p+1 within its byte.
 struct State_Prefix
 {
 	uint32_t n_const;
@@ -917,10 +906,8 @@ struct State_Prefix
 	uint8_t  state_at_pos;
 };
 
-// Stride table built at block-decompress time. Each entry holds the cumulative
-// per-state count at position `stride_id * DTM50_PREFIX_STRIDE`. At read time
-// state_prefix only walks at most STRIDE-1 positions of state_bits from the
-// stride snapshot, replacing the O(block_positions) scan with O(STRIDE).
+// Per-stride state-count snapshots; turn the per-read scan from
+// O(block_positions) into O(STRIDE). 256 keeps the table at 32B/stride.
 constexpr size_t DTM50_PREFIX_STRIDE = 256;
 
 struct DTM50_Prefix_Entry
@@ -932,8 +919,7 @@ struct DTM50_Prefix_Entry
 };
 static_assert(sizeof(DTM50_Prefix_Entry) == 16);
 
-// Sum the SINGLE/DOUBLE/MULTI bits in [bit_lo, bit_hi). Caller decrements
-// `nonc` from the position span to recover the CONST count.
+// Tally SINGLE/DOUBLE/MULTI in [bit_lo, bit_hi); CONST = span - sum.
 INLINE void popcount_state_range(
 	const uint8_t* sb, size_t bit_lo, size_t bit_hi,
 	uint32_t& ns, uint32_t& nd, uint32_t& nm)
@@ -1009,13 +995,9 @@ NODISCARD INLINE State_Prefix state_prefix_indexed(
 
 }  // namespace
 
-// Cached buffer layout for a non-skipped block:
-//   uint32 payload_size                              decompressed LZMA size
-//   uint8  payload[payload_size]                     raw block payload
-//   DTM50_Prefix_Entry prefix[n_strides]             precomputed state index
-// The 4-byte prefix lets read() locate the prefix table from the cached
-// `Block_Ptr` alone, without consulting the offset table again. Skipped blocks
-// (uniform-DRAW, usz==0) are short-circuited in read() before reaching here.
+// Cached buffer: [uint32 payload_size][payload][DTM50_Prefix_Entry prefix...].
+// payload_size up front so read() can find `prefix` from the Block_Ptr alone.
+// Skipped blocks (usz==0) are short-circuited in read() before reaching here.
 Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 {
 	for (size_t i = 0; i < pc.live; ++i)
@@ -1024,7 +1006,7 @@ Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 	uint64_t dso, usz;
 	std::memcpy(&dso, pc.offset_tb + block_id * 16,     8);
 	std::memcpy(&usz, pc.offset_tb + block_id * 16 + 8, 8);
-	ASSERT(usz != 0);  // caller must check the skip sentinel before this
+	ASSERT(usz != 0);  // read() checks the skip sentinel first
 	const size_t dsz  = dso & 0xFFFFFu;
 	const size_t doff = dso >> 20;
 
@@ -1043,8 +1025,7 @@ Block_Ptr DTM50_Probe_File::get_block_locked(Per_Color& pc, size_t block_id)
 	const Const_Span<uint8_t> raw = pc.decomp->decompress(
 		Const_Span(pc.compressed_data + doff, dsz), usz);
 
-	// Parse num_positions from the freshly decompressed header to size the
-	// prefix-index tail of the buffer.
+	// num_positions from the just-decompressed header sizes the prefix tail.
 	uint32_t np32;
 	std::memcpy(&np32, raw.data(), 4);
 	const size_t n_strides = (np32 + DTM50_PREFIX_STRIDE - 1) / DTM50_PREFIX_STRIDE;
@@ -1078,12 +1059,9 @@ DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, 
 	const size_t block_id = static_cast<size_t>(pos) / ppb;
 	const size_t pos_in_block = static_cast<size_t>(pos) % ppb;
 
-	// Block-skip sentinel: usz == 0 ⇒ uniform-DRAW block, no payload. Such a
-	// block by construction can only hold canonical-DRAW positions (any W/L
-	// position would force stored != 0 at some layer), and ILLEGAL positions
-	// never reach this read() — the upstream WDL-table guard short-circuits
-	// before probe_dtm50_internal. So wdl is always DRAW/cursed/blessed here,
-	// all of which decode to DRAW regardless of hmc.
+	// Skip-block (usz==0): uniform DRAW. W/L would force a non-zero cell at
+	// some layer, and ILLEGAL is filtered by the upstream WDL guard, so wdl
+	// is DRAW/cursed/blessed here — all decode to DRAW regardless of hmc.
 	uint64_t usz;
 	std::memcpy(&usz, pc.offset_tb + block_id * 16 + 8, 8);
 	if (usz == 0) return DTM_Final_Entry::make_draw();
@@ -1103,8 +1081,6 @@ DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, 
 		tl.bytes[s]    = blk;
 		buf_data = blk->data();
 	}
-	// Cached buffer layout (see get_block_locked): [uint32 payload_size,
-	// payload..., prefix_index...].
 	uint32_t payload_size;
 	std::memcpy(&payload_size, buf_data, 4);
 	const uint8_t* payload = buf_data + 4;
@@ -1138,22 +1114,20 @@ DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, 
 
 	const State_Prefix sp = state_prefix_indexed(state_bits, prefix, pos_in_block);
 
-	// Per-state entry sizes for SINGLE/DOUBLE (variable: short = draw-end).
+	// short = draw-end variant.
 	const size_t single_short = 1 + eb;
 	const size_t single_long  = 1 + 2 * eb;
 	const size_t double_short = 2 + 2 * eb;
 	const size_t double_long  = 2 + 3 * eb;
 
-	// DRAW is no longer pinned to a rank: the draw-end hint synthesizes
-	// stored=0 directly, bypassing the rank→storage lookup. At hmc=0 this is
-	// unreachable (h ≥ 1 so the draw-end branch can't fire); at hmc>0
-	// dtm50_layered_entry_from_storage's stored==0 short-circuit produces DRAW,
-	// which upstream recover_mate_at_hmc lifts back to WIN/LOSE if needed.
+	// DRAW is unpinned: the draw-end hint synthesizes stored=0 directly.
+	// Unreachable at hmc=0 (h≥1); at hmc>0 the stored==0 path returns DRAW,
+	// which recover_mate_at_hmc lifts back to WIN/LOSE if needed.
 	uint16_t stored;
 	switch (sp.state_at_pos)
 	{
 		case 0: {
-			// CONST: one rank, regardless of hmc.
+			// CONST: one rank for all hmc.
 			const size_t idx = sp.n_const;
 			uint16_t rank;
 			if (eb == 1) rank = const_stream[idx];
@@ -1162,7 +1136,7 @@ DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, 
 			break;
 		}
 		case 1: {
-			// SINGLE: one transition at h. hmc < h → r0; else r1 (or DRAW).
+			// SINGLE: one transition at h.
 			const size_t idx = sp.n_single;
 			const size_t n_short = popcount_prefix_exclusive(single_hints, idx);
 			const size_t byte_off = n_short * single_short + (idx - n_short) * single_long;
@@ -1217,7 +1191,7 @@ DTM_Final_Entry DTM50_Probe_File::read(Color c, Board_Index pos, WDL_Entry wdl, 
 			break;
 		}
 		default: {
-			// MULTI: full 100-bit changepoint bitmap; popcount(bits ≤ hmc) - 1.
+			// MULTI: 100-bit changepoint bitmap; rsel = popcount(bits ≤ hmc) - 1.
 			const size_t idx = sp.n_multi;
 			const uint8_t* entry = multi_data + multi_dir[idx];
 			const uint8_t kbyte = entry[0];
@@ -1397,14 +1371,13 @@ struct Probe_Tables::Impl
 	std::vector<std::filesystem::path> dtm_dirs = { "./dtm/" };
 	std::vector<std::filesystem::path> dtm50_dirs = { "./dtm50/" };
 
-	// Use material-key integers to avoid per-probe string hashing.
+	// Keyed by material-key int to avoid per-probe string hashing.
 	mutable std::shared_mutex                                 wdl_mu;
 	std::unordered_map<uint32_t, std::unique_ptr<WDL_Probe_File>> wdl_cache;
 	mutable std::shared_mutex                                 dtc_mu;
 	std::unordered_map<uint32_t, std::unique_ptr<DTC_Probe_File>> dtc_cache;
 	mutable std::shared_mutex                                 dtm_mu;
 	std::unordered_map<uint32_t, std::unique_ptr<DTM_Probe_File>> dtm_cache;
-	// DTM50 cache: one file per material, all 100 hmc layers inside.
 	mutable std::shared_mutex                                 dtm50_mu;
 	std::unordered_map<uint32_t, std::unique_ptr<DTM50_Probe_File>> dtm50_cache;
 	mutable std::shared_mutex                                 epsi_mu;
@@ -1838,7 +1811,7 @@ Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Positi
 	WDL_Probe_File* w = open_wdl(ps);
 	DTC_Probe_File* d = open_dtc(ps);
 	DTM_Probe_File* m = open_dtm(ps);
-	// rule50 ≥ 100 ⇒ auto-50MR DRAW (no layer to read). Other tables unaffected.
+	// rule50 ≥ 100: auto-50MR DRAW, no DTM50 layer to read.
 	const bool rule50_drawn = rule50 != PROBE_IMPL_SKIP_DTM50 && rule50 >= DTM50_HMC_COUNT;
 	DTM50_Probe_File* m50 = nullptr;
 	if (rule50 != PROBE_IMPL_SKIP_DTM50 && !rule50_drawn)
@@ -2086,9 +2059,7 @@ WDL_Entry Probe_Tables::probe_wdl(const Position& pos, Square ep_square, unsigne
 
 namespace {
 
-// Recover WIN(1)/LOSS(0) that the layered decoder collapsed to DRAW at hmc>0.
-// WDL=WIN: scan STM moves for a mating one. WDL=LOSE: STM mated iff in check
-// with no legal moves.
+// Recover mate-in-1 the layered DTM50 decoder collapses to DRAW at hmc>0.
 NODISCARD DTM_Final_Entry recover_mate_at_hmc(const Position& pos, WDL_Entry wdl)
 {
 	if (wdl == WDL_Entry::WIN)
@@ -2129,7 +2100,6 @@ NODISCARD DTM_Final_Entry recover_mate_at_hmc(const Position& pos, WDL_Entry wdl
 DTM_Final_Entry Probe_Tables::Impl::probe_dtm50_internal(
 	const Piece_Config& ps, const Position& pos, WDL_Entry wdl, unsigned rule50, int depth)
 {
-	// Auto-50MR draw: no DTM50 layer applies.
 	if (rule50 >= DTM50_HMC_COUNT) return DTM_Final_Entry::make_draw();
 	const uint16_t hmc = static_cast<uint16_t>(rule50);
 	DTM50_Probe_File* m = open_dtm50(ps);
@@ -2144,14 +2114,14 @@ DTM_Final_Entry Probe_Tables::Impl::probe_dtm50_internal(
 		? derive_dtm50(ps, pos, rule50, depth)
 		: m->read(stm, idx, wdl, hmc);
 
-	// Recover mate-in-≤1 if the layered decoder collapsed it to DRAW.
+	// See recover_mate_at_hmc.
 	if (hmc > 0 && e.is_draw() && (wdl == WDL_Entry::WIN || wdl == WDL_Entry::LOSE))
 		return recover_mate_at_hmc(pos, wdl);
 	return e;
 }
 
-// rule50-aware derive: each child tracks its own hmc (zeroing resets, quiet
-// increments; ≥100 caps to DRAW unless the move is mate).
+// rule50-aware derive: per-child hmc (zeroing resets, quiet increments);
+// once ≥100, the move is DRAW unless it mates.
 DTM_Final_Entry Probe_Tables::Impl::derive_dtm50(
 	const Piece_Config& ps, const Position& pos, unsigned rule50, int depth)
 {

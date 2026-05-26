@@ -107,7 +107,7 @@ private:
 
 	// Out `worst_loss_dtm` is the largest `sub_e.value()+1` contribution from
 	// cap/promo children when the return is Intermediate; 0 otherwise.
-	// iterate() floors m_max_dtm with it so silent-ply termination can't stop
+	// iterate() floors m_max_dtm with it so silent-ply termination cannot stop
 	// before check_loss reaches the ply where the cap-path contribution
 	// classifies the cell.
 	NODISCARD DTM_Any_Entry make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id,
@@ -165,4 +165,3 @@ private:
 	void page_in_for_group(In_Out_Param<Thread_Pool> thread_pool,
 	                       Color me, size_t group_id);
 };
-

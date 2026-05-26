@@ -25,17 +25,14 @@ constexpr uint64_t EGTB_CHECKSUM_INIT_VALUE = 0xf0f0f0f0f0f0;
 
 constexpr size_t WDL_BLOCK_SIZE = 64 * 1024;
 
-// Number of hmc (50MR half-move counter) layers stored per DTM50 sub-table.
-// Lives here rather than egtb_gen_dtm50.h because both the generator-side
-// flat sub-loader (egtb_compress.cpp) and the probe-side block decoder
-// (probe.cpp) need it for the .lzdtm50 block-payload format math, and neither
-// can pull in egtb_gen_dtm50.h.
+// Hmc layers per DTM50 sub-table. Lives here (not egtb_gen_dtm50.h) so both
+// the flat sub-loader and the probe block decoder can see it without pulling
+// in the generator header.
 inline constexpr int DTM50_HMC_COUNT = 100;
 
-// Per-color histograms gathered alongside W/D/L tally. hist_1b is indexed by
-// dtc_value_for_storage(e) (cursed halved); hist_2b is indexed by raw e.value().
-// Both are populated in one gather pass; the entry_bytes decision picks which
-// rank table to encode against based on rank_1b.ranks.size() <= 256.
+// hist_1b: indexed by dtc_value_for_storage (cursed halved).
+// hist_2b: indexed by raw e.value().
+// One gather pass populates both; entry_bytes picks the tier based on rank_1b.ranks.size() <= 256.
 struct Value_Histogram
 {
 	static constexpr size_t HIST_BINS = 2048;
@@ -44,9 +41,8 @@ struct Value_Histogram
 	std::array<uint64_t, HIST_BINS> hist_2b{};  // indexed by raw value
 };
 
-// Frequency-ranked permutation of values. Built per-tier from its hist:
-// rank_1b is keyed by halved storage values, rank_2b by raw values. Compress
-// writes ranks; load reverse-maps so the probe path is unchanged.
+// Frequency-ranked value permutation. Built per-tier from its hist.
+// Compress writes ranks; load reverse-maps so probe path is unchanged.
 struct Value_Rank_Table
 {
 	// ranks[r] = value at rank r (descending frequency).
@@ -164,20 +160,14 @@ private:
 
 NODISCARD bool prepare_packed_wdl_entries_for_compression(Span<Packed_WDL_Entries> data);
 
-// DTC compressor (LZMA + run-stitch fill). Same input as the PPMd variant;
-// helper rank-lookups, fills each illegal with the previous legal rank, packs
-// at entry_bytes width, and bulk-LZMA-compresses.
-// Generalized LZMA + rank-encoded compressor for 16-bit table entries. The
-// `storage_fn` argument maps raw entry bits to their on-disk storage form for
-// a given tier. DTC's 2-byte tier stores raw low-11-bit values and the 1-byte
-// tier halves cursed only (dtc_storage_fn). DTM halves every classified value
-// in BOTH tiers via the parity invariant (dtm_storage_fn) — class is folded
-// in from the .lzw companion at decode so storage is lossless either way.
+// LZMA + rank-encoded compressor for 16-bit entries. ILLEGAL cells are
+// run-stitched with neighboring legal ranks pre-compress. `storage_fn` maps
+// raw bits to tier-specific on-disk value (see dtc_storage_fn / dtm_storage_fn).
 struct LZMA_Rank_Compress_Helper : public Compress_Helper
 {
 	using Storage_Fn = uint16_t(*)(uint16_t /*raw_bits*/, size_t /*entry_bytes*/);
 
-	// `rank_table` must outlive every clone of this helper (capture by pointer).
+	// `rank_table` must outlive every clone (captured by pointer).
 	LZMA_Rank_Compress_Helper(const Value_Rank_Table& rank_table, size_t entry_bytes,
 	                          Storage_Fn storage_fn)
 		: m_rank_table(&rank_table), m_entry_bytes(entry_bytes),
@@ -214,11 +204,10 @@ private:
 	size_t m_entry_bytes;
 	Storage_Fn m_storage_fn;
 	LZMA_Compress_Helper m_lzma;
-	std::vector<uint8_t> m_scratch;  // per-instance rank buffer, reused per block
+	std::vector<uint8_t> m_scratch;
 };
 
-// Storage helpers for LZMA_Rank_Compress_Helper. DTC: 2-byte tier is raw
-// (low 11 bits), 1-byte tier halves cursed via dtc_value_for_storage.
+// DTC: 2-byte raw (low 11 bits), 1-byte halves cursed (dtc_value_for_storage).
 // DTM: both tiers halve via dtm_value_for_storage (parity-lossless).
 NODISCARD inline uint16_t dtc_storage_fn(uint16_t bits, size_t entry_bytes)
 {
@@ -240,8 +229,8 @@ NODISCARD std::optional<LZ4_Dict> make_dict_for_wdl(
 	size_t block_size
 );
 
-// Caller handles WDL singularity (via a pre-probe); this function compresses
-// unconditionally. `max_workers` caps pool fan-out (0 = unlimited).
+// Caller handles WDL singularity via pre-probe; this compresses unconditionally.
+// max_workers caps pool fan-out (0 = unlimited).
 NODISCARD Compressed_EGTB save_compress_wdl(
 	In_Out_Param<Thread_Pool> thread_pool,
 	const Block_Source& src,
@@ -249,8 +238,8 @@ NODISCARD Compressed_EGTB save_compress_wdl(
 	size_t max_workers = 0
 );
 
-// silent=true suppresses the per-block progress bar and the "singular" line;
-// callers (e.g. DTM50's per-hmc save loop) print their own one-line indicator.
+// silent=true suppresses progress bar + "singular" line (DTM50's per-hmc loop
+// prints its own one-line indicator).
 NODISCARD Compressed_EGTB save_compress_egtb(
 	In_Out_Param<Thread_Pool> thread_pool,
 	const Block_Source& src,
@@ -280,8 +269,8 @@ void save_egtb_table(
 	EGTB_Magic magic
 );
 
-// Parse the WDL .lzw header into wdl's block index + per-color metadata.
-// Blocks stay compressed; decoded on demand via the per-thread cache in read().
+// Parse .lzw header → block index + per-color metadata. Blocks stay
+// compressed; decoded on demand via the per-thread cache in read().
 void load_wdl_table(
 	Out_Param<WDL_File_For_Probe> wdl,
 	const Piece_Config& ps,

@@ -23,11 +23,10 @@ enum struct EGTB_Magic : uint64_t
 	DTM50_PHASE_SLICE_MAGIC = 0xd1cef11e51ce0051ULL,
 };
 
-// WDL_Entry: 5-value + ILLEGAL sentinel, 4 bits per entry.
-// Syzygy-style ordering: higher = better for the mover; `w > best` picks max.
-// ILLEGAL = 7 sits off the ordering scale so it never masquerades as a real outcome.
-//   CURSED_WIN:   mover wins under normal rules, but win not reachable within 50mr (FIDE: draw).
-//   BLESSED_LOSS: loss cannot be forced within 50mr.
+// 4 bits per entry. Syzygy-style ordering: higher = better for mover (`w > best` maxes).
+// ILLEGAL = 7 sits off-scale so it can't masquerade as a real outcome.
+//   CURSED_WIN:   normal-rules win, not reachable within 50mr (FIDE: draw).
+//   BLESSED_LOSS: loss not forceable within 50mr.
 enum struct WDL_Entry : uint8_t
 {
 	LOSE         = 0,
@@ -103,7 +102,7 @@ constexpr void set_wdl_entry(Packed_WDL_Entries& packed, size_t pos, WDL_Entry v
 		(packed & PACKED_WDL_ENTRY_INV_MASK[pos]) | (static_cast<uint8_t>(v) << (pos * WDL_ENTRY_BITS)));
 }
 
-// DTC value = plies to next zeroing event; class lives in the flag bits.
+// DTC value = plies to next zeroing; class lives in flag bits.
 
 enum DTC_Score : uint16_t {
 	DTC_SCORE_ZERO = 0,
@@ -113,13 +112,11 @@ enum DTC_Score : uint16_t {
 ENUM_ENABLE_OPERATOR_INC(DTC_Score);
 ENUM_ENABLE_OPERATOR_ADD(DTC_Score);
 
-// Final and Intermediate share the same 16-bit storage.
-//   WIN:       classified WIN. value = DTZ to next zeroing.
-//   LOSS:      classified LOSS. value = DTZ.
-//   CAP_CWIN:  cursed-winning zeroing class hint.
-//   CAP_CLOSS: cursed-losing zeroing class (LOSS-side dual).
-//   CHANGE:    iterate's "reverify pending" marker on Intermediates. Atomic OR via
-//              lock_add_flags; cleared by write_dtc overwrite when the cell finalizes.
+// Final and Intermediate share 16-bit storage.
+//   WIN/LOSS:        classified; value = DTZ.
+//   CAP_CWIN/CLOSS:  cursed-winning / cursed-losing zeroing class hint.
+//   CHANGE:          reverify-pending on Intermediates. Atomic OR via lock_add_flags;
+//                    cleared when write_dtc overwrites with a Final.
 enum DTC_Intermediate_Entry_Flag : uint16_t {
 	DTC_FLAG_WIN       = 0x0800u,
 	DTC_FLAG_LOSS      = 0x1000u,
@@ -137,13 +134,11 @@ struct DTC_Final_Entry
 	static constexpr uint16_t VALUE_MASK = 0x07FFu;
 	static constexpr uint16_t ILLEGAL_VAL = VALUE_MASK;  // = 0x07FF in the score field
 
-	// Shared 16-bit layout: lock_add_flags accepts Intermediate flags on Final-typed storage
-	// (used for atomic CHANGE-bit OR-ing during iterate).
+	// lock_add_flags accepts Intermediate flags on Final-typed storage (CHANGE OR during iterate).
 	template <typename FlagT>
 	static constexpr bool is_allowed_flag_type = std::is_same_v<FlagT, DTC_Intermediate_Entry_Flag>;
 
-	// LOAD-BEARING m_data(0): Huge_Array's For_Overwrite_Tag uses `new T`
-	// default-init still runs this ctor and zero-fills the allocation.
+	// Huge_Array's For_Overwrite_Tag path uses `new T`; this ctor must zero m_data.
 	constexpr DTC_Final_Entry() : m_data(0) {}
 
 	NODISCARD static constexpr DTC_Final_Entry make_illegal()
@@ -224,8 +219,7 @@ struct DTC_Final_Entry
 
 	NODISCARD constexpr WDL_Entry wdl() const
 	{
-		// CAP_CWIN/CAP_CLOSS only project cursed on Final WIN/LOSS;
-		// Intermediates with CAP_* hints project DRAW (unclassified).
+		// CAP_* only projects cursed on Final WIN/LOSS; Intermediates with CAP_* are DRAW.
 		if (is_illegal()) return WDL_Entry::ILLEGAL;
 		if (is_win())
 		{
@@ -250,8 +244,8 @@ private:
 };
 static_assert(sizeof(DTC_Final_Entry) == 2);
 
-// 1-byte tier halves cursed values; 2-byte tier writes raw values.
-// Round up so the decoded value stays strictly > MAX_NON_CURSED_DTZ.
+// 1-byte tier halves cursed values (round up so decode stays > MAX_NON_CURSED_DTZ);
+// 2-byte tier writes raw values.
 NODISCARD constexpr uint16_t dtc_value_for_storage(DTC_Final_Entry e)
 {
 	const uint16_t v = static_cast<uint16_t>(e.value());
@@ -260,14 +254,11 @@ NODISCARD constexpr uint16_t dtc_value_for_storage(DTC_Final_Entry e)
 		? static_cast<uint16_t>((v + 1) >> 1) : v;
 }
 
-// Decode pairs with the round-up encode in dtc_value_for_storage:
-// recovers v=101, 103, ... exactly; v=102, 104, ... as v-1.
+// Pairs with the round-up encode: v=101,103,... recover exactly; v=102,104,... as v-1.
 //
-// DRAW positions go through here too but their stored bits are don't-care:
-// the encoder folds DRAW into the same run-stitch class as ILLEGAL, so a DRAW
-// cell carries the stitched W/L neighbor value, not zero. Synthesize DRAW from
-// the WDL companion's verdict instead of returning the garbage stored bits.
-// (dtm_entry_from_storage already does this via its default arm.)
+// DRAW is WDL-companion authoritative across DTC/DTM/DTM50: the encoder
+// run-stitches DRAW cells with W/L neighbors for compression, so their stored
+// bits carry neighbor payloads. Synthesize DRAW from `w`, never from `stored`.
 NODISCARD constexpr DTC_Final_Entry dtc_entry_from_storage(DTC_Final_Entry stored, WDL_Entry w, size_t entry_bytes)
 {
 	if (w == WDL_Entry::DRAW) return DTC_Final_Entry::make_draw();
@@ -276,13 +267,12 @@ NODISCARD constexpr DTC_Final_Entry dtc_entry_from_storage(DTC_Final_Entry store
 		: stored;
 }
 
-// Distinct type from DTC_Final_Entry, same 16-bit layout; conversions are bit-identical.
+// Distinct type, same 16-bit layout; conversions bit-identical.
 struct DTC_Intermediate_Entry
 {
 	template <typename FlagT>
 	static constexpr bool is_allowed_flag_type = std::is_same_v<FlagT, DTC_Intermediate_Entry_Flag>;
 
-	// Load-bearing zero-init for Huge_Array's For_Overwrite_Tag path (see Final note).
 	constexpr DTC_Intermediate_Entry() : m_data(0) {}
 
 	constexpr explicit DTC_Intermediate_Entry(DTC_Final_Entry f) : m_data(f.m_data) {}
@@ -322,12 +312,9 @@ static_assert(sizeof(DTC_Intermediate_Entry) == 2);
 using DTC_Any_Entry = std::variant<DTC_Intermediate_Entry, DTC_Final_Entry>;
 
 // =============================================================================
-// DTM (Distance To Mate, no 50-move-rule). Flat ply count to mate; no zeroing,
-// no cursed/blessed classes. In-memory layout mirrors DTC: explicit WIN/LOSS
-// flag bits + CHANGE flag. On disk the class flags are stripped and class is
-// recovered from the companion wdl/<name>.lzw — same split DTC uses. The
-// parity invariant (WIN values odd, LOSS values even) survives the strip, so
-// the 1-byte rank tier can halve the storage when ranks.size() fits in 256.
+// DTM (no 50MR). Flat ply count to mate; no zeroing, no cursed/blessed.
+// On disk: class stripped, recovered from companion .lzw (same split as DTC).
+// Parity invariant (WIN odd, LOSS even) lets both rank tiers halve storage.
 // =============================================================================
 
 enum DTM_Score : uint16_t {
@@ -357,8 +344,7 @@ struct DTM_Final_Entry
 	template <typename FlagT>
 	static constexpr bool is_allowed_flag_type = std::is_same_v<FlagT, DTM_Entry_Flag>;
 
-	// LOAD-BEARING m_data(0): Huge_Array's For_Overwrite_Tag uses `new T` so the
-	// default ctor still runs and zero-fills the allocation. 0 == DRAW here.
+	// Huge_Array For_Overwrite_Tag uses `new T`; this ctor must zero (0 == DRAW).
 	constexpr DTM_Final_Entry() : m_data(0) {}
 
 	NODISCARD static constexpr DTM_Final_Entry make_draw() { return {}; }
@@ -413,27 +399,19 @@ private:
 };
 static_assert(sizeof(DTM_Final_Entry) == 2);
 
-// Storage layout (both tiers): halved value using the parity invariant.
-// WIN values are odd, LOSS values are even, so storing v/2 (rounded down)
-// is lossless when class is known. Class is reconstructed from the .lzw
-// companion at probe time; the halved storage works the same way for the
-// 1-byte and 2-byte tiers, which differ only in the rank-table width.
+// Both tiers store v/2 (parity invariant: WIN odd, LOSS even → lossless when
+// class is known via the .lzw companion).
 //
-// ILLEGAL is kept at ILLEGAL_VAL (un-halved) — the run-stitch step in
-// LZMA_Rank_Compress_Helper::compress needs a sentinel that no real value
-// aliases, and halving the sentinel (2047>>1 = 1023) would collide with
-// LOSS(2046)/2 = 1023.
+// ILLEGAL stays un-halved at ILLEGAL_VAL: halving would collide with
+// LOSS(2046)/2 = 1023, breaking the run-stitch sentinel in LZMA_Rank_Compress_Helper.
 NODISCARD constexpr uint16_t dtm_value_for_storage(DTM_Final_Entry e)
 {
 	if (e.is_illegal()) return DTM_Final_Entry::ILLEGAL_VAL;
-	// Both WIN(2k+1)/2 and LOSS(2k)/2 land on k. Class disambiguates at decode.
 	return static_cast<uint16_t>(e.value()) >> 1;
 }
 
-// Reconstruct a DTM_Final_Entry from a storage value + WDL class. The .lzw
-// companion folds CURSED_WIN→WIN and BLESSED_LOSS→LOSE here since DTM doesn't
-// have cursed classes. Storage is always halved (parity invariant); the
-// unhalving is identical for the 1-byte and 2-byte tiers.
+// DTM has no cursed classes; CURSED_WIN→WIN, BLESSED_LOSS→LOSE.
+// See dtc_entry_from_storage above for the DRAW-is-companion-authoritative rule.
 NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_Entry w)
 {
 	switch (w)
@@ -450,10 +428,8 @@ NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_
 	}
 }
 
-// 1-byte cell used for DTM50's per-cell phase tape. Stored through the same
-// Sliced_EGTB_File_For_Gen path as DTM entries so it benefits from per-group
-// paging and disk spill. The trait `is_allowed_flag_type` is never consulted
-// (we don't call add_flags / lock_add_flags on the phase slice).
+// 1-byte cell for DTM50's per-cell phase tape; routed through Sliced_EGTB_File_For_Gen
+// to inherit paging + spill. is_allowed_flag_type is unused (no add_flags calls).
 struct DTM50_Phase_Entry
 {
 	constexpr DTM50_Phase_Entry() : v(0) {}
@@ -462,9 +438,8 @@ struct DTM50_Phase_Entry
 };
 static_assert(sizeof(DTM50_Phase_Entry) == 1);
 
-// DTM50 layer-0 decode. Reuses DTC's 5-class WDL: cursed/blessed → DRAW;
-// strict WIN/LOSE → halved class+value. No ambiguity at hmc=0 because a cell
-// can't be both strict-WIN-in-flat-DTM and DRAW-in-DTM50 at the fresh window.
+// DTM50 layer-0: cursed/blessed → DRAW. Unambiguous at hmc=0 (no cell is both
+// strict-WIN in flat-DTM and DRAW in DTM50 at the reset window).
 NODISCARD constexpr DTM_Final_Entry dtm50_entry_from_storage(uint16_t stored, WDL_Entry w)
 {
 	switch (w)
@@ -479,10 +454,9 @@ NODISCARD constexpr DTM_Final_Entry dtm50_entry_from_storage(uint16_t stored, WD
 	}
 }
 
-// DTM50 layer-k>0 decode. WDL=WIN at storage=0 is ambiguous between WIN(1)
-// and DTM50-DRAW (cursed route from this hmc). Resolve to DRAW; the prober
-// recovers WIN(1)/LOSS(0) locally via move-gen when needed. storage>0 still
-// disambiguates WIN/LOSE by class.
+// DTM50 layer-k>0: WDL=WIN at storage=0 is ambiguous (WIN(1) vs cursed-route DRAW);
+// resolve to DRAW, prober recovers WIN(1)/LOSS(0) locally via move-gen. storage>0
+// disambiguates by class.
 NODISCARD constexpr DTM_Final_Entry dtm50_layered_entry_from_storage(uint16_t stored, WDL_Entry w)
 {
 	if (w == WDL_Entry::ILLEGAL) return DTM_Final_Entry::make_illegal();
@@ -498,8 +472,7 @@ NODISCARD constexpr DTM_Final_Entry dtm50_layered_entry_from_storage(uint16_t st
 	}
 }
 
-// Distinct C++ type from DTM_Final_Entry, same 16-bit layout. Lets init_entries
-// dispatch Final vs Intermediate via std::visit (mirrors DTC's pattern).
+// Distinct type, same layout — lets init_entries std::visit Final vs Intermediate.
 struct DTM_Intermediate_Entry
 {
 	template <typename FlagT>

@@ -47,7 +47,7 @@
 void egtb_request_interrupt() noexcept;
 NODISCARD bool egtb_is_interrupt_requested() noexcept;
 
-// Position_For_Gen: Position + Board_Index, lazily filled from group-indices.
+// Position_For_Gen: Position + Board_Index, lazily filled from group indices.
 // Always operates in the canonical frame.
 
 struct Position_For_Gen
@@ -374,10 +374,9 @@ public:
 		const size_t chunk_index = m_current_chunk_index.fetch_add(1);
 		const size_t start = static_cast<size_t>(m_start_idx);
 		const size_t end   = static_cast<size_t>(m_end_idx);
-		// Emit globally m_chunk_size-aligned chunks: first chunk is the
-		// unaligned head (if any), then boundary-aligned full chunks, then
-		// an unaligned tail (if any). Lets per-chunk consumers know that a
-		// chunk fully covers a m_chunk_size-wide bit just by checking
+		// Emit globally m_chunk_size-aligned chunks: an unaligned head if
+		// needed, boundary-aligned full chunks, then an unaligned tail if
+		// needed. Per-chunk consumers can identify a full bitmap chunk with
 		// cs % m_chunk_size == 0 && ce - cs == m_chunk_size.
 		const size_t aligned_start = (start + m_chunk_size - 1) / m_chunk_size * m_chunk_size;
 		const size_t has_head = (start < aligned_start) ? 1 : 0;
@@ -674,8 +673,8 @@ private:
 // may have evicted some groups by the time save runs; the singular-probe /
 // gather / block-source readers acquire+release via this cache so groups
 // are loaded on demand and the cap-bounded FIFO evicts the rest. Save passes
-// are quasi-sequential fanouts of a full scan, so load-order eviction is as
-// good as recency-order in practice. Templated on the entry type so DTC and
+// are quasi-sequential fanouts of a full scan, making FIFO eviction close to
+// recency-order eviction in practice. Templated on the entry type so DTC and
 // DTM share the implementation.
 template <typename EntryT>
 struct Save_Group_Cache
@@ -809,8 +808,8 @@ struct EGTB_Generator
 	}
 
 	// Sub-material closure for `ps`: every Piece_Config reachable in one move
-	// (capture, promotion, or capture-with-promote). Same dependency shape for
-	// DTC/WDL and DTM gens; differ only in which probe-file type is opened.
+	// (capture, promotion, or capture-with-promote). DTC/WDL and DTM share the
+	// dependency shape and differ only in the probe-file type they open.
 	NODISCARD static std::map<Material_Key, Piece_Config>
 	enumerate_sub_materials(const Piece_Config& ps);
 
@@ -855,13 +854,13 @@ protected:
 	                                     Out_Param<Color> sub_color,
 	                                     Out_Param<const Piece_Config_For_Gen*> sub_epsi) const;
 
-	// Sized so per-worker windows keep adjacent Board_Index ranges NUMA-local.
+	// Sized so per-worker windows keep adjacent Board_Index ranges local.
 	static constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
 
 	NODISCARD Shared_Board_Index_Iterator make_slice_group_iterator(
 		size_t group_id, size_t slices_per_group) const;
 
-	// Paging state — shared across DTC and DTM gens. Sized/seeded by each
+	// Paging state shared across DTC and DTM gens. Sized/seeded by each
 	// derived ctor once the table dimensions are known.
 	size_t m_paging_budget_bytes = 0;
 	uint64_t m_paging_tick = 0;
@@ -874,9 +873,9 @@ protected:
 	std::vector<uint8_t> m_pid_in_pair;        // [num_pawn_slices]
 	std::vector<size_t>  m_pair_group_ids;     // groups touched by m_active_pawn_slices
 
-	// Per-color scan bitmap, indexed by group_id. Loose greedy tracking shared
+	// Per-color scan bitmap, indexed by group_id. Conservative tracking shared
 	// by DTC and DTM gens: any write or CHANGE-flag flip sets the target
-	// group's bit via mark_iter (over-marking is harmless — extra scan; under-
+	// group's bit via mark_iter (over-marking only costs an extra scan; under-
 	// marking would silently drop work). run_iter walks only marked groups and
 	// clears the bit after scanning a group whose cells are all FINAL/ILLEGAL
 	// with values far enough behind the current ply that no future action can
@@ -912,7 +911,7 @@ protected:
 		}
 	}
 
-	// Per-fusion seed: first sweep is full-scan, eviction tightens from there.
+	// Per-fusion seed: first sweep is full-scan, eviction narrows from there.
 	// Non-pair groups/chunks are never visited (run_iter only walks
 	// m_pair_group_ids), so over-marking them is harmless.
 	void seed_iter_groups()
@@ -1009,8 +1008,8 @@ protected:
 		return fusions;
 	}
 
-	// Drive the resident-group set toward (needed_w | needed_b): load anything
-	// needed that isn't resident, evict LRU non-needed groups until residency
+	// Drive the resident-group set toward (needed_w | needed_b): load any
+	// needed nonresident group, then evict LRU non-needed groups until residency
 	// fits m_paging_budget_bytes. Templated on EntryT so DTC and DTM share the
 	// body.
 	template <typename EntryT>
@@ -1129,4 +1128,3 @@ struct Working_Set_Estimate
 // this false since pawn pushes there are zeroing and never reverse-marked.
 NODISCARD Working_Set_Estimate compute_working_set(const Piece_Config& ps,
                                                    bool include_push_in_iter = false);
-

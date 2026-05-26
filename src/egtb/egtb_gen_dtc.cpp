@@ -151,7 +151,7 @@ WDL_Entry DTC_Generator::effective_opp_wdl_after_dp(const Position_For_Gen& pos_
 	WDL_Entry best_ep_for_opp = WDL_Entry::LOSE;
 	bool any_ep = false;
 
-	// Post-DP position is the same for both ep targets; lazy-build once.
+	// Post-DP position is shared across both ep targets; build lazily.
 	std::optional<Position_For_Gen> p_gen_for_ep;
 
 	for (int df : { -1, +1 })
@@ -265,8 +265,7 @@ DTC_Any_Entry DTC_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 	}
 	if (!any_legal)
 	{
-		// Stalemate stored as plain Intermediate (m_data=0): no pre_quiet
-		// pred can land on a no-move position, so it's never reclassified.
+		// Stalemate: plain Intermediate; no pre_quiet pred lands here, never reclassified.
 		return in_check ? DTC_Final_Entry::make_loss(0)
 		                : DTC_Intermediate_Entry{};
 	}
@@ -280,14 +279,14 @@ DTC_Any_Entry DTC_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 		switch (best)
 		{
 		case ValueCursedWin:   return DTC_Final_Entry::make_win(CURSED_BOUND).with_cap_cwin();
-		case ValueDraw:        return DTC_Intermediate_Entry{};  // bit-identical to Final DRAW
+		case ValueDraw:        return DTC_Intermediate_Entry{};
 		case ValueCursedLoss:  return DTC_Final_Entry::make_loss(CURSED_BOUND).with_cap_closs();
 		case ValueClassicLoss: return DTC_Final_Entry::make_loss(1);
 		default: break;
 		}
 	}
 
-	// Hint the zeroing class on the Intermediate so the cursed-transition can act on it.
+	// Hint zeroing class on the Intermediate for the cursed transition.
 	switch (best)
 	{
 	case ValueCursedWin:   return DTC_Intermediate_Entry::make_cap_cwin();
@@ -312,16 +311,14 @@ bool DTC_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 	for (int32_t pid : m_active_pawn_slices)
 		targets_by_pid[static_cast<size_t>(pid)] = psm.push_target_slices(pid);
 
-	// Init working set: both colors at g, plus (push_target_pid, same_kid)
-	// on opp (pushes don't move kings).
+	// Working set: both colors at g + (push_target_pid, same_kid) on opp.
 	auto page_in_for_init_group = [&](size_t g) {
 		if (m_paging_budget_bytes == 0) return;
 		m_scratch_need[WHITE].assign(ngroups, 0);
 		m_scratch_need[WHITE][g] = 1;
 		const size_t g_start = g * spg;
 		const size_t g_end   = std::min(g_start + spg, ntotal);
-		// pid-major loop: a slice-major filter wastes ~spg/nks iterations
-		// per active pid on tiny-within materials.
+		// pid-major: slice-major filter wastes ~spg/nks iters per active pid.
 		for (int32_t pid : m_active_pawn_slices)
 		{
 			const size_t pid_base = static_cast<size_t>(pid) * nks;
@@ -499,8 +496,8 @@ INLINE bool wdl_is_opp_win(WDL_Entry w, bool cursed)
 
 } // namespace
 
-// Syzygy-style class-driven iterate: WIN(dtz=ply) retro-flags preds with
-// CHANGE; flagged entries reverify; verified LOSS retros preds as WIN(ply+1).
+// Syzygy class-driven iterate: WIN(dtz=ply) flags preds CHANGE; flagged preds
+// reverify; verified LOSS retros preds as WIN(ply+1).
 DTC_Generator::Iter_Action DTC_Generator::action_for_entry(
 	DTC_Final_Entry e, uint16_t ply, Iter_Phase phase) const
 {
@@ -508,14 +505,11 @@ DTC_Generator::Iter_Action DTC_Generator::action_for_entry(
 
 	if (e.is_draw())
 	{
-		// Cursed-gate fires regardless of CHANGE: a cap_cwin cell's check_loss
-		// always fails (the cap/promo move is mover-winning, so sub_e fails
-		// is_win), so a coincident CHANGE bit at ply MAX_NON_CURSED_DTZ + 1
-		// would otherwise route the cell into CHANGE_REVERIFY → clear CHANGE
-		// → SKIP forever, missing PROMOTE_CWIN. cap_closs has the symmetric
-		// problem with check_loss returning a sub-clamp dtz. PROMOTE_CWIN /
-		// CAPT_CLOSS_REVERIFY both overwrite the cell anyway, so dropping
-		// a stale CHANGE bit is fine.
+		// Cursed-gate fires regardless of CHANGE. Otherwise a coincident CHANGE
+		// at ply 101 would route cap_cwin/cap_closs through CHANGE_REVERIFY,
+		// which can't classify them (check_loss fails / returns sub-clamp dtz),
+		// clearing CHANGE and leaving them SKIP forever. PROMOTE_CWIN and
+		// CAPT_CLOSS_REVERIFY overwrite anyway, so the stale CHANGE is fine.
 		if (phase == Iter_Phase::CURSED
 		    && ply == DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
 		{
@@ -533,12 +527,11 @@ DTC_Generator::Iter_Action DTC_Generator::action_for_entry(
 
 	if (ply == 0)
 	{
-		// MATE at ply 0: preds become WIN(1).
+		// Mate: preds become WIN(1).
 		if (e.is_loss() && e.value() == 0) return Iter_Action::MARK_WIN_IN_1;
 		return Iter_Action::SKIP;
 	}
 
-	// ply >= 1 here since the ply == 0 branch returned above.
 	if (e.is_win() && (e.value() == ply || e.value() == ply - 1))
 		return Iter_Action::MARK_CHANGED;
 
@@ -613,8 +606,7 @@ DTC_Generator::Loss_Verification_Result DTC_Generator::check_loss(
 				if (!cursed_phase) return r;
 				any_cursed_child = true;
 			}
-			// Strict ply-ordering: child win_loss[v] must already be set,
-			// i.e. child dtz < ply.
+			// Strict ply-ordering: child dtz < ply (child must already be classified).
 			if (ce.value() >= ply) return r;
 			contribution = static_cast<uint16_t>(ce.value() + 1);
 		}
@@ -622,8 +614,7 @@ DTC_Generator::Loss_Verification_Result DTC_Generator::check_loss(
 	}
 
 	if (!any_legal) return r;
-	// Verify only when natural LOSS-DTZ matches the current ply.
-	if (max_contribution != ply) return r;
+	if (max_contribution != ply) return r;  // only verify at natural LOSS-DTZ
 
 	r.is_loss  = true;
 	r.loss_dtz = max_contribution;
@@ -658,8 +649,7 @@ void DTC_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
 		if (pred == BOARD_INDEX_NONE) continue;
 		const auto e = read_dtc(pred, opp);
 		if (!e.is_draw() || e.has_change()) continue;
-		// Atomic OR: a concurrent retro_mark_wins overwrite to Final clears the
-		// flag naturally (we always write fresh class+value).
+		// Atomic OR; a concurrent retro_mark_wins overwrite to Final clears it.
 		m_table->m_dtc[opp].lock_add_flags(pred, DTC_FLAG_CHANGE);
 		mark_iter(opp, pred, m_table->m_dtc[opp]);
 	}
@@ -678,8 +668,7 @@ void DTC_Generator::retro_mark_wins(Position_For_Gen& pos_gen,
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
 		if (pred == BOARD_INDEX_NONE) continue;
 		if (!read_dtc(pred, opp).is_draw()) continue;
-		// Overwrite drops any CAP_* / CHANGE bits on the Intermediate.
-		write_dtc(pred, opp, new_e);
+		write_dtc(pred, opp, new_e);  // overwrite drops CAP_* / CHANGE bits
 	}
 }
 
@@ -724,9 +713,8 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 					const DTC_Final_Entry e = read_dtc(idx, stm);
 					if (e.is_illegal()) continue;
 
-					// Only flagged Intermediates (CHANGE | CAP_CWIN | CAP_CLOSS) can
-					// fire a future action; bare DRAW will never become actionable
-					// unless a write reinstates the bit via mark_iter.
+					// Only flagged Intermediates fire future actions; bare DRAW
+					// stays inert until a write reinstates a bit via mark_iter.
 					if (e.is_draw()) { if (e.has_any_flags()) chunk.any_intermediate = true; }
 					else
 					{
@@ -777,7 +765,7 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 						const auto res = check_loss(pos_gen, ml, ply, phase, tid);
 						if (!res.is_loss)
 						{
-							// Failed verify: clear CHANGE only, preserve CAP_*.
+							// Failed verify: clear CHANGE, preserve CAP_*.
 							write_dtc(idx, stm, e.without_change());
 							break;
 						}
@@ -803,7 +791,7 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 				if (chunk.any_intermediate) local.any_intermediate = true;
 				update_max(local.max_classified, chunk.max_classified);
 
-				// Evict only full-CHUNK_SIZE chunks — head/tail share their bit.
+				// Evict full-CHUNK_SIZE chunks only; head/tail share a bit.
 				if (static_cast<size_t>(chunk_end) - static_cast<size_t>(chunk_start) == CHUNK_SIZE
 				    && !chunk.any_intermediate && chunk.max_classified + 1 < ply)
 					m_iter_chunks[stm][cid] = 0;
@@ -817,9 +805,8 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 			if (r.any_intermediate) any_intermediate = true;
 			update_max(max_classified, r.max_classified);
 		}
-		// Evict: no Intermediate cells remain and every classified cell's value
-		// is strictly behind ply-1, so no action_for_entry can fire at this ply
-		// or any future ply. Any later write reinstates the bit via mark_iter.
+		// Evict: no Intermediates and every classified value < ply-1 → no
+		// action_for_entry will fire here again. Later writes reinstate via mark_iter.
 		if (!any_intermediate && max_classified + 1 < ply)
 			m_iter_groups[stm][g] = 0;
 	}
@@ -1154,11 +1141,8 @@ static Block_Source make_wdl_block_source(
 						const uint16_t v = static_cast<uint16_t>(e.value());
 						if (v > longest_value) { longest_value = v; longest_idx = cur_raw; }
 					}
-					// DRAW and ILLEGAL are both WDL-shortcuttable at probe time
-					// (the .lzw companion decides class first; DTC bytes for
-					// these cells are never read). Excluding them from the
-					// histogram lets the rank table allocate its short codes
-					// to values that actually matter for W/L decoding.
+					// DRAW/ILLEGAL: WDL companion authoritative — exclude so
+					// rank table spends short codes on W/L values.
 					if (!e.is_illegal() && !e.is_draw())
 					{
 						++hist1_local[static_cast<size_t>(dtc_value_for_storage(e))];

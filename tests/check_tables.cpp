@@ -1,11 +1,9 @@
 // Check disk-table invariants for every legal canonical position.
 //
-//   DTC:   wins >0, losses are 0 only at mate, cursed iff dtc>100.
-//          (DRAW cells aren't checked — encoder run-stitches them with W/L
-//           neighbors and the WDL companion is authoritative for class.)
-//   DTM:   wins >0, losses are 0 only at mate, WIN odd, LOSE even.
-//   DTM50: layer-0 class equals fold_dtm50_wdl(wdl) (cursed/blessed → DRAW);
-//          WIN/LOSE values follow the same nonzero + parity invariants as DTM.
+//   DTC:   wins >0, losses 0 only at mate, cursed iff dtc>100. (DRAW cells
+//          skipped: WDL companion is class-authoritative; see egtb_entry.h.)
+//   DTM:   wins >0, losses 0 only at mate, WIN odd, LOSE even.
+//   DTM50: layer-0 class == fold_dtm50_wdl(wdl); W/L follow DTM nonzero+parity.
 //
 //   ./check_tables KRRK [KQQK ...]
 //   ./check_tables --list FILE
@@ -60,7 +58,7 @@ bool is_cursed_class(WDL_Entry w)
 	return w == WDL_Entry::CURSED_WIN || w == WDL_Entry::BLESSED_LOSS;
 }
 
-// 5-class → DTM50 layer-0 3-class: cursed/blessed project to DRAW.
+// 5-class → DTM50 layer-0 3-class: cursed/blessed → DRAW.
 WDL_Entry fold_dtm50_wdl(WDL_Entry w)
 {
 	if (w == WDL_Entry::CURSED_WIN || w == WDL_Entry::BLESSED_LOSS) return WDL_Entry::DRAW;
@@ -103,7 +101,7 @@ struct Shard
 	size_t v_dtm_lose_zero_non_mate = 0;
 	size_t v_dtm_parity_win = 0;
 	size_t v_dtm_parity_lose = 0;
-	// DTM50 layer-0 invariants (vs 5-class WDL after fold_dtm50_wdl).
+	// DTM50 layer-0 (vs fold_dtm50_wdl).
 	size_t v_missing_dtm50 = 0;
 	size_t v_dtm50_class_mismatch = 0;
 	size_t v_dtm50_win_zero = 0;
@@ -193,10 +191,7 @@ bool check_material(const Options& opt, const std::string& name)
 				const WDL_Entry w = pr.wdl;
 				s.per_wdl[static_cast<size_t>(w)] += 1;
 
-				// DRAW and ILLEGAL are WDL-companion-authoritative; their DTC/
-				// DTM/DTM50 stored bits are don't-care (encoder run-stitches
-				// them with W/L neighbors for compression). Gate the entire
-				// per-table value-invariant block.
+				// DRAW/ILLEGAL stored bits are don't-care (see egtb_entry.h).
 				if (w == WDL_Entry::ILLEGAL || w == WDL_Entry::DRAW) continue;
 				++s.classified;
 
@@ -231,19 +226,16 @@ bool check_material(const Options& opt, const std::string& name)
 					if (!pr.has_dtm) { ++s.v_missing_dtm; continue; }
 					const uint16_t dtm_v = static_cast<uint16_t>(pr.dtm.value());
 
-					// Winning DTM cells must be nonzero.
 					if (is_win_class(w) && dtm_v == 0) {
 						++s.v_dtm_win_zero;
 						push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtm_v, "DTM_WIN_ZERO");
 					}
 
-					// LOSE(0) is checkmate-only.
 					if (is_lose_class(w) && dtm_v == 0 && !position_is_checkmate(pos)) {
 						++s.v_dtm_lose_zero_non_mate;
 						push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtm_v, "DTM_LOSE_ZERO_NOMATE");
 					}
 
-					// DTM parity: WIN odd, LOSE even.
 					if (is_win_class(w) && (dtm_v % 2u) == 0u) {
 						++s.v_dtm_parity_win;
 						push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtm_v, "DTM_PARITY_WIN_EVEN");
@@ -256,9 +248,6 @@ bool check_material(const Options& opt, const std::string& name)
 
 				if (have_dtm50)
 				{
-					// hmc=0 invariant: DTM50 class equals fold_dtm50_wdl(wdl).
-					// Cursed/blessed cells fold to DRAW; strict WIN/LOSE stay
-					// classified with the same value shape as DTM.
 					const WDL_Entry expect = fold_dtm50_wdl(w);
 					if (!pr.has_dtm50) {
 						++s.v_missing_dtm50;

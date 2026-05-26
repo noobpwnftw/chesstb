@@ -47,7 +47,7 @@ placements_from_position(const Piece_Config_For_Gen& epsi, const Position& pos)
 			out[c].add(b.pop_first_square());
 	}
 
-	// Pawns aren't in populated_classes (they live in the pawn-slice id), but
+	// Pawns are not in populated_classes (they live in the pawn-slice id), but
 	// canonicalize_placements still needs them to compute orientation.
 	for (Piece_Class c : { WHITE_PAWNS, BLACK_PAWNS })
 	{
