@@ -852,10 +852,11 @@ struct RS_Block_Encoder
 			+ dh_bytes + double_stream.size();      // DOUBLE: hint bitmap + variable payload
 		multi_dir_off += (4 - (multi_dir_off & 3)) & 3;
 
-		const size_t total =
+		size_t total =
 			multi_dir_off
 			+ multi_dir.size() * 4                  // multi_dir (cumulative offsets)
 			+ multi_stream.size();                  // multi_stream
+		total += (4 - (total & 3)) & 3;
 
 		out.resize(total);
 		Serial_Memory_Writer w{ Span<uint8_t>(out) };
@@ -883,6 +884,7 @@ struct RS_Block_Encoder
 			multi_dir.size() * 4));
 		if (!multi_stream.empty())
 			w.write(Const_Span<uint8_t>(multi_stream.data(), multi_stream.size()));
+		w.zero_align(4);
 		ASSERT(w.num_bytes_written() == total);
 		return Const_Span<uint8_t>(out.data(), out.size());
 	}

@@ -64,6 +64,20 @@ struct DTM50_Prefix_Entry
 };
 static_assert(sizeof(DTM50_Prefix_Entry) == 16);
 
+struct DTM50_Cached_Block
+{
+	uint32_t state_bits_off;
+	uint32_t const_stream_off;
+	uint32_t single_hints_off;
+	uint32_t single_stream_off;
+	uint32_t double_hints_off;
+	uint32_t double_stream_off;
+	uint32_t multi_dir_off;
+	uint32_t multi_data_off;
+	uint32_t prefix_off;
+};
+static_assert(sizeof(DTM50_Cached_Block) % 4 == 0);
+
 // Tally SINGLE/DOUBLE/MULTI in [bit_lo, bit_hi); CONST = span - sum.
 INLINE void popcount_state_range(
 	const uint8_t* sb, size_t bit_lo, size_t bit_hi,
@@ -138,8 +152,8 @@ NODISCARD INLINE State_Prefix state_prefix_indexed(
 	return State_Prefix{ nc, ns, nd, nm, state_at_pos };
 }
 
-// Cached buffer: [uint32 payload_size][payload][DTM50_Prefix_Entry prefix...].
-// payload_size up front so read() can find `prefix` from the Block_Ptr alone.
+// Cached buffer: [DTM50_Cached_Block][payload][DTM50_Prefix_Entry prefix...].
+// Offsets are cached so read() does not reparse the payload layout every probe.
 // Skipped blocks (usz==0) are short-circuited in read() before reaching here.
 Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 {
@@ -150,6 +164,7 @@ Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 	const uint64_t dso = offset[0];
 	const uint64_t usz = offset[1];
 	ASSERT(usz != 0);  // read() checks the skip sentinel first
+	ASSERT((usz & 3) == 0);
 	const size_t dsz  = dso & 0xFFFFFu;
 	const size_t doff = dso >> 20;
 
@@ -163,27 +178,55 @@ Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 			+ ppb * eb                                          // all CONST
 			+ (ppb + 7) / 8 + ppb * (1 + 2 * eb)                // all SINGLE
 			+ (ppb + 7) / 8 + ppb * (2 + 3 * eb)                // all DOUBLE
-			+ (ppb + 1) * 4 + ppb * (1 + 16 + DTM50_HMC_COUNT * eb);  // all MULTI
+			+ (ppb + 1) * 4 + ppb * (1 + 16 + DTM50_HMC_COUNT * eb)  // all MULTI
+			+ 3;                                                // tail alignment
 		pc.decomp = std::make_unique<LZMA_Decompress_Helper>(max_payload);
 	}
 	const Const_Span<uint8_t> raw = pc.decomp->decompress(
 		Const_Span(pc.compressed_data + doff, dsz), usz);
 
-	// num_positions from the just-decompressed header sizes the prefix tail.
-	uint32_t np32;
-	std::memcpy(&np32, raw.data(), 4);
-	const size_t n_strides = (np32 + DTM50_PREFIX_STRIDE - 1) / DTM50_PREFIX_STRIDE;
+	const uint8_t* payload = raw.data();
+	uint32_t num_positions, num_single, num_double, num_multi;
+	uint32_t single_stream_bytes, double_stream_bytes;
+	std::memcpy(&num_positions,        payload,      4);
+	std::memcpy(&num_single,           payload + 4,  4);
+	std::memcpy(&num_double,           payload + 8,  4);
+	std::memcpy(&num_multi,            payload + 12, 4);
+	std::memcpy(&single_stream_bytes,  payload + 16, 4);
+	std::memcpy(&double_stream_bytes,  payload + 20, 4);
+
+	const size_t eb = pc.entry_bytes;
+	const size_t num_const = num_positions - num_single - num_double - num_multi;
+	const size_t sb_bytes = (num_positions * 2 + 7) / 8;
+	const size_t sh_bytes = (num_single + 7) / 8;
+	const size_t dh_bytes = (num_double + 7) / 8;
+
+	DTM50_Cached_Block meta{};
+	size_t p = 24;
+	meta.state_bits_off = static_cast<uint32_t>(p); p += sb_bytes;
+	meta.const_stream_off = static_cast<uint32_t>(p); p += num_const * eb;
+	meta.single_hints_off = static_cast<uint32_t>(p); p += sh_bytes;
+	meta.single_stream_off = static_cast<uint32_t>(p); p += single_stream_bytes;
+	meta.double_hints_off = static_cast<uint32_t>(p); p += dh_bytes;
+	meta.double_stream_off = static_cast<uint32_t>(p); p += double_stream_bytes;
+	p += (4 - (p & 3)) & 3;
+	meta.multi_dir_off = static_cast<uint32_t>(p);
+	p += (num_multi + 1) * 4;
+	meta.multi_data_off = static_cast<uint32_t>(p);
+
+	const size_t payload_off = sizeof(DTM50_Cached_Block);
+	const size_t n_strides = (num_positions + DTM50_PREFIX_STRIDE - 1) / DTM50_PREFIX_STRIDE;
 	const size_t prefix_bytes = n_strides * sizeof(DTM50_Prefix_Entry);
+	const size_t prefix_off = payload_off + usz;
+	meta.prefix_off = static_cast<uint32_t>(prefix_off);
 
-	auto buf = std::make_shared<std::vector<uint8_t>>(4 + usz + prefix_bytes, 0);
-	const uint32_t payload_size32 = static_cast<uint32_t>(usz);
-	std::memcpy(buf->data(), &payload_size32, 4);
-	std::memcpy(buf->data() + 4, raw.data(), usz);
+	auto buf = std::make_shared<std::vector<uint8_t>>(prefix_off + prefix_bytes, 0);
+	std::memcpy(buf->data(), &meta, sizeof(meta));
+	std::memcpy(buf->data() + payload_off, raw.data(), usz);
 
-	constexpr size_t HEADER_BYTES = 24;
-	const uint8_t* state_bits = buf->data() + 4 + HEADER_BYTES;
-	auto* prefix = reinterpret_cast<DTM50_Prefix_Entry*>(buf->data() + 4 + usz);
-	build_dtm50_prefix_index(state_bits, np32, prefix, n_strides);
+	const uint8_t* state_bits = buf->data() + payload_off + meta.state_bits_off;
+	auto* prefix = reinterpret_cast<DTM50_Prefix_Entry*>(buf->data() + meta.prefix_off);
+	build_dtm50_prefix_index(state_bits, num_positions, prefix, n_strides);
 
 	const size_t slot = next_cache_slot(pc.live, pc.next_slot);
 	pc.block_id[slot] = block_id;
@@ -261,37 +304,21 @@ uint16_t DTM50_Traits::read(Per_Color& pc, bool is_singular, Board_Index pos,
 
 	const uint8_t* buf_data = fetch_block_cached(pc, block_id, dtm50_get_block);
 
-	uint32_t payload_size;
-	std::memcpy(&payload_size, buf_data, 4);
-	const uint8_t* payload = buf_data + 4;
+	const auto* meta = reinterpret_cast<const DTM50_Cached_Block*>(buf_data);
+	const uint8_t* payload = buf_data + sizeof(DTM50_Cached_Block);
 	const auto* prefix = reinterpret_cast<const DTM50_Prefix_Entry*>(
-		buf_data + 4 + payload_size);
-
-	// Block header (24 bytes): np, ns, nd, nm, ss_bytes, ds_bytes.
-	uint32_t num_positions, num_single, num_double, num_multi, ss_bytes32, ds_bytes32;
-	std::memcpy(&num_positions, payload,      4);
-	std::memcpy(&num_single,    payload + 4,  4);
-	std::memcpy(&num_double,    payload + 8,  4);
-	std::memcpy(&num_multi,     payload + 12, 4);
-	std::memcpy(&ss_bytes32,    payload + 16, 4);
-	std::memcpy(&ds_bytes32,    payload + 20, 4);
+		buf_data + meta->prefix_off);
 	const size_t eb = pc.entry_bytes;
-	const size_t num_const = num_positions - num_single - num_double - num_multi;
-	const size_t sb_bytes  = (num_positions * 2 + 7) / 8;
-	const size_t sh_bytes  = (num_single + 7) / 8;
-	const size_t dh_bytes  = (num_double + 7) / 8;
 
-	const uint8_t* p = payload + 24;
-	const uint8_t* state_bits   = p;                p += sb_bytes;
-	const uint8_t* const_stream = p;                p += num_const * eb;
-	const uint8_t* single_hints = p;                p += sh_bytes;
-	const uint8_t* single_stream = p;               p += ss_bytes32;
-	const uint8_t* double_hints = p;                p += dh_bytes;
-	const uint8_t* double_stream = p;               p += ds_bytes32;
-	p += (4 - ((p - payload) & 3)) & 3;
-	const uint32_t* multi_dir = reinterpret_cast<const uint32_t*>(p);
-	p += (num_multi + 1) * 4;
-	const uint8_t* multi_data = p;
+	const uint8_t* state_bits    = payload + meta->state_bits_off;
+	const uint8_t* const_stream  = payload + meta->const_stream_off;
+	const uint8_t* single_hints  = payload + meta->single_hints_off;
+	const uint8_t* single_stream = payload + meta->single_stream_off;
+	const uint8_t* double_hints  = payload + meta->double_hints_off;
+	const uint8_t* double_stream = payload + meta->double_stream_off;
+	const uint32_t* multi_dir = reinterpret_cast<const uint32_t*>(
+		payload + meta->multi_dir_off);
+	const uint8_t* multi_data = payload + meta->multi_data_off;
 
 	const State_Prefix sp = state_prefix_indexed(state_bits, prefix, pos_in_block);
 
