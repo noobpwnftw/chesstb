@@ -1,6 +1,6 @@
 CXX      ?= g++
 CC       ?= gcc
-CXXFLAGS ?= -std=c++17 -O3 -DNDEBUG -flto=auto -march=native -Wall -Isrc -Ilib -Wno-interference-size -Wno-format-security
+CXXFLAGS ?= -std=c++17 -O3 -DNDEBUG -flto=auto -march=native -Wall -Isrc -Ilib -Wno-interference-size -Wno-format-security -Wno-class-memaccess
 CFLAGS   ?= -O3 -DNDEBUG -flto=auto -march=native -Wall -Ilib
 LDFLAGS  ?= -pthread
 

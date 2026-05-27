@@ -4,7 +4,7 @@
 ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O3 -flto=auto -Wall -I$(ROOT)/src -I$(ROOT)/lib -Wno-interference-size -Wno-format-security
+CXXFLAGS ?= -std=c++17 -O3 -flto=auto -Wall -I$(ROOT)/src -I$(ROOT)/lib -Wno-interference-size -Wno-format-security -Wno-class-memaccess
 LDFLAGS  ?= -pthread
 
 ifeq ($(shell uname -m),aarch64)
