@@ -221,246 +221,251 @@ static int dump_info_file(const std::filesystem::path& path)
 
 int main(int argc, char** argv)
 {
-	if (!is_little_endian()) { std::cerr << "Only little-endian hosts supported.\n"; return 1; }
-	attack_init();
+	try {
+		if (!is_little_endian()) { std::cerr << "Only little-endian hosts supported.\n"; return 1; }
+		attack_init();
 
-	Options opt;
-	if (!parse_args(argc, argv, opt)) return 1;
+		Options opt;
+		if (!parse_args(argc, argv, opt)) return 1;
 
-	if (!opt.info_paths.empty())
-	{
-		int rc = 0;
-		for (const auto& p : opt.info_paths)
-			rc |= dump_info_file(p);
-		return rc;
-	}
+		if (!opt.info_paths.empty())
+		{
+			int rc = 0;
+			for (const auto& p : opt.info_paths)
+				rc |= dump_info_file(p);
+			return rc;
+		}
 
-	if (opt.enumerate_up_to > 0)
-	{
-		for (const auto& name : enumerate_materials(opt.enumerate_up_to))
-			std::cout << name << "\n";
-		return 0;
-	}
+		if (opt.enumerate_up_to > 0)
+		{
+			for (const auto& name : enumerate_materials(opt.enumerate_up_to))
+				std::cout << name << "\n";
+			return 0;
+		}
 
-	if (!opt.list_file.empty())
-	{
-		const auto more = read_list_file(opt.list_file);
-		opt.materials.insert(opt.materials.end(), more.begin(), more.end());
-	}
-	if (opt.materials.empty())
-	{
-		std::cerr << "No materials given. Use -r or --list.\n";
-		print_usage();
-		return 1;
-	}
+		if (!opt.list_file.empty())
+		{
+			const auto more = read_list_file(opt.list_file);
+			opt.materials.insert(opt.materials.end(), more.begin(), more.end());
+		}
+		if (opt.materials.empty())
+		{
+			std::cerr << "No materials given. Use -r or --list.\n";
+			print_usage();
+			return 1;
+		}
 
-	if (opt.estimate_only)
-	{
-		auto fmt_bytes = [](size_t bytes) {
-			char buf[64];
-			if (bytes >= 1ull << 40)      std::snprintf(buf, sizeof(buf), "%.2f TiB", bytes / static_cast<double>(1ull << 40));
-			else if (bytes >= 1ull << 30) std::snprintf(buf, sizeof(buf), "%.2f GiB", bytes / static_cast<double>(1ull << 30));
-			else if (bytes >= 1ull << 20) std::snprintf(buf, sizeof(buf), "%.2f MiB", bytes / static_cast<double>(1ull << 20));
-			else if (bytes >= 1ull << 10) std::snprintf(buf, sizeof(buf), "%.2f KiB", bytes / static_cast<double>(1ull << 10));
-			else                          std::snprintf(buf, sizeof(buf), "%zu B", bytes);
-			return std::string(buf);
-		};
+		if (opt.estimate_only)
+		{
+			auto fmt_bytes = [](size_t bytes) {
+				char buf[64];
+				if (bytes >= 1ull << 40)      std::snprintf(buf, sizeof(buf), "%.2f TiB", bytes / static_cast<double>(1ull << 40));
+				else if (bytes >= 1ull << 30) std::snprintf(buf, sizeof(buf), "%.2f GiB", bytes / static_cast<double>(1ull << 30));
+				else if (bytes >= 1ull << 20) std::snprintf(buf, sizeof(buf), "%.2f MiB", bytes / static_cast<double>(1ull << 20));
+				else if (bytes >= 1ull << 10) std::snprintf(buf, sizeof(buf), "%.2f KiB", bytes / static_cast<double>(1ull << 10));
+				else                          std::snprintf(buf, sizeof(buf), "%zu B", bytes);
+				return std::string(buf);
+			};
+			for (const auto& name : opt.materials)
+			{
+				if (!Piece_Config::is_constructible_from(name))
+				{
+					std::cout << name << ": invalid material name\n";
+					continue;
+				}
+				const Piece_Config ps(name);
+				if (ps.num_pieces() <= 2)
+				{
+					std::cout << ps.name() << ": <=2 pieces, trivial draw, no table generated\n";
+					continue;
+				}
+				const Working_Set_Estimate w = compute_working_set(ps, opt.build_dtm || opt.build_dtm50);
+				std::cout << ps.name() << ":\n";
+				std::printf("  positions             : %zu\n", w.num_positions);
+				std::printf("  total table (resident): %s  (both colors)\n", fmt_bytes(w.total_table_bytes).c_str());
+				std::printf("  bytes per slice       : %s  (within=%zu cells x 2 B)\n",
+					fmt_bytes(w.bytes_per_slice).c_str(),
+					w.bytes_per_slice / sizeof(DTC_Final_Entry));
+				std::printf("  slices per group      : %zu\n", w.slices_per_group);
+				std::printf("  bytes per group       : %s\n", fmt_bytes(w.bytes_per_group).c_str());
+				std::printf("  num slices / groups   : %zu / %zu\n", w.num_slices, w.num_groups);
+				std::printf("  iter per-dispatch     : %zu groups = %s  (minimum: one me-group + king-adj opp)\n",
+					w.peak_per_group_iter_groups,
+					fmt_bytes(w.peak_per_group_iter_groups * w.bytes_per_group).c_str());
+				std::printf("  iter per-pair_sid     : %zu groups = %s  (cache fits one pair_sid trajectory)\n",
+					w.peak_pair_iter_groups,
+					fmt_bytes(w.peak_pair_iter_groups * w.bytes_per_group).c_str());
+				std::printf("  iter per-batch        : %zu groups = %s  (unbounded fusion, --mem 0 ceiling)\n",
+					w.peak_batch_iter_groups,
+					fmt_bytes(w.peak_batch_iter_groups * w.bytes_per_group).c_str());
+				std::printf("  init per-dispatch     : %zu groups = %s\n",
+					w.peak_per_group_init_groups,
+					fmt_bytes(w.peak_per_group_init_groups * w.bytes_per_group).c_str());
+				std::printf("  init per-pair_sid     : %zu groups = %s\n",
+					w.peak_pair_init_groups,
+					fmt_bytes(w.peak_pair_init_groups * w.bytes_per_group).c_str());
+				std::printf("  init per-batch        : %zu groups = %s\n",
+					w.peak_batch_init_groups,
+					fmt_bytes(w.peak_batch_init_groups * w.bytes_per_group).c_str());
+				if (opt.build_dtm50)
+				{
+					std::printf("  dtm50                 : 3 * peaks above\n");
+				}
+				std::cout << "\n";
+			}
+			return 0;
+		}
+
+		EGTB_Paths paths;
+		paths.add_wdl_path(opt.wdl_dir);
+		paths.add_dtc_path(opt.dtc_dir);
+		paths.add_dtm_path(opt.dtm_dir);
+		paths.add_dtm50_path(opt.dtm50_dir);
+		paths.set_tmp_path(opt.tmp_dir);
+		paths.init_directories();
+
+		Unique_Piece_Configs requested;
 		for (const auto& name : opt.materials)
 		{
 			if (!Piece_Config::is_constructible_from(name))
 			{
-				std::cout << name << ": invalid material name\n";
+				std::cerr << "Skipping " << name << ": not a valid piece configuration.\n";
 				continue;
 			}
-			const Piece_Config ps(name);
-			if (ps.num_pieces() <= 2)
-			{
-				std::cout << ps.name() << ": <=2 pieces, trivial draw, no table generated\n";
-				continue;
-			}
-			const Working_Set_Estimate w = compute_working_set(ps, opt.build_dtm || opt.build_dtm50);
-			std::cout << ps.name() << ":\n";
-			std::printf("  positions             : %zu\n", w.num_positions);
-			std::printf("  total table (resident): %s  (both colors)\n", fmt_bytes(w.total_table_bytes).c_str());
-			std::printf("  bytes per slice       : %s  (within=%zu cells x 2 B)\n",
-				fmt_bytes(w.bytes_per_slice).c_str(),
-				w.bytes_per_slice / sizeof(DTC_Final_Entry));
-			std::printf("  slices per group      : %zu\n", w.slices_per_group);
-			std::printf("  bytes per group       : %s\n", fmt_bytes(w.bytes_per_group).c_str());
-			std::printf("  num slices / groups   : %zu / %zu\n", w.num_slices, w.num_groups);
-			std::printf("  iter per-dispatch     : %zu groups = %s  (minimum: one me-group + king-adj opp)\n",
-				w.peak_per_group_iter_groups,
-				fmt_bytes(w.peak_per_group_iter_groups * w.bytes_per_group).c_str());
-			std::printf("  iter per-pair_sid     : %zu groups = %s  (cache fits one pair_sid trajectory)\n",
-				w.peak_pair_iter_groups,
-				fmt_bytes(w.peak_pair_iter_groups * w.bytes_per_group).c_str());
-			std::printf("  iter per-batch        : %zu groups = %s  (unbounded fusion, --mem 0 ceiling)\n",
-				w.peak_batch_iter_groups,
-				fmt_bytes(w.peak_batch_iter_groups * w.bytes_per_group).c_str());
-			std::printf("  init per-dispatch     : %zu groups = %s\n",
-				w.peak_per_group_init_groups,
-				fmt_bytes(w.peak_per_group_init_groups * w.bytes_per_group).c_str());
-			std::printf("  init per-pair_sid     : %zu groups = %s\n",
-				w.peak_pair_init_groups,
-				fmt_bytes(w.peak_pair_init_groups * w.bytes_per_group).c_str());
-			std::printf("  init per-batch        : %zu groups = %s\n",
-				w.peak_batch_init_groups,
-				fmt_bytes(w.peak_batch_init_groups * w.bytes_per_group).c_str());
-			if (opt.build_dtm50)
-			{
-				std::printf("  dtm50                 : 3 * peaks above\n");
-			}
-			std::cout << "\n";
+			requested.add_unique(Piece_Config(name));
 		}
+
+		Unique_Piece_Configs closured;
+		for (const Piece_Config& ps : requested)
+			ps.add_closure_in_dependency_order_to(closured, true);
+
+		closured.remove_if([](const Piece_Config& ps) { return ps.num_pieces() <= 2; });
+
+		const size_t budget_bytes = opt.mem_mib * 1024ull * 1024ull;
+		std::cout << closured.size() << " piece configurations in plan"
+				<< (opt.mem_mib > 0 ? " (--mem " + std::to_string(opt.mem_mib) + " MiB)" : "")
+				<< (opt.build_dtm ? " (+dtm)" : "")
+				<< (opt.build_dtm50 ? " (+dtm50)" : "")
+				<< ":\n";
+		for (const Piece_Config& ps : closured)
+		{
+			const bool has_wdl = paths.find_wdl_file(ps);
+			const bool has_dtc = paths.find_dtc_file(ps);
+			const bool has_dtm = opt.build_dtm ? paths.find_dtm_file(ps) : true;
+			const bool has_dtm50 = opt.build_dtm50 ? paths.find_dtm50_file(ps) : true;
+			const size_t est = estimate_dtc_ram_bytes(ps);
+			std::string line = "  " + ps.name();
+			line.resize(10, ' ');
+			line += "  WDL "; line += has_wdl ? '+' : '-';
+			line += "  DTC "; line += has_dtc ? '+' : '-';
+			if (opt.build_dtm)   { line += "  DTM ";   line += has_dtm   ? '+' : '-'; }
+			if (opt.build_dtm50) { line += "  DTM50 "; line += has_dtm50 ? '+' : '-'; }
+			std::printf("%s  ~%6.1f MiB\n", line.c_str(), est / (1024.0 * 1024.0));
+		}
+
+		Thread_Pool pool(opt.num_threads);
+
+		{
+			struct sigaction sa{};
+			sa.sa_handler = [](int) { egtb_request_interrupt(); };
+			sigemptyset(&sa.sa_mask);
+			sigaction(SIGINT, &sa, nullptr);
+		}
+
+		const auto t_total_start = std::chrono::steady_clock::now();
+		size_t idx = 0;
+		for (const Piece_Config& ps : closured)
+		{
+			++idx;
+			if (egtb_is_interrupt_requested())
+			{
+				std::cout << "interrupted before " << ps.name() << ".\n";
+				return 130;
+			}
+
+			// DTC pass (always; gated by file existence). Produces wdl/<name>.lzw
+			// which the DTM pass below consumes for class info.
+			const bool need_wdl = !paths.find_wdl_file(ps);
+			const bool need_dtc = !paths.find_dtc_file(ps);
+			if (need_wdl || need_dtc)
+			{
+				std::cout << "[" << idx << "/" << closured.size() << "] " << ps.name()
+						<< ": generating DTC...\n";
+				const auto t_start = std::chrono::steady_clock::now();
+
+				auto subs = EGTB_Generator::open_sub_probes<WDL_File_For_Probe>(ps, paths, inout_param(pool));
+				DTC_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
+				try
+				{
+					g.gen(inout_param(pool), paths);
+					g.save_to_disk(inout_param(pool), paths);
+				}
+				catch (const DTC_Interrupted&)
+				{
+					return 130;
+				}
+
+				const auto t_end = std::chrono::steady_clock::now();
+				std::cout << "  " << ps.name() << " DTC done in " << format_elapsed_time(t_start, t_end)
+						<< "  (WDL " << std::filesystem::file_size(paths.wdl_save_path(ps)) << " B, "
+						<< "DTC " << std::filesystem::file_size(paths.dtc_save_path(ps)) << " B)\n";
+			}
+			else
+			{
+				std::cout << "[" << idx << "/" << closured.size() << "] " << ps.name() << ": DTC already on disk.\n";
+			}
+
+			// Optional DTM pass for this material.
+			if (opt.build_dtm && !paths.find_dtm_file(ps))
+			{
+				std::cout << "  " << ps.name() << ": generating DTM...\n";
+				const auto t_start = std::chrono::steady_clock::now();
+
+				auto subs = EGTB_Generator::open_sub_probes<DTM_Sub_File_Flat>(ps, paths, inout_param(pool));
+				DTM_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
+				try
+				{
+					g.gen(inout_param(pool), paths);
+					g.save_to_disk(inout_param(pool), paths);
+				}
+				catch (const DTM_Interrupted&)
+				{
+					return 130;
+				}
+
+				const auto t_end = std::chrono::steady_clock::now();
+				std::cout << "  " << ps.name() << " DTM done in " << format_elapsed_time(t_start, t_end)
+						<< "  (DTM " << std::filesystem::file_size(paths.dtm_save_path(ps)) << " B)\n";
+			}
+
+			// Optional DTM50 pass for this material.
+			if (opt.build_dtm50 && !paths.find_dtm50_file(ps))
+			{
+				std::cout << "  " << ps.name() << ": generating DTM50...\n";
+				const auto t_start = std::chrono::steady_clock::now();
+
+				auto subs = EGTB_Generator::open_sub_probes<DTM50_Sub_File_Flat>(ps, paths, inout_param(pool));
+				DTM50_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
+				try
+				{
+					g.gen(inout_param(pool), paths);
+					g.save_to_disk(inout_param(pool), paths);
+				}
+				catch (const DTM50_Interrupted&)
+				{
+					return 130;
+				}
+
+				const auto t_end = std::chrono::steady_clock::now();
+				std::cout << "  " << ps.name() << " DTM50 done in " << format_elapsed_time(t_start, t_end)
+						<< "  (DTM50 " << std::filesystem::file_size(paths.dtm50_save_path(ps)) << " B)\n";
+			}
+		}
+		const auto t_total_end = std::chrono::steady_clock::now();
+		std::cout << "All done in " << format_elapsed_time(t_total_start, t_total_end) << ".\n";
 		return 0;
+	} catch (const std::exception& e) {
+		std::fprintf(stderr, "error: %s\n", e.what());
+		return 1;
 	}
-
-	EGTB_Paths paths;
-	paths.add_wdl_path(opt.wdl_dir);
-	paths.add_dtc_path(opt.dtc_dir);
-	paths.add_dtm_path(opt.dtm_dir);
-	paths.add_dtm50_path(opt.dtm50_dir);
-	paths.set_tmp_path(opt.tmp_dir);
-	paths.init_directories();
-
-	Unique_Piece_Configs requested;
-	for (const auto& name : opt.materials)
-	{
-		if (!Piece_Config::is_constructible_from(name))
-		{
-			std::cerr << "Skipping " << name << ": not a valid piece configuration.\n";
-			continue;
-		}
-		requested.add_unique(Piece_Config(name));
-	}
-
-	Unique_Piece_Configs closured;
-	for (const Piece_Config& ps : requested)
-		ps.add_closure_in_dependency_order_to(closured, true);
-
-	closured.remove_if([](const Piece_Config& ps) { return ps.num_pieces() <= 2; });
-
-	const size_t budget_bytes = opt.mem_mib * 1024ull * 1024ull;
-	std::cout << closured.size() << " piece configurations in plan"
-	          << (opt.mem_mib > 0 ? " (--mem " + std::to_string(opt.mem_mib) + " MiB)" : "")
-	          << (opt.build_dtm ? " (+dtm)" : "")
-	          << (opt.build_dtm50 ? " (+dtm50)" : "")
-	          << ":\n";
-	for (const Piece_Config& ps : closured)
-	{
-		const bool has_wdl = paths.find_wdl_file(ps);
-		const bool has_dtc = paths.find_dtc_file(ps);
-		const bool has_dtm = opt.build_dtm ? paths.find_dtm_file(ps) : true;
-		const bool has_dtm50 = opt.build_dtm50 ? paths.find_dtm50_file(ps) : true;
-		const size_t est = estimate_dtc_ram_bytes(ps);
-		std::string line = "  " + ps.name();
-		line.resize(10, ' ');
-		line += "  WDL "; line += has_wdl ? '+' : '-';
-		line += "  DTC "; line += has_dtc ? '+' : '-';
-		if (opt.build_dtm)   { line += "  DTM ";   line += has_dtm   ? '+' : '-'; }
-		if (opt.build_dtm50) { line += "  DTM50 "; line += has_dtm50 ? '+' : '-'; }
-		std::printf("%s  ~%6.1f MiB\n", line.c_str(), est / (1024.0 * 1024.0));
-	}
-
-	Thread_Pool pool(opt.num_threads);
-
-	{
-		struct sigaction sa{};
-		sa.sa_handler = [](int) { egtb_request_interrupt(); };
-		sigemptyset(&sa.sa_mask);
-		sigaction(SIGINT, &sa, nullptr);
-	}
-
-	const auto t_total_start = std::chrono::steady_clock::now();
-	size_t idx = 0;
-	for (const Piece_Config& ps : closured)
-	{
-		++idx;
-		if (egtb_is_interrupt_requested())
-		{
-			std::cout << "interrupted before " << ps.name() << ".\n";
-			return 130;
-		}
-
-		// DTC pass (always; gated by file existence). Produces wdl/<name>.lzw
-		// which the DTM pass below consumes for class info.
-		const bool need_wdl = !paths.find_wdl_file(ps);
-		const bool need_dtc = !paths.find_dtc_file(ps);
-		if (need_wdl || need_dtc)
-		{
-			std::cout << "[" << idx << "/" << closured.size() << "] " << ps.name()
-			          << ": generating DTC...\n";
-			const auto t_start = std::chrono::steady_clock::now();
-
-			auto subs = EGTB_Generator::open_sub_probes<WDL_File_For_Probe>(ps, paths, inout_param(pool));
-			DTC_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
-			try
-			{
-				g.gen(inout_param(pool), paths);
-				g.save_to_disk(inout_param(pool), paths);
-			}
-			catch (const DTC_Interrupted&)
-			{
-				return 130;
-			}
-
-			const auto t_end = std::chrono::steady_clock::now();
-			std::cout << "  " << ps.name() << " DTC done in " << format_elapsed_time(t_start, t_end)
-			          << "  (WDL " << std::filesystem::file_size(paths.wdl_save_path(ps)) << " B, "
-			          << "DTC " << std::filesystem::file_size(paths.dtc_save_path(ps)) << " B)\n";
-		}
-		else
-		{
-			std::cout << "[" << idx << "/" << closured.size() << "] " << ps.name() << ": DTC already on disk.\n";
-		}
-
-		// Optional DTM pass for this material.
-		if (opt.build_dtm && !paths.find_dtm_file(ps))
-		{
-			std::cout << "  " << ps.name() << ": generating DTM...\n";
-			const auto t_start = std::chrono::steady_clock::now();
-
-			auto subs = EGTB_Generator::open_sub_probes<DTM_Sub_File_Flat>(ps, paths, inout_param(pool));
-			DTM_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
-			try
-			{
-				g.gen(inout_param(pool), paths);
-				g.save_to_disk(inout_param(pool), paths);
-			}
-			catch (const DTM_Interrupted&)
-			{
-				return 130;
-			}
-
-			const auto t_end = std::chrono::steady_clock::now();
-			std::cout << "  " << ps.name() << " DTM done in " << format_elapsed_time(t_start, t_end)
-			          << "  (DTM " << std::filesystem::file_size(paths.dtm_save_path(ps)) << " B)\n";
-		}
-
-		// Optional DTM50 pass for this material.
-		if (opt.build_dtm50 && !paths.find_dtm50_file(ps))
-		{
-			std::cout << "  " << ps.name() << ": generating DTM50...\n";
-			const auto t_start = std::chrono::steady_clock::now();
-
-			auto subs = EGTB_Generator::open_sub_probes<DTM50_Sub_File_Flat>(ps, paths, inout_param(pool));
-			DTM50_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
-			try
-			{
-				g.gen(inout_param(pool), paths);
-				g.save_to_disk(inout_param(pool), paths);
-			}
-			catch (const DTM50_Interrupted&)
-			{
-				return 130;
-			}
-
-			const auto t_end = std::chrono::steady_clock::now();
-			std::cout << "  " << ps.name() << " DTM50 done in " << format_elapsed_time(t_start, t_end)
-			          << "  (DTM50 " << std::filesystem::file_size(paths.dtm50_save_path(ps)) << " B)\n";
-		}
-	}
-	const auto t_total_end = std::chrono::steady_clock::now();
-	std::cout << "All done in " << format_elapsed_time(t_total_start, t_total_end) << ".\n";
-	return 0;
 }

@@ -87,7 +87,14 @@ struct Shard
 	Color longest_win_stm = WHITE;
 };
 
-static bool compare_material(const char* name)
+struct Options
+{
+	std::string wdl_dir = "./wdl/";
+	std::string dtc_dir = "./dtc/";
+	std::string syzygy_dir = "./syzygy";
+};
+
+static bool compare_material(const Options& opt, const char* name)
 {
 	if (!Piece_Config::is_constructible_from(std::string(name))) {
 		std::printf("%-8s: invalid name\n", name); return false;
@@ -95,7 +102,7 @@ static bool compare_material(const char* name)
 	Piece_Config ps(std::string{name});
 
 	// Accept both full and dropped-STM WDL files; generator lookup rejects the latter.
-	if (!std::filesystem::exists(std::filesystem::path("./wdl") / (ps.name() + ".lzw"))) {
+	if (!std::filesystem::exists(std::filesystem::path(opt.wdl_dir) / (ps.name() + ".lzw"))) {
 		std::printf("%-8s: no .lzw on disk, skipped\n", name); return true;
 	}
 	if (ps.num_pieces() > TB_LARGEST) {
@@ -111,8 +118,8 @@ static bool compare_material(const char* name)
 	const size_t N = epsi.num_positions();
 	// Share table caches across workers.
 	Probe_Tables tables;
-	tables.add_wdl_path("./wdl/");
-	tables.add_dtc_path("./dtc/");
+	tables.add_wdl_path(opt.wdl_dir);
+	tables.add_dtc_path(opt.dtc_dir);
 
 	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
 	std::atomic<size_t> next_idx{0};
@@ -292,52 +299,77 @@ static std::vector<std::string> enumerate_materials(size_t max_pieces)
 
 int main(int argc, char** argv)
 {
-	attack_init();
-	if (!tb_init("./syzygy")) {
-		std::fprintf(stderr, "tb_init failed (need ./syzygy/ with .rtbw files)\n");
-		return 1;
-	}
-	// tb_init accepts an empty directory; fail early so the run is meaningful.
-	if (TB_LARGEST == 0) {
-		std::fprintf(stderr,
-			"./syzygy/ contains no usable tablebase files — every probe will "
-			"fail. Place .rtbw files in ./syzygy/ before running.\n");
-		return 1;
-	}
+	try {
+		attack_init();
 
-	std::vector<std::string> materials;
-	for (int i = 1; i < argc; ++i) {
-		std::string a = argv[i];
-		if (a == "-t" && i + 1 < argc) {
-			const char* v = argv[++i];
-			char* end = nullptr;
-			const long long n = std::strtoll(v, &end, 10);
-			if (end == v || *end != '\0' || n <= 0) {
-				std::fprintf(stderr, "-t needs a positive integer (got \"%s\")\n", v);
-				return 1;
+		Options opt;
+		std::vector<std::string> materials;
+		for (int i = 1; i < argc; ++i) {
+			std::string a = argv[i];
+			if (a == "-t" && i + 1 < argc) {
+				const char* v = argv[++i];
+				char* end = nullptr;
+				const long long n = std::strtoll(v, &end, 10);
+				if (end == v || *end != '\0' || n <= 0) {
+					std::fprintf(stderr, "-t needs a positive integer (got \"%s\")\n", v);
+					return 1;
+				}
+				g_num_threads = static_cast<size_t>(n);
+			} else if (a == "--wdl" && i + 1 < argc) {
+				opt.wdl_dir = argv[++i];
+			} else if (a == "--dtc" && i + 1 < argc) {
+				opt.dtc_dir = argv[++i];
+			} else if (a == "--syzygy" && i + 1 < argc) {
+				opt.syzygy_dir = argv[++i];
+			} else if (a == "--list" && i + 1 < argc) {
+				auto more = read_list_file(argv[++i]);
+				materials.insert(materials.end(), more.begin(), more.end());
+			} else if (a == "--enumerate" && i + 1 < argc) {
+				auto more = enumerate_materials(std::strtoull(argv[++i], nullptr, 10));
+				materials.insert(materials.end(), more.begin(), more.end());
+			} else if (a == "-h" || a == "--help") {
+				std::printf(
+					"Usage: %s [options] [MATERIAL...]\n"
+					"Options:\n"
+					"  -t N           worker threads (default: hardware_concurrency)\n"
+					"  --wdl DIR      disk WDL directory (default ./wdl/)\n"
+					"  --dtc DIR      disk DTC directory (default ./dtc/)\n"
+					"  --syzygy DIR   Syzygy .rtbw/.rtbz directory (default ./syzygy)\n"
+					"  --list FILE    newline-separated material names\n"
+					"  --enumerate N  all materials up to N pieces\n",
+					argv[0]);
+				return 0;
+			} else {
+				materials.push_back(a);
 			}
-			g_num_threads = static_cast<size_t>(n);
-		} else if (a == "--list" && i + 1 < argc) {
-			auto more = read_list_file(argv[++i]);
-			materials.insert(materials.end(), more.begin(), more.end());
-		} else if (a == "--enumerate" && i + 1 < argc) {
-			auto more = enumerate_materials(std::strtoull(argv[++i], nullptr, 10));
-			materials.insert(materials.end(), more.begin(), more.end());
-		} else if (a == "-h" || a == "--help") {
-			std::printf("Usage: %s [-t N] [MATERIAL...] [--list FILE] [--enumerate N]\n", argv[0]);
-			return 0;
-		} else {
-			materials.push_back(a);
 		}
-	}
-	if (materials.empty()) {
-		std::fprintf(stderr, "No materials given. Use positional args, --list FILE, or --enumerate N.\n");
+
+		if (!tb_init(opt.syzygy_dir.c_str())) {
+			std::fprintf(stderr, "tb_init failed (need %s/ with .rtbw files)\n",
+				opt.syzygy_dir.c_str());
+			return 1;
+		}
+		// tb_init accepts an empty directory; fail early so the run is meaningful.
+		if (TB_LARGEST == 0) {
+			std::fprintf(stderr,
+				"%s/ contains no usable tablebase files — every probe will "
+				"fail. Place .rtbw files there before running.\n",
+				opt.syzygy_dir.c_str());
+			return 1;
+		}
+
+		if (materials.empty()) {
+			std::fprintf(stderr, "No materials given. Use positional args, --list FILE, or --enumerate N.\n");
+			return 1;
+		}
+
+		bool ok = true;
+		for (const auto& name : materials) ok &= compare_material(opt, name.c_str());
+
+		tb_free();
+		return ok ? 0 : 1;
+	} catch (const std::exception& e) {
+		std::fprintf(stderr, "error: %s\n", e.what());
 		return 1;
 	}
-
-	bool ok = true;
-	for (const auto& name : materials) ok &= compare_material(name.c_str());
-
-	tb_free();
-	return ok ? 0 : 1;
 }

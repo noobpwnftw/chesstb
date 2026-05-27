@@ -332,17 +332,22 @@ std::vector<Probe> parse_args(int argc, char** argv, Options* opt)
 
 int main(int argc, char** argv)
 {
-	attack_init();
+	try {
+		attack_init();
 
-	Options opt;
-	const std::vector<Probe> probes = parse_args(argc, argv, &opt);
+		Options opt;
+		const std::vector<Probe> probes = parse_args(argc, argv, &opt);
 
-	Probe_Tables tables;
-	tables.add_wdl_path(opt.wdl_dir);
-	tables.add_dtc_path(opt.dtc_dir);
-	tables.add_dtm_path(opt.dtm_dir);
-	tables.add_dtm50_path(opt.dtm50_dir);
+		Probe_Tables tables;
+		tables.add_wdl_path(opt.wdl_dir);
+		tables.add_dtc_path(opt.dtc_dir);
+		tables.add_dtm_path(opt.dtm_dir);
+		tables.add_dtm50_path(opt.dtm50_dir);
 
-	for (const Probe& p : probes) probe_one(opt, &tables, p);
-	return 0;
+		for (const Probe& p : probes) probe_one(opt, &tables, p);
+		return 0;
+	} catch (const std::exception& e) {
+		std::fprintf(stderr, "error: %s\n", e.what());
+		return 1;
+	}
 }

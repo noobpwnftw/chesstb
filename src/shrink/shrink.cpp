@@ -829,13 +829,18 @@ bool shrink_one(const std::filesystem::path& path)
 
 int main(int argc, char** argv)
 {
-	if (argc < 2)
-	{
-		std::fprintf(stderr, "usage: %s FILE [FILE...]\n", argv[0]);
-		return 2;
+	try {
+		if (argc < 2)
+		{
+			std::fprintf(stderr, "usage: %s FILE [FILE...]\n", argv[0]);
+			return 2;
+		}
+		int failures = 0;
+		for (int i = 1; i < argc; ++i)
+			if (!shrink_one(argv[i])) ++failures;
+		return failures == 0 ? 0 : 1;
+	} catch (const std::exception& e) {
+		std::fprintf(stderr, "error: %s\n", e.what());
+		return 1;
 	}
-	int failures = 0;
-	for (int i = 1; i < argc; ++i)
-		if (!shrink_one(argv[i])) ++failures;
-	return failures == 0 ? 0 : 1;
 }

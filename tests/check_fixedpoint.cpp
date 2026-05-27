@@ -746,69 +746,74 @@ std::vector<std::string> enumerate_materials(size_t max_pieces)
 
 int main(int argc, char** argv)
 {
-	attack_init();
+	try {
+		attack_init();
 
-	Options opt;
-	std::vector<std::string> mats;
-	bool explicit_mode = false;
+		Options opt;
+		std::vector<std::string> mats;
+		bool explicit_mode = false;
 
-	for (int i = 1; i < argc; ++i)
-	{
-		std::string a = argv[i];
-		if (a == "-t" && i + 1 < argc) {
-			const char* v = argv[++i];
-			char* end = nullptr;
-			const long long n = std::strtoll(v, &end, 10);
-			if (end == v || *end != '\0' || n <= 0) {
-				std::fprintf(stderr, "-t needs a positive integer (got \"%s\")\n", v);
-				return 1;
+		for (int i = 1; i < argc; ++i)
+		{
+			std::string a = argv[i];
+			if (a == "-t" && i + 1 < argc) {
+				const char* v = argv[++i];
+				char* end = nullptr;
+				const long long n = std::strtoll(v, &end, 10);
+				if (end == v || *end != '\0' || n <= 0) {
+					std::fprintf(stderr, "-t needs a positive integer (got \"%s\")\n", v);
+					return 1;
+				}
+				g_num_threads = static_cast<size_t>(n);
+				continue;
 			}
-			g_num_threads = static_cast<size_t>(n);
-			continue;
+			if (a == "--wdl" && i + 1 < argc)   { opt.wdl_dir = argv[++i]; continue; }
+			if (a == "--dtc-dir" && i + 1 < argc) { opt.dtc_dir = argv[++i]; continue; }
+			if (a == "--dtm-dir" && i + 1 < argc) { opt.dtm_dir = argv[++i]; continue; }
+			if (a == "--dtc" || a == "--dtz")   { if (!explicit_mode) { opt.check_dtc = opt.check_dtm = false; explicit_mode = true; } opt.check_dtc = true; continue; }
+			if (a == "--dtm")                   { if (!explicit_mode) { opt.check_dtc = opt.check_dtm = false; explicit_mode = true; } opt.check_dtm = true; continue; }
+			if (a == "--limit" && i + 1 < argc) { opt.sample_cap = std::strtoull(argv[++i], nullptr, 10); continue; }
+			if (a == "--list" && i + 1 < argc)  {
+				auto more = read_list_file(argv[++i]);
+				mats.insert(mats.end(), more.begin(), more.end());
+				continue;
+			}
+			if (a == "--enumerate" && i + 1 < argc) {
+				auto more = enumerate_materials(std::strtoull(argv[++i], nullptr, 10));
+				mats.insert(mats.end(), more.begin(), more.end());
+				continue;
+			}
+			if (a == "-h" || a == "--help") {
+				std::printf(
+					"Usage: %s [options] MATERIAL...\n"
+					"Options:\n"
+					"  -t N             worker threads (default: hardware_concurrency)\n"
+					"  --dtm            check DTM only (can be combined with --dtc)\n"
+					"  --dtc, --dtz     check DTC only (can be combined with --dtm)\n"
+					"  --list FILE      newline-separated material names\n"
+					"  --enumerate N    check every material with <= N pieces\n"
+					"  --wdl DIR        WDL directory (default ./wdl/)\n"
+					"  --dtc-dir DIR    DTC directory (default ./dtc/)\n"
+					"  --dtm-dir DIR    DTM directory (default ./dtm/)\n"
+					"  --limit N        max sample FENs per material (default 20)\n",
+					argv[0]);
+				return 0;
+			}
+			mats.push_back(a);
 		}
-		if (a == "--wdl" && i + 1 < argc)   { opt.wdl_dir = argv[++i]; continue; }
-		if (a == "--dtc-dir" && i + 1 < argc) { opt.dtc_dir = argv[++i]; continue; }
-		if (a == "--dtm-dir" && i + 1 < argc) { opt.dtm_dir = argv[++i]; continue; }
-		if (a == "--dtc" || a == "--dtz")   { if (!explicit_mode) { opt.check_dtc = opt.check_dtm = false; explicit_mode = true; } opt.check_dtc = true; continue; }
-		if (a == "--dtm")                   { if (!explicit_mode) { opt.check_dtc = opt.check_dtm = false; explicit_mode = true; } opt.check_dtm = true; continue; }
-		if (a == "--limit" && i + 1 < argc) { opt.sample_cap = std::strtoull(argv[++i], nullptr, 10); continue; }
-		if (a == "--list" && i + 1 < argc)  {
-			auto more = read_list_file(argv[++i]);
-			mats.insert(mats.end(), more.begin(), more.end());
-			continue;
-		}
-		if (a == "--enumerate" && i + 1 < argc) {
-			auto more = enumerate_materials(std::strtoull(argv[++i], nullptr, 10));
-			mats.insert(mats.end(), more.begin(), more.end());
-			continue;
-		}
-		if (a == "-h" || a == "--help") {
-			std::printf(
-				"Usage: %s [options] MATERIAL...\n"
-				"Options:\n"
-				"  -t N             worker threads (default: hardware_concurrency)\n"
-				"  --dtm            check DTM only (can be combined with --dtc)\n"
-				"  --dtc, --dtz     check DTC only (can be combined with --dtm)\n"
-				"  --list FILE      newline-separated material names\n"
-				"  --enumerate N    check every material with <= N pieces\n"
-				"  --wdl DIR        WDL directory (default ./wdl/)\n"
-				"  --dtc-dir DIR    DTC directory (default ./dtc/)\n"
-				"  --dtm-dir DIR    DTM directory (default ./dtm/)\n"
-				"  --limit N        max sample FENs per material (default 20)\n",
-				argv[0]);
-			return 0;
-		}
-		mats.push_back(a);
-	}
 
-	if (mats.empty())
-	{
-		std::fprintf(stderr, "No materials given. Use positional args, --list FILE, or --enumerate N.\n");
+		if (mats.empty())
+		{
+			std::fprintf(stderr, "No materials given. Use positional args, --list FILE, or --enumerate N.\n");
+			return 1;
+		}
+
+		bool ok = true;
+		for (const auto& mat : mats)
+			ok &= check_material(opt, mat);
+		return ok ? 0 : 1;
+	} catch (const std::exception& e) {
+		std::fprintf(stderr, "error: %s\n", e.what());
 		return 1;
 	}
-
-	bool ok = true;
-	for (const auto& mat : mats)
-		ok &= check_material(opt, mat);
-	return ok ? 0 : 1;
 }
