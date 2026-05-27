@@ -849,57 +849,8 @@ protected:
 	// Fast child Board_Index after a quiet (non-cap, non-promo, non-EP) move;
 	// also the predecessor index for a pre-quiet retro move. Falls back to full
 	// re-canonicalization for king moves, pawn moves, and self-stabilizer slices
-	// (all can shift canonical orientation). INLINE: hottest call in the retro
-	// inner loops, so defined here rather than out-of-line in egtb_gen.cpp.
-	NODISCARD INLINE Board_Index next_quiet_index(const Position_For_Gen& pos_gen, Move move) const
-	{
-		ASSERT(!move.is_promotion());
-		ASSERT(!move.is_ep_capture());
-
-		// Caller has already filtered illegal positions.
-		const Position& board = pos_gen.board_unchecked();
-		const Square from = move.from();
-		const Square to   = move.to();
-		const Piece mover = board.piece_at(from);
-		ASSERT(mover != PIECE_NONE);
-		ASSERT(board.is_empty(to));
-
-		auto fallback = [&]() {
-			// board_unchecked() above also populated m_placements; reuse them and
-			// patch the moved class instead of re-scanning bitboards.
-			auto placements = pos_gen.placements_unchecked();
-			const Piece_Class cls = piece_class(mover);
-			placements[cls] = placements[cls].with_moved_square(from, to);
-			return canonical_board_index(m_epsi, placements);
-		};
-
-		if (piece_type(mover) == KING) return fallback();
-
-		if (m_epsi.slice_manager().slice_has_stabilizer[pos_gen.index().king_slice_id])
-			return fallback();
-
-		if (piece_type(mover) == PAWN)
-		{
-			// Quiet pawn move is a same-file push: file-mirror orientation preserved
-			// and kings unchanged, so only pawn_slice_id needs recomputing.
-			auto placements = pos_gen.placements_unchecked();
-			placements[piece_class(mover)] =
-				placements[piece_class(mover)].with_moved_square(from, to);
-			Decomposed_Board_Index dix = pos_gen.index();
-			const auto& w_pl = placements[WHITE_PAWNS];
-			const auto& b_pl = placements[BLACK_PAWNS];
-			dix.pawn_slice_id = m_epsi.pawn_slice_manager().lookup_from_squares(
-				Const_Span<Square>(w_pl.begin(), w_pl.size()),
-				Const_Span<Square>(b_pl.begin(), b_pl.size()));
-			return m_epsi.compose_board_index(dix);
-		}
-
-		const Piece_Class cls = piece_class(mover);
-		Decomposed_Board_Index dix = pos_gen.index();
-		dix.within[cls] = m_epsi.group(cls).compound_index_after_quiet_move(
-			dix.within[cls], from, to);
-		return m_epsi.compose_board_index(dix);
-	}
+	// (all can shift canonical orientation).
+	NODISCARD Board_Index next_quiet_index(const Position_For_Gen& pos_gen, Move move) const;
 
 	// Forward sub-move: apply `move`, look up sub-material, mirror if needed,
 	// return Board_Index in the sub-epsi. Handles cap/promo/cap-promo uniformly.
