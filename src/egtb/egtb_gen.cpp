@@ -99,57 +99,6 @@ Board_Index board_index_of_position(const Piece_Config_For_Gen& epsi, const Posi
 	return canonical_board_index(epsi, p);
 }
 
-Board_Index next_quiet_index(const Piece_Config_For_Gen& epsi,
-                             const Position_For_Gen& pos_gen, Move move)
-{
-	ASSERT(!move.is_promotion());
-	ASSERT(!move.is_ep_capture());
-
-	// Caller has already filtered illegal positions.
-	const Position& board = pos_gen.board_unchecked();
-	const Square from = move.from();
-	const Square to   = move.to();
-	const Piece mover = board.piece_at(from);
-	ASSERT(mover != PIECE_NONE);
-	ASSERT(board.is_empty(to));
-
-	auto fallback = [&]() {
-		// board_unchecked() above also populated m_placements; reuse them and
-		// patch the moved class instead of re-scanning bitboards.
-		auto placements = pos_gen.placements_unchecked();
-		const Piece_Class cls = piece_class(mover);
-		placements[cls] = placements[cls].with_moved_square(from, to);
-		return canonical_board_index(epsi, placements);
-	};
-
-	if (piece_type(mover) == KING) return fallback();
-
-	if (epsi.slice_manager().slice_has_stabilizer[pos_gen.index().king_slice_id])
-		return fallback();
-
-	if (piece_type(mover) == PAWN)
-	{
-		// Quiet pawn move is a same-file push: file-mirror orientation preserved
-		// and kings unchanged, so only pawn_slice_id needs recomputing.
-		auto placements = pos_gen.placements_unchecked();
-		placements[piece_class(mover)] =
-			placements[piece_class(mover)].with_moved_square(from, to);
-		Decomposed_Board_Index dix = pos_gen.index();
-		const auto& w_pl = placements[WHITE_PAWNS];
-		const auto& b_pl = placements[BLACK_PAWNS];
-		dix.pawn_slice_id = epsi.pawn_slice_manager().lookup_from_squares(
-			Const_Span<Square>(w_pl.begin(), w_pl.size()),
-			Const_Span<Square>(b_pl.begin(), b_pl.size()));
-		return epsi.compose_board_index(dix);
-	}
-
-	const Piece_Class cls = piece_class(mover);
-	Decomposed_Board_Index dix = pos_gen.index();
-	dix.within[cls] = epsi.group(cls).compound_index_after_quiet_move(
-		dix.within[cls], from, to);
-	return epsi.compose_board_index(dix);
-}
-
 // Cap-promo sub-config: remove `cap_idx` AND replace `pawn_idx` with `promo_piece`.
 static Piece_Config make_cap_promo_sub(const Piece_Config& ps,
                                        size_t cap_idx, size_t pawn_idx,
@@ -262,11 +211,6 @@ EGTB_Generator::EGTB_Generator(const Piece_Config& ps) :
 			}
 		}
 	}
-}
-
-Board_Index EGTB_Generator::next_quiet_index(const Position_For_Gen& pos_for_gen, Move move) const
-{
-	return ::next_quiet_index(m_epsi, pos_for_gen, move);
 }
 
 // Decode (captured, promo) for `m` on `p`. PIECE_NONE if not a capture; handles EP.
