@@ -107,8 +107,6 @@ void Position::undo_move(Move m, Piece captured)
 
 	if (m.is_promotion())
 	{
-		const Piece placed = m_squares[to];
-		ASSERT(placed != PIECE_NONE);
 		remove_piece(to);
 		put_piece(piece_make(us, PAWN), from);
 		if (captured != PIECE_NONE)
