@@ -47,6 +47,36 @@ bool find_in_dirs(const Piece_Config& ps, const char* ext,
 	return false;
 }
 
+// Open-or-build behind a two-tier cache: a lock-free thread-local front (keyed
+// by `epoch`) over the shared per-key map under `mu`. `make` runs only on a
+// full miss and outside the write lock, returning the owning pointer to insert
+// — which may be null (e.g. no table on disk). Concurrent builders race on
+// try_emplace; the loser's freshly built object is discarded.
+template <typename Map, typename Make>
+auto cached_open(uint64_t epoch, std::shared_mutex& mu, Map& cache, uint32_t k, Make&& make)
+	-> typename Map::mapped_type::element_type*
+{
+	using T = typename Map::mapped_type::element_type;
+	thread_local TL_Cache<T> tl;
+	T* hit;
+	if (tl.lookup(epoch, k, hit)) return hit;
+	{
+		std::shared_lock rlk(mu);
+		auto it = cache.find(k);
+		if (it != cache.end())
+		{
+			tl.insert(epoch, k, it->second.get());
+			return it->second.get();
+		}
+	}
+	typename Map::mapped_type built = make();
+	std::unique_lock wlk(mu);
+	auto [it, inserted] = cache.try_emplace(k, std::move(built));
+	T* raw = it->second.get();
+	tl.insert(epoch, k, raw);
+	return raw;
+}
+
 // Literal key detects whether canonicalization swapped colors.
 struct Config_And_Literal_Key
 {
@@ -152,6 +182,21 @@ bool is_symmetric_material(const Piece_Config& ps)
 {
 	const auto [mat_key, mir_key] = ps.material_keys();
 	return mat_key == mir_key;
+}
+
+// Symmetric materials store only the WHITE-to-move frame.
+Position mirror_symmetric_black_stm(const Position& pos)
+{
+	Position swapped;
+	swapped.clear();
+	for (Square sq = SQ_A1; sq < SQ_END; sq = static_cast<Square>(sq + 1))
+	{
+		const Piece p = pos.piece_at(sq);
+		if (p != PIECE_NONE)
+			swapped.put_piece(piece_opp_color(p), sq_rank_mirror(sq));
+	}
+	swapped.set_turn(WHITE);
+	return swapped;
 }
 
 struct Child_Pos { Position pos; Piece_Config ps; bool is_kk; bool is_zeroing; };
@@ -264,129 +309,34 @@ struct Probe_Tables::Impl
 
 	std::atomic<size_t> largest_pieces{0};
 
+	// Builds the table for `ps` if a matching file exists in `dirs`, else
+	// caches a null entry so the lookup isn't retried on every probe.
+	template <typename File>
+	NODISCARD File* open_table(
+		std::shared_mutex& mu, std::unordered_map<uint32_t, std::unique_ptr<File>>& cache,
+		const std::vector<std::filesystem::path>& dirs, const char* ext, const Piece_Config& ps)
+	{
+		const uint32_t k = ps.min_material_key().value();
+		return cached_open(epoch, mu, cache, k, [&]() -> std::unique_ptr<File> {
+			std::filesystem::path path;
+			if (!find_in_dirs(ps, ext, dirs, &path)) return nullptr;
+			auto f = std::make_unique<File>();
+			f->load(ps, path);
+			return f;
+		});
+	}
+
 	NODISCARD const Position_Index_Config& get_epsi(const Piece_Config& ps)
 	{
 		const uint32_t k = ps.min_material_key().value();
-		thread_local TL_Cache<const Position_Index_Config> tl;
-		const Position_Index_Config* hit;
-		if (tl.lookup(epoch, k, hit)) return *hit;
-		{
-			std::shared_lock rlk(epsi_mu);
-			auto it = epsi_cache.find(k);
-			if (it != epsi_cache.end())
-				{ tl.insert(epoch, k, it->second.get()); return *it->second; }
-		}
-		auto e = std::make_unique<Position_Index_Config>(ps);
-		std::unique_lock wlk(epsi_mu);
-		auto [it, inserted] = epsi_cache.try_emplace(k, std::move(e));
-		const Position_Index_Config* raw = it->second.get();
-		tl.insert(epoch, k, raw);
-		return *raw;
+		return *cached_open(epoch, epsi_mu, epsi_cache, k,
+			[&] { return std::make_unique<Position_Index_Config>(ps); });
 	}
 
-	NODISCARD WDL_File* open_wdl(const Piece_Config& ps)
-	{
-		const uint32_t k = ps.min_material_key().value();
-		thread_local TL_Cache<WDL_File> tl;
-		WDL_File* hit;
-		if (tl.lookup(epoch, k, hit)) return hit;
-		{
-			std::shared_lock rlk(wdl_mu);
-			auto it = wdl_cache.find(k);
-			if (it != wdl_cache.end())
-				{ tl.insert(epoch, k, it->second.get()); return it->second.get(); }
-		}
-		std::filesystem::path path;
-		std::unique_ptr<WDL_File> f;
-		if (find_in_dirs(ps, WDL_EXT, wdl_dirs, &path))
-		{
-			f = std::make_unique<WDL_File>();
-			f->load(ps, path);
-		}
-		std::unique_lock wlk(wdl_mu);
-		auto [it, inserted] = wdl_cache.try_emplace(k, std::move(f));
-		WDL_File* raw = it->second.get();
-		tl.insert(epoch, k, raw);
-		return raw;
-	}
-
-	NODISCARD DTC_File* open_dtc(const Piece_Config& ps)
-	{
-		const uint32_t k = ps.min_material_key().value();
-		thread_local TL_Cache<DTC_File> tl;
-		DTC_File* hit;
-		if (tl.lookup(epoch, k, hit)) return hit;
-		{
-			std::shared_lock rlk(dtc_mu);
-			auto it = dtc_cache.find(k);
-			if (it != dtc_cache.end())
-				{ tl.insert(epoch, k, it->second.get()); return it->second.get(); }
-		}
-		std::filesystem::path path;
-		std::unique_ptr<DTC_File> f;
-		if (find_in_dirs(ps, DTC_EXT, dtc_dirs, &path))
-		{
-			f = std::make_unique<DTC_File>();
-			f->load(ps, path);
-		}
-		std::unique_lock wlk(dtc_mu);
-		auto [it, inserted] = dtc_cache.try_emplace(k, std::move(f));
-		DTC_File* raw = it->second.get();
-		tl.insert(epoch, k, raw);
-		return raw;
-	}
-
-	NODISCARD DTM_File* open_dtm(const Piece_Config& ps)
-	{
-		const uint32_t k = ps.min_material_key().value();
-		thread_local TL_Cache<DTM_File> tl;
-		DTM_File* hit;
-		if (tl.lookup(epoch, k, hit)) return hit;
-		{
-			std::shared_lock rlk(dtm_mu);
-			auto it = dtm_cache.find(k);
-			if (it != dtm_cache.end())
-				{ tl.insert(epoch, k, it->second.get()); return it->second.get(); }
-		}
-		std::filesystem::path path;
-		std::unique_ptr<DTM_File> f;
-		if (find_in_dirs(ps, DTM_EXT, dtm_dirs, &path))
-		{
-			f = std::make_unique<DTM_File>();
-			f->load(ps, path);
-		}
-		std::unique_lock wlk(dtm_mu);
-		auto [it, inserted] = dtm_cache.try_emplace(k, std::move(f));
-		DTM_File* raw = it->second.get();
-		tl.insert(epoch, k, raw);
-		return raw;
-	}
-
-	NODISCARD DTM50_File* open_dtm50(const Piece_Config& ps)
-	{
-		const uint32_t k = ps.min_material_key().value();
-		thread_local TL_Cache<DTM50_File> tl;
-		DTM50_File* hit;
-		if (tl.lookup(epoch, k, hit)) return hit;
-		{
-			std::shared_lock rlk(dtm50_mu);
-			auto it = dtm50_cache.find(k);
-			if (it != dtm50_cache.end())
-				{ tl.insert(epoch, k, it->second.get()); return it->second.get(); }
-		}
-		std::filesystem::path path;
-		std::unique_ptr<DTM50_File> f;
-		if (find_in_dirs(ps, DTM50_EXT, dtm50_dirs, &path))
-		{
-			f = std::make_unique<DTM50_File>();
-			f->load(ps, path);
-		}
-		std::unique_lock wlk(dtm50_mu);
-		auto [it, inserted] = dtm50_cache.try_emplace(k, std::move(f));
-		DTM50_File* raw = it->second.get();
-		tl.insert(epoch, k, raw);
-		return raw;
-	}
+	NODISCARD WDL_File*   open_wdl  (const Piece_Config& ps) { return open_table(wdl_mu,   wdl_cache,   wdl_dirs,   WDL_EXT,   ps); }
+	NODISCARD DTC_File*   open_dtc  (const Piece_Config& ps) { return open_table(dtc_mu,   dtc_cache,   dtc_dirs,   DTC_EXT,   ps); }
+	NODISCARD DTM_File*   open_dtm  (const Piece_Config& ps) { return open_table(dtm_mu,   dtm_cache,   dtm_dirs,   DTM_EXT,   ps); }
+	NODISCARD DTM50_File* open_dtm50(const Piece_Config& ps) { return open_table(dtm50_mu, dtm50_cache, dtm50_dirs, DTM50_EXT, ps); }
 
 	NODISCARD Probe_Result probe_impl(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
 	NODISCARD WDL_Entry probe_wdl_internal(const Piece_Config& ps, const Position& pos, int depth);
@@ -404,86 +354,12 @@ struct Probe_Tables::Impl
 	void scan_paths();
 };
 
-namespace {
-
-// Symmetric materials store only the WHITE-to-move frame.
-Position mirror_symmetric_black_stm(const Position& pos)
-{
-	Position swapped;
-	swapped.clear();
-	for (Square sq = SQ_A1; sq < SQ_END; sq = static_cast<Square>(sq + 1))
-	{
-		const Piece p = pos.piece_at(sq);
-		if (p != PIECE_NONE)
-			swapped.put_piece(piece_opp_color(p), sq_rank_mirror(sq));
-	}
-	swapped.set_turn(WHITE);
-	return swapped;
-}
-
-struct Canonical_Root
-{
-	Piece_Config ps;
-	Position pos;
-	Square ep_square = SQ_END;
-	bool mirrored = false;
-};
-
-Canonical_Root canonical_root_from_position(const Position& input, Square ep_square)
-{
-	auto [ps, literal_key] = piece_config_and_literal_key_from_position(input);
-	Position pos = input;
-	if (literal_key != ps.base_material_key())
-	{
-		pos = mirror_for_canonical(input);
-		if (ep_square != SQ_END)
-			ep_square = sq_rank_mirror(ep_square);
-		return { std::move(ps), std::move(pos), ep_square, true };
-	}
-	return { std::move(ps), std::move(pos), ep_square, false };
-}
-
-std::optional<Canonical_Root> canonical_root_from_config(
-	const Piece_Config& ps, const Position& input, Square ep_square)
-{
-	const Material_Key literal_key = input.material_key();
-	const auto [base_key, mirror_key] = ps.material_keys();
-	if (literal_key == base_key)
-		return Canonical_Root{ ps, input, ep_square, false };
-	if (literal_key != mirror_key)
-		return std::nullopt;
-
-	Position pos = mirror_for_canonical(input);
-	if (ep_square != SQ_END)
-		ep_square = sq_rank_mirror(ep_square);
-	return Canonical_Root{ ps, std::move(pos), ep_square, true };
-}
-
-Probe_Result illegal_probe_result()
-{
-	Probe_Result r;
-	r.status = Probe_Result::Status::ILLEGAL_POS;
-	return r;
-}
-
-Move rank_mirror_move(Move m)
-{
-	if (m.is_ep_capture())
-		return Move::make_ep_capture(sq_rank_mirror(m.from()), sq_rank_mirror(m.to()));
-	if (m.is_promotion())
-		return Move::make_promotion(sq_rank_mirror(m.from()), sq_rank_mirror(m.to()), m.promotion());
-	return Move::make_quiet(sq_rank_mirror(m.from()), sq_rank_mirror(m.to()));
-}
-
-}  // namespace
-
 WDL_Entry Probe_Tables::Impl::probe_wdl_internal(const Piece_Config& ps, const Position& pos, int depth)
 {
 	WDL_File* w = open_wdl(ps);
 	if (!w) return WDL_Entry::ILLEGAL;
 
-	const Position_Index_Config& epsi = get_epsi(ps);
-	const Board_Index idx = board_index_of_position(epsi, pos);
+	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
 	if (idx == BOARD_INDEX_NONE) return WDL_Entry::ILLEGAL;
 
 	const Color stm = pos.turn();
@@ -498,8 +374,7 @@ std::optional<uint16_t> Probe_Tables::Impl::probe_dtc_internal(
 	DTC_File* d = open_dtc(ps);
 	if (!d) return std::nullopt;
 
-	const Position_Index_Config& epsi = get_epsi(ps);
-	const Board_Index idx = board_index_of_position(epsi, pos);
+	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
 	if (idx == BOARD_INDEX_NONE) return std::nullopt;
 
 	const Color stm = pos.turn();
@@ -514,14 +389,37 @@ std::optional<uint16_t> Probe_Tables::Impl::probe_dtm_internal(
 	DTM_File* d = open_dtm(ps);
 	if (!d) return std::nullopt;
 
-	const Position_Index_Config& epsi = get_epsi(ps);
-	const Board_Index idx = board_index_of_position(epsi, pos);
+	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
 	if (idx == BOARD_INDEX_NONE) return std::nullopt;
 
 	const Color stm = pos.turn();
 	return d->is_dropped[stm]
 		? derive_dtm(ps, pos, depth)
 		: d->read(stm, idx, wdl);
+}
+
+DTM50_Result Probe_Tables::Impl::probe_dtm50_internal(
+	const Piece_Config& ps, const Position& pos, WDL_Entry wdl, unsigned rule50, int depth)
+{
+	if (rule50 >= DTM50_HMC_COUNT)
+		return { WDL_Entry::DRAW, 0 };
+	const uint16_t hmc = static_cast<uint16_t>(rule50);
+	DTM50_File* m = open_dtm50(ps);
+	if (!m) return {};
+
+	const Position_Index_Config& epsi = get_epsi(ps);
+	const Board_Index idx = board_index_of_position(epsi, pos);
+	if (idx == BOARD_INDEX_NONE) return {};
+
+	const Color stm = pos.turn();
+	const DTM50_Result d = m->is_dropped[stm]
+		? derive_dtm50(ps, pos, rule50, depth)
+		: DTM50_Result{ fold_dtm50_wdl(wdl), m->read(stm, idx, wdl, hmc) };
+
+	// See recover_mate_at_hmc.
+	if (hmc > 0 && d.dtm == 0 && (wdl == WDL_Entry::WIN || wdl == WDL_Entry::LOSE))
+		return recover_mate_at_hmc(pos, wdl);
+	return d;
 }
 
 WDL_Entry Probe_Tables::Impl::derive_wdl(const Piece_Config& ps, const Position& pos, int depth)
@@ -676,6 +574,74 @@ std::optional<uint16_t> Probe_Tables::Impl::derive_dtm(const Piece_Config& ps, c
 	return 0;
 }
 
+// rule50-aware derive: per-child hmc (zeroing resets, quiet increments);
+// once ≥100, the move is DRAW unless it mates.
+DTM50_Result Probe_Tables::Impl::derive_dtm50(
+	const Piece_Config& ps, const Position& pos, unsigned rule50, int depth)
+{
+	if (depth >= MAX_DERIVE_DEPTH) return {};
+
+	Move_List ml;
+	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
+
+	bool any_legal = false;
+	bool have_candidate = false;
+	WDL_Entry best_wdl = WDL_Entry::LOSE;
+	uint16_t  best_dtm = 0;
+
+	for (size_t i = 0; i < ml.size(); ++i)
+	{
+		const Move m = ml[i];
+		if (!pos.is_pseudo_legal_move_legal(m)) continue;
+		any_legal = true;
+
+		Child_Pos c = make_child(pos, m);
+		const unsigned child_rule50 = c.is_zeroing ? 0u : (rule50 + 1u);
+
+		DTM50_Result cd;
+		if (c.is_kk)
+		{
+			cd = { WDL_Entry::DRAW, 0 };
+		}
+		else if (child_rule50 >= DTM50_HMC_COUNT)
+		{
+			// Quiet move past the 50MR window: DRAW unless the move is mate.
+			cd = is_checkmate(c.pos)
+				? DTM50_Result{ WDL_Entry::LOSE, 0 }
+				: DTM50_Result{ WDL_Entry::DRAW, 0 };
+		}
+		else
+		{
+			const WDL_Entry cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
+			if (cw == WDL_Entry::ILLEGAL) continue;
+			cd = probe_dtm50_internal(c.ps, c.pos, cw, child_rule50, depth + 1);
+			if (cd.wdl == WDL_Entry::ILLEGAL) continue;
+		}
+
+		WDL_Entry cw = fold_dtm50_wdl(cd.wdl);  // cursed/blessed -> DRAW before inverting
+		const WDL_Entry my_wdl = invert_wdl(cw);
+		const uint16_t my_dtm = static_cast<uint16_t>(1u + static_cast<uint16_t>(cd.dtm));
+
+		if (!have_candidate || prefer_new(my_wdl, my_dtm, best_wdl, best_dtm))
+		{
+			best_wdl = my_wdl;
+			best_dtm = my_dtm;
+			have_candidate = true;
+		}
+	}
+
+	if (!any_legal)
+		return pos.is_in_check()
+			? DTM50_Result{ WDL_Entry::LOSE, 0 }
+			: DTM50_Result{ WDL_Entry::DRAW, 0 };
+	if (!have_candidate)
+		return {};
+
+	if (best_wdl == WDL_Entry::WIN || best_wdl == WDL_Entry::LOSE)
+		return { best_wdl, best_dtm };
+	return { WDL_Entry::DRAW, 0 };
+}
+
 Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth)
 {
 	if (pos.turn() == BLACK && is_symmetric_material(ps))
@@ -828,6 +794,51 @@ Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
 
 namespace {
 
+struct Canonical_Root
+{
+	Piece_Config ps;
+	Position pos;
+	Square ep_square = SQ_END;
+	bool mirrored = false;
+};
+
+Canonical_Root canonical_root_from_position(const Position& input, Square ep_square)
+{
+	auto [ps, literal_key] = piece_config_and_literal_key_from_position(input);
+	Position pos = input;
+	if (literal_key != ps.base_material_key())
+	{
+		pos = mirror_for_canonical(input);
+		if (ep_square != SQ_END)
+			ep_square = sq_rank_mirror(ep_square);
+		return { std::move(ps), std::move(pos), ep_square, true };
+	}
+	return { std::move(ps), std::move(pos), ep_square, false };
+}
+
+std::optional<Canonical_Root> canonical_root_from_config(
+	const Piece_Config& ps, const Position& input, Square ep_square)
+{
+	const Material_Key literal_key = input.material_key();
+	const auto [base_key, mirror_key] = ps.material_keys();
+	if (literal_key == base_key)
+		return Canonical_Root{ ps, input, ep_square, false };
+	if (literal_key != mirror_key)
+		return std::nullopt;
+
+	Position pos = mirror_for_canonical(input);
+	if (ep_square != SQ_END)
+		ep_square = sq_rank_mirror(ep_square);
+	return Canonical_Root{ ps, std::move(pos), ep_square, true };
+}
+
+Probe_Result illegal_probe_result()
+{
+	Probe_Result r;
+	r.status = Probe_Result::Status::ILLEGAL_POS;
+	return r;
+}
+
 // Count material characters before the extension.
 size_t count_pieces_from_filename(const std::string& fname)
 {
@@ -933,99 +944,16 @@ WDL_Entry Probe_Tables::probe_wdl(const Position& pos, Square ep_square, unsigne
 	return r.status == Probe_Result::Status::OK ? r.wdl : WDL_Entry::ILLEGAL;
 }
 
-DTM50_Result Probe_Tables::Impl::probe_dtm50_internal(
-	const Piece_Config& ps, const Position& pos, WDL_Entry wdl, unsigned rule50, int depth)
-{
-	if (rule50 >= DTM50_HMC_COUNT)
-		return { WDL_Entry::DRAW, 0 };
-	const uint16_t hmc = static_cast<uint16_t>(rule50);
-	DTM50_File* m = open_dtm50(ps);
-	if (!m) return {};
-
-	const Position_Index_Config& epsi = get_epsi(ps);
-	const Board_Index idx = board_index_of_position(epsi, pos);
-	if (idx == BOARD_INDEX_NONE) return {};
-
-	const Color stm = pos.turn();
-	const DTM50_Result d = m->is_dropped[stm]
-		? derive_dtm50(ps, pos, rule50, depth)
-		: DTM50_Result{ fold_dtm50_wdl(wdl), m->read(stm, idx, wdl, hmc) };
-
-	// See recover_mate_at_hmc.
-	if (hmc > 0 && d.dtm == 0 && (wdl == WDL_Entry::WIN || wdl == WDL_Entry::LOSE))
-		return recover_mate_at_hmc(pos, wdl);
-	return d;
-}
-
-// rule50-aware derive: per-child hmc (zeroing resets, quiet increments);
-// once ≥100, the move is DRAW unless it mates.
-DTM50_Result Probe_Tables::Impl::derive_dtm50(
-	const Piece_Config& ps, const Position& pos, unsigned rule50, int depth)
-{
-	if (depth >= MAX_DERIVE_DEPTH) return {};
-
-	Move_List ml;
-	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
-
-	bool any_legal = false;
-	bool have_candidate = false;
-	WDL_Entry best_wdl = WDL_Entry::LOSE;
-	uint16_t  best_dtm = 0;
-
-	for (size_t i = 0; i < ml.size(); ++i)
-	{
-		const Move m = ml[i];
-		if (!pos.is_pseudo_legal_move_legal(m)) continue;
-		any_legal = true;
-
-		Child_Pos c = make_child(pos, m);
-		const unsigned child_rule50 = c.is_zeroing ? 0u : (rule50 + 1u);
-
-		DTM50_Result cd;
-		if (c.is_kk)
-		{
-			cd = { WDL_Entry::DRAW, 0 };
-		}
-		else if (child_rule50 >= DTM50_HMC_COUNT)
-		{
-			// Quiet move past the 50MR window: DRAW unless the move is mate.
-			cd = is_checkmate(c.pos)
-				? DTM50_Result{ WDL_Entry::LOSE, 0 }
-				: DTM50_Result{ WDL_Entry::DRAW, 0 };
-		}
-		else
-		{
-			const WDL_Entry cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
-			if (cw == WDL_Entry::ILLEGAL) continue;
-			cd = probe_dtm50_internal(c.ps, c.pos, cw, child_rule50, depth + 1);
-			if (cd.wdl == WDL_Entry::ILLEGAL) continue;
-		}
-
-		WDL_Entry cw = fold_dtm50_wdl(cd.wdl);  // cursed/blessed -> DRAW before inverting
-		const WDL_Entry my_wdl = invert_wdl(cw);
-		const uint16_t my_dtm = static_cast<uint16_t>(1u + static_cast<uint16_t>(cd.dtm));
-
-		if (!have_candidate || prefer_new(my_wdl, my_dtm, best_wdl, best_dtm))
-		{
-			best_wdl = my_wdl;
-			best_dtm = my_dtm;
-			have_candidate = true;
-		}
-	}
-
-	if (!any_legal)
-		return pos.is_in_check()
-			? DTM50_Result{ WDL_Entry::LOSE, 0 }
-			: DTM50_Result{ WDL_Entry::DRAW, 0 };
-	if (!have_candidate)
-		return {};
-
-	if (best_wdl == WDL_Entry::WIN || best_wdl == WDL_Entry::LOSE)
-		return { best_wdl, best_dtm };
-	return { WDL_Entry::DRAW, 0 };
-}
-
 namespace {
+
+Move rank_mirror_move(Move m)
+{
+	if (m.is_ep_capture())
+		return Move::make_ep_capture(sq_rank_mirror(m.from()), sq_rank_mirror(m.to()));
+	if (m.is_promotion())
+		return Move::make_promotion(sq_rank_mirror(m.from()), sq_rank_mirror(m.to()), m.promotion());
+	return Move::make_quiet(sq_rank_mirror(m.from()), sq_rank_mirror(m.to()));
+}
 
 // Positive values are wins for the side to move; negative values are losses.
 int signed_dtz_of(const Probe_Result& r)
