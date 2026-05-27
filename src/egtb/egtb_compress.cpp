@@ -196,12 +196,13 @@ size_t LZMA_Rank_Compress_Helper::compress(Span<uint8_t> dest, Const_Span<uint8_
 	const uint16_t* const v2r = m_rank_table->value_to_rank.data();
 	auto* const work = reinterpret_cast<uint16_t*>(m_scratch.data());
 
-	// Collapse DRAW (m_data == 0 for both DTC and DTM) into the ILLEGAL
-	// sentinel so the run-stitch pass folds both don't-care classes. Probe
-	// reads them via the .lzw companion and never consults these bytes.
+	// storage_fn maps both don't-care classes (DRAW and ILLEGAL) to the same
+	// sentinel so the run-stitch pass folds them away; the probe recovers them
+	// via the .lzw companion and never consults these bytes. illegal_v recovers
+	// that sentinel value to drive the stitch.
 	const uint16_t illegal_v = m_storage_fn(DTC_Final_Entry::ILLEGAL_VAL, m_entry_bytes);
 	for (size_t i = 0; i < entries; ++i)
-		work[i] = (in[i] == 0) ? illegal_v : m_storage_fn(in[i], m_entry_bytes);
+		work[i] = m_storage_fn(in[i], m_entry_bytes);
 
 	if (!prepare_entries_for_compression<uint16_t>(Span<uint16_t>(work, entries), illegal_v))
 		return 0;

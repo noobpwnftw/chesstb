@@ -1274,7 +1274,7 @@ static void gather_dtc_info(
 				if (e.is_win())
 					info.maybe_update_longest_win(color, idx, e.value());
 
-				if (!e.is_illegal())
+				if (!e.is_illegal() && !e.is_draw())
 				{
 					++hist.hist_1b[static_cast<size_t>(dtc_value_for_storage(e))];
 					++hist.hist_2b[static_cast<size_t>(static_cast<uint16_t>(e.value()))];

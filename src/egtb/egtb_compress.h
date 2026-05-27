@@ -210,9 +210,10 @@ private:
 // DTM: both tiers halve via dtm_value_for_storage (parity-lossless).
 NODISCARD inline uint16_t dtc_storage_fn(uint16_t bits, size_t entry_bytes)
 {
-	if (entry_bytes == 2) return bits & DTC_Final_Entry::VALUE_MASK;
 	DTC_Final_Entry e;
 	std::memcpy(&e, &bits, sizeof(e));
+	if (e.is_draw()) return DTC_Final_Entry::ILLEGAL_VAL;
+	if (entry_bytes == 2) return e.value();
 	return dtc_value_for_storage(e);
 }
 
@@ -220,6 +221,7 @@ NODISCARD inline uint16_t dtm_storage_fn(uint16_t bits, size_t /*entry_bytes*/)
 {
 	DTM_Final_Entry e;
 	std::memcpy(&e, &bits, sizeof(e));
+	if (e.is_draw()) return DTM_Final_Entry::ILLEGAL_VAL;
 	return dtm_value_for_storage(e);
 }
 
