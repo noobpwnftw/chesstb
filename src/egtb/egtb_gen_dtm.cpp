@@ -6,7 +6,6 @@
 
 #include "chess/chess.h"
 #include "chess/position.h"
-#include "chess/attack.h"
 #include "chess/piece_config.h"
 
 #include "util/defines.h"
@@ -15,16 +14,12 @@
 #include "util/utility.h"
 
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
-#include <mutex>
 #include <optional>
-#include <set>
 
 namespace {
 

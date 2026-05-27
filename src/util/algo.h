@@ -3,12 +3,9 @@
 #include "defines.h"
 #include "span.h"
 
-#include <cstdint>
 #include <vector>
 #include <algorithm>
 #include <utility>
-#include <atomic>
-#include <limits>
 
 template <typename T = size_t>
 struct Mixed_Radix

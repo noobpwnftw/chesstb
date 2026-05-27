@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
-#include <new>
 #include <type_traits>
 
 #ifdef __cpp_lib_hardware_interference_size

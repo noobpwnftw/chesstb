@@ -3,6 +3,7 @@
 #include "chess/chess.h"
 #include "util/defines.h"
 #include "util/enum.h"
+#include "util/fixed_vector.h"
 #include "util/math.h"
 #include "util/span.h"
 
@@ -73,8 +74,6 @@ inline constexpr void unpack_wdl_entries(Const_Span<Packed_WDL_Entries> in, Span
 	for (size_t i = 0; i < in.size(); ++i)
 		unpack_wdl_entries(in[i], out.data() + i * WDL_ENTRY_PACK_RATIO);
 }
-
-#include "util/fixed_vector.h"
 
 NODISCARD inline Fixed_Vector<Color, 2> egtb_table_colors(size_t table_num)
 {
@@ -427,16 +426,6 @@ NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_
 		default:                      return DTM_Final_Entry::make_draw();
 	}
 }
-
-// 1-byte cell for DTM50's per-cell phase tape; routed through Sliced_EGTB_File_For_Gen
-// to inherit paging + spill. is_allowed_flag_type is unused (no add_flags calls).
-struct DTM50_Phase_Entry
-{
-	constexpr DTM50_Phase_Entry() : v(0) {}
-	constexpr DTM50_Phase_Entry(uint8_t x) : v(x) {}
-	uint8_t v;
-};
-static_assert(sizeof(DTM50_Phase_Entry) == 1);
 
 // DTM50 layer-0: cursed/blessed → DRAW. Unambiguous at hmc=0 (no cell is both
 // strict-WIN in flat-DTM and DRAW in DTM50 at the reset window).

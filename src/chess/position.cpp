@@ -7,7 +7,6 @@
 
 #include "util/defines.h"
 
-#include <cstring>
 #include <stdexcept>
 #include <string>
 

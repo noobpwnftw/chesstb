@@ -7,8 +7,6 @@
 
 #include "lz4/lz4.h"
 
-#include <cstdio>
-#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <vector>

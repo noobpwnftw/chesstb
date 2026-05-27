@@ -6,7 +6,6 @@
 
 #include "chess/chess.h"
 #include "chess/position.h"
-#include "chess/attack.h"
 #include "chess/piece_config.h"
 
 #include "util/compress.h"

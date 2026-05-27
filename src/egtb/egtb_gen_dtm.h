@@ -8,9 +8,7 @@
 #include "egtb/symmetry.h"
 
 #include "chess/chess.h"
-#include "chess/position.h"
 #include "chess/move.h"
-#include "chess/attack.h"
 #include "chess/piece_config.h"
 
 #include "util/defines.h"
@@ -21,7 +19,6 @@
 #include <filesystem>
 #include <map>
 #include <memory>
-#include <vector>
 
 struct DTM_Interrupted
 {

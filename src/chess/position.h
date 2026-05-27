@@ -2,14 +2,12 @@
 
 #include "chess/chess.h"
 #include "chess/bitboard.h"
-#include "chess/attack.h"
 #include "chess/move.h"
 
 #include "util/defines.h"
 #include "util/param.h"
 #include "util/span.h"
 
-#include <array>
 #include <cstdint>
 #include <cstring>
 #include <string>

@@ -1,7 +1,6 @@
 #include "chess/move.h"
 #include "chess/chess.h"
 
-#include <cstdio>
 #include <cstring>
 #include <iostream>
 

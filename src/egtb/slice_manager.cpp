@@ -6,7 +6,6 @@
 #include "chess/bitboard.h"
 
 #include <algorithm>
-#include <vector>
 
 namespace {
 

@@ -12,9 +12,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <mutex>
-#include <map>
-#include <memory>
 #include <vector>
 
 // A Piece_Group holds N identical pieces of one type, ranked combinatorially

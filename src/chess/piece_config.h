@@ -3,13 +3,10 @@
 #include "chess.h"
 
 #include "util/defines.h"
-#include "util/enum.h"
 #include "util/span.h"
-#include "util/param.h"
 
 #include <array>
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <utility>
@@ -18,8 +15,6 @@
 #include <type_traits>
 #include <map>
 #include <set>
-#include <memory>
-#include <optional>
 
 // One class per piece type per color.
 // Unlike xiangqi's DEFENDERS, chess does not merge classes — KINGS stands alone

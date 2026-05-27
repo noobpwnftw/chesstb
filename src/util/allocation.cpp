@@ -19,7 +19,6 @@
 
 #endif
 
-#include <cstdlib>
 #include <cstdio>
 
 NODISCARD void* allocate_large_pages(size_t bytes)

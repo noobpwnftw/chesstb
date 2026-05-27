@@ -9,9 +9,7 @@
 #include "egtb/symmetry.h"
 
 #include "chess/chess.h"
-#include "chess/position.h"
 #include "chess/move.h"
-#include "chess/attack.h"
 #include "chess/piece_config.h"
 
 #include "util/defines.h"
@@ -22,7 +20,6 @@
 #include <filesystem>
 #include <map>
 #include <memory>
-#include <vector>
 
 // DTM50 = plies-to-mate under 50MR. 100 per-hmc layers per color.
 //

@@ -21,9 +21,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
-#include <optional>
-#include <utility>
-#include <functional>
 #include <vector>
 
 // Represents an lz4 dictionary.

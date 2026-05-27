@@ -4,7 +4,6 @@
 
 #include "util/defines.h"
 
-#include <array>
 #include <algorithm>
 #include <map>
 

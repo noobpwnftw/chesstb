@@ -1,9 +1,7 @@
 #pragma once
 
 #include "defines.h"
-#include "math.h"
 #include "span.h"
-#include "enum.h"
 
 #include <memory>
 #include <type_traits>

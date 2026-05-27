@@ -1,8 +1,6 @@
 #pragma once
 
 #include "chess/chess.h"
-#include "chess/bitboard.h"
-#include "chess/attack.h"
 #include "egtb/piece_config_for_gen.h"
 
 #include "util/defines.h"

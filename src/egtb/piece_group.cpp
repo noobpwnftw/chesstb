@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <array>
 #include <vector>
-#include <cstring>
 
 Piece_Group::Piece_Group(Piece pc, size_t count, Const_Span<Square> legal_squares) :
 	m_piece(pc),
