@@ -14,6 +14,7 @@
 
 #include "util/algo.h"
 #include "util/allocation.h"
+#include "util/compress.h"
 #include "util/defines.h"
 #include "util/division.h"
 #include "util/enum.h"
@@ -776,6 +777,14 @@ struct Pinned_Group_Range
 	Pinned_Group_Range& operator=(const Pinned_Group_Range&) = delete;
 };
 
+template <typename EntryT>
+NODISCARD Block_Source make_entry_block_source(
+	Sliced_EGTB_File_For_Gen<EntryT>& src,
+	Save_Group_Cache<EntryT>& cache,
+	Color color,
+	size_t block_size,
+	size_t entry_bytes);
+
 // Position to canonical Board_Index for a given epsi.
 NODISCARD std::array<Piece_Group::Placement, PIECE_CLASS_NB>
 	placements_from_position(const Piece_Config_For_Gen& epsi, const Position& pos);
@@ -931,81 +940,14 @@ protected:
 	}
 
 	template <typename EntryT>
-	void refresh_active_metadata(const Sliced_EGTB_File_For_Gen<EntryT>& tbl)
-	{
-		const size_t nps = m_epsi.num_pawn_slices();
-		const size_t nks = m_epsi.num_king_slices();
-		const size_t spg = tbl.slices_per_group();
-		const size_t ngroups = tbl.num_groups();
-
-		m_pid_in_pair.assign(nps, 0);
-		for (int32_t pid : m_active_pawn_slices)
-			m_pid_in_pair[static_cast<size_t>(pid)] = 1;
-
-		std::vector<uint8_t> in_pair(ngroups, 0);
-		for (int32_t pid : m_active_pawn_slices)
-		{
-			const size_t base = static_cast<size_t>(pid) * nks;
-			for (size_t k = 0; k < nks; ++k)
-				in_pair[(base + k) / spg] = 1;
-		}
-
-		m_pair_group_ids.clear();
-		m_pair_group_ids.reserve(ngroups);
-		for (size_t g = 0; g < ngroups; ++g)
-			if (in_pair[g]) m_pair_group_ids.push_back(g);
-	}
+	void refresh_active_metadata(const Sliced_EGTB_File_For_Gen<EntryT>& tbl);
 
 	// Pack a topo-batch of pair_sids into fusion groups whose unioned group-set
 	// fits m_paging_budget_bytes. Returns `{batch}` when budget is unbounded.
 	template <typename EntryT>
 	NODISCARD std::vector<std::vector<int32_t>>
 	compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT>& tbl,
-	                      const std::vector<int32_t>& batch) const
-	{
-		if (batch.empty()) return {};
-		if (m_paging_budget_bytes == 0) return { batch };
-
-		const auto& psm = m_epsi.pawn_slice_manager();
-		const size_t nks = m_epsi.num_king_slices();
-		const size_t spg = tbl.slices_per_group();
-		const size_t bytes_per_group =
-			spg * m_epsi.within_slice_size() * sizeof(EntryT);
-		const size_t budget_groups =
-			std::max<size_t>(1, m_paging_budget_bytes / bytes_per_group);
-
-		auto pair_groups = [&](int32_t pair_sid) -> std::set<size_t> {
-			std::set<size_t> g;
-			for (int32_t pid : psm.pair_members(pair_sid))
-			{
-				const size_t base = static_cast<size_t>(pid) * nks;
-				for (size_t k = 0; k < nks; ++k)
-					g.insert((base + k) / spg);
-			}
-			return g;
-		};
-
-		std::vector<std::vector<int32_t>> fusions;
-		fusions.emplace_back();
-		std::set<size_t> covered;
-
-		for (int32_t pair_sid : batch)
-		{
-			const auto pg = pair_groups(pair_sid);
-			size_t added = 0;
-			for (size_t g : pg) if (!covered.count(g)) ++added;
-
-			if (!fusions.back().empty() && covered.size() + added > budget_groups)
-			{
-				fusions.emplace_back();
-				covered.clear();
-			}
-			for (size_t g : pg) covered.insert(g);
-			fusions.back().push_back(pair_sid);
-		}
-		if (fusions.back().empty()) fusions.pop_back();
-		return fusions;
-	}
+	                      const std::vector<int32_t>& batch) const;
 
 	// Drive the resident-group set toward (needed_w | needed_b): load any
 	// needed nonresident group, then evict LRU non-needed groups until residency
@@ -1017,85 +959,7 @@ protected:
 		Sliced_EGTB_File_For_Gen<EntryT>* w_tbl,
 		Sliced_EGTB_File_For_Gen<EntryT>* b_tbl,
 		const std::vector<uint8_t>& needed_w,
-		const std::vector<uint8_t>& needed_b)
-	{
-		struct Group_Task {
-			Sliced_EGTB_File_For_Gen<EntryT>* tbl;
-			size_t group_id;
-			bool load;
-		};
-
-		Sliced_EGTB_File_For_Gen<EntryT>* tbls[COLOR_NB] = { w_tbl, b_tbl };
-		const std::vector<uint8_t>* needed[COLOR_NB] = { &needed_w, &needed_b };
-
-		const size_t bytes_per_group =
-			w_tbl->within_slice_size() * w_tbl->slices_per_group() * sizeof(EntryT);
-
-		++m_paging_tick;
-
-		std::vector<Group_Task> tasks;
-		size_t live_groups = 0;
-		for (Color c : { WHITE, BLACK })
-		{
-			auto& tbl = *tbls[c];
-			const auto& need = *needed[c];
-			const size_t ng = tbl.num_groups();
-			ASSERT(need.size() == ng);
-			for (size_t g = 0; g < ng; ++g)
-			{
-				const bool res = tbl.is_group_resident(g);
-				if (need[g])
-					m_last_used[c][g] = m_paging_tick;
-				if (need[g] && !res)
-					tasks.push_back({ &tbl, g, true });
-				if (res || need[g])
-					++live_groups;
-			}
-		}
-
-		if (m_paging_budget_bytes > 0)
-		{
-			size_t future_bytes = live_groups * bytes_per_group;
-			if (future_bytes > m_paging_budget_bytes)
-			{
-				struct Candidate { uint64_t last_used; Color c; size_t g; };
-				std::vector<Candidate> victims;
-				for (Color c : { WHITE, BLACK })
-				{
-					auto& tbl = *tbls[c];
-					const auto& need = *needed[c];
-					const size_t ng = tbl.num_groups();
-					for (size_t g = 0; g < ng; ++g)
-						if (!need[g] && tbl.is_group_resident(g))
-							victims.push_back({ m_last_used[c][g], c, g });
-				}
-				std::sort(victims.begin(), victims.end(),
-					[](const Candidate& a, const Candidate& b) {
-						return a.last_used < b.last_used;
-					});
-				for (const Candidate& v : victims)
-				{
-					if (future_bytes <= m_paging_budget_bytes) break;
-					tasks.push_back({ tbls[v.c], v.g, false });
-					future_bytes -= bytes_per_group;
-				}
-			}
-		}
-
-		if (tasks.empty()) return;
-
-		std::atomic<size_t> next(0);
-		thread_pool->run_sync_task_on_all_threads([&](size_t) {
-			for (;;)
-			{
-				const size_t i = next.fetch_add(1);
-				if (i >= tasks.size()) return;
-				const Group_Task& t = tasks[i];
-				if (t.load) t.tbl->load_group(t.group_id);
-				else        t.tbl->evict_group(t.group_id);
-			}
-		});
-	}
+		const std::vector<uint8_t>& needed_b);
 };
 
 // Working-set sizing for the gen pipeline. Used by --estimate and `--mem`

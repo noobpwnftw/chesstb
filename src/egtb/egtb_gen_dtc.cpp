@@ -1186,55 +1186,6 @@ static Block_Source make_wdl_block_source(
 	};
 }
 
-static Block_Source make_dtc_block_source(
-	Sliced_EGTB_File_For_Gen<DTC_Final_Entry>& src,
-	DTC_Save_Cache& cache,
-	Color color,
-	size_t block_size,
-	size_t entry_bytes)
-{
-	constexpr size_t kEntry = sizeof(DTC_Final_Entry);
-	ASSERT(block_size % entry_bytes == 0);
-	const size_t source_block_bytes = block_size * kEntry / entry_bytes;
-	const size_t within = src.within_slice_size();
-	const size_t spg = src.slices_per_group();
-	const size_t total_entries = src.num_slices() * within;
-	const size_t source_total_bytes = total_entries * kEntry;
-	const size_t output_total_bytes = total_entries * entry_bytes;
-	return Block_Source{
-		output_total_bytes,
-		[&src, &cache, color, within, spg, source_block_bytes, source_total_bytes](size_t block_id, Span<uint8_t> scratch) -> Const_Span<uint8_t> {
-			const size_t block_off = block_id * source_block_bytes;
-			const size_t this_block = std::min(source_block_bytes, source_total_bytes - block_off);
-			ASSERT(scratch.size() >= this_block);
-			ASSERT(block_off % kEntry == 0);
-			ASSERT(this_block % kEntry == 0);
-
-			const size_t entry_off = block_off / kEntry;
-			const size_t entry_cnt = this_block / kEntry;
-
-			const size_t first_g = (entry_off / within) / spg;
-			const size_t last_g  = (entry_cnt == 0 ? first_g
-			                                       : ((entry_off + entry_cnt - 1) / within) / spg);
-			DTC_Pinned_Range pin(cache, color, first_g, last_g);
-
-			size_t done = 0;
-			while (done < entry_cnt)
-			{
-				const size_t cur = entry_off + done;
-				const size_t s = cur / within;
-				const size_t in_slice = cur - s * within;
-				const size_t take = std::min(entry_cnt - done, within - in_slice);
-				const auto* const raw = src.slice_data(s) + in_slice;
-				std::memcpy(scratch.data() + done * kEntry, raw, take * kEntry);
-				done += take;
-			}
-
-			return Const_Span<uint8_t>(scratch.data(), this_block);
-		}
-	};
-}
-
 static void gather_dtc_info(
 	const Piece_Config_For_Gen& epsi,
 	DTC_Save_Cache& cache,
@@ -1369,7 +1320,7 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 	for (Color me : colors)
 	{
 		Value_Rank_Table& chosen = (dtc_entry_bytes[me] == 1) ? dtc_rank_1b[me] : dtc_rank_2b[me];
-		Block_Source src = make_dtc_block_source(
+		Block_Source src = make_entry_block_source(
 			m_table->m_dtc[me], cache, me, DTC_BLOCK_SIZE, dtc_entry_bytes[me]);
 		dtc_save[me] = save_compress_egtb(
 			thread_pool, src, me, m_info, dtc_entry_bytes[me], DTC_BLOCK_SIZE, max_workers,

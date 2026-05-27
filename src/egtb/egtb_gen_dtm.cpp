@@ -1098,55 +1098,6 @@ void gather_dtm_info(
 	}
 }
 
-Block_Source make_dtm_block_source(
-	Sliced_EGTB_File_For_Gen<DTM_Final_Entry>& src,
-	DTM_Save_Cache& cache,
-	Color color,
-	size_t block_size,
-	size_t entry_bytes)
-{
-	constexpr size_t kEntry = sizeof(DTM_Final_Entry);
-	ASSERT(block_size % entry_bytes == 0);
-	const size_t source_block_bytes = block_size * kEntry / entry_bytes;
-	const size_t within = src.within_slice_size();
-	const size_t spg = src.slices_per_group();
-	const size_t total_entries = src.num_slices() * within;
-	const size_t source_total_bytes = total_entries * kEntry;
-	const size_t output_total_bytes = total_entries * entry_bytes;
-	return Block_Source{
-		output_total_bytes,
-		[&src, &cache, color, within, spg, source_block_bytes, source_total_bytes](size_t block_id, Span<uint8_t> scratch) -> Const_Span<uint8_t> {
-			const size_t block_off = block_id * source_block_bytes;
-			const size_t this_block = std::min(source_block_bytes, source_total_bytes - block_off);
-			ASSERT(scratch.size() >= this_block);
-			ASSERT(block_off % kEntry == 0);
-			ASSERT(this_block % kEntry == 0);
-
-			const size_t entry_off = block_off / kEntry;
-			const size_t entry_cnt = this_block / kEntry;
-
-			const size_t first_g = (entry_off / within) / spg;
-			const size_t last_g  = (entry_cnt == 0 ? first_g
-			                                       : ((entry_off + entry_cnt - 1) / within) / spg);
-			DTM_Pinned_Range pin(cache, color, first_g, last_g);
-
-			size_t done = 0;
-			while (done < entry_cnt)
-			{
-				const size_t cur = entry_off + done;
-				const size_t s = cur / within;
-				const size_t in_slice = cur - s * within;
-				const size_t take = std::min(entry_cnt - done, within - in_slice);
-				const auto* const raw = src.slice_data(s) + in_slice;
-				std::memcpy(scratch.data() + done * kEntry, raw, take * kEntry);
-				done += take;
-			}
-
-			return Const_Span<uint8_t>(scratch.data(), this_block);
-		}
-	};
-}
-
 }  // namespace
 
 void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths& paths)
@@ -1214,7 +1165,7 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 	for (Color me : colors)
 	{
 		if (dtm_save[me].is_singular()) continue;
-		Block_Source src = make_dtm_block_source(m_table->m_dtm[me], cache, me, DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
+		Block_Source src = make_entry_block_source(m_table->m_dtm[me], cache, me, DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
 		dtm_save[me] = save_compress_egtb(
 			thread_pool, src, me, m_info, dtm_entry_bytes[me], DTM_BLOCK_SIZE, max_workers,
 			dtm_rank[me], &dtm_storage_fn);

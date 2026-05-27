@@ -1,4 +1,5 @@
 #include "egtb/egtb_gen.h"
+#include "egtb/egtb_entry.h"
 #include "egtb/symmetry.h"
 #include "egtb/slice_manager.h"
 #include "egtb/pawn_slice_manager.h"
@@ -506,3 +507,232 @@ Working_Set_Estimate compute_working_set(const Piece_Config& ps, bool include_pu
 
 	return w;
 }
+
+// =============================================================================
+// EGTB_Generator paging templates + the shared block source. Bodies live here
+// (not the header) so the TUs that include egtb_gen.h don't recompile them;
+// explicitly instantiated below for the closed {DTC, DTM} entry set.
+// =============================================================================
+
+template <typename EntryT>
+void EGTB_Generator::refresh_active_metadata(const Sliced_EGTB_File_For_Gen<EntryT>& tbl)
+{
+	const size_t nps = m_epsi.num_pawn_slices();
+	const size_t nks = m_epsi.num_king_slices();
+	const size_t spg = tbl.slices_per_group();
+	const size_t ngroups = tbl.num_groups();
+
+	m_pid_in_pair.assign(nps, 0);
+	for (int32_t pid : m_active_pawn_slices)
+		m_pid_in_pair[static_cast<size_t>(pid)] = 1;
+
+	std::vector<uint8_t> in_pair(ngroups, 0);
+	for (int32_t pid : m_active_pawn_slices)
+	{
+		const size_t base = static_cast<size_t>(pid) * nks;
+		for (size_t k = 0; k < nks; ++k)
+			in_pair[(base + k) / spg] = 1;
+	}
+
+	m_pair_group_ids.clear();
+	m_pair_group_ids.reserve(ngroups);
+	for (size_t g = 0; g < ngroups; ++g)
+		if (in_pair[g]) m_pair_group_ids.push_back(g);
+}
+
+template <typename EntryT>
+std::vector<std::vector<int32_t>>
+EGTB_Generator::compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT>& tbl,
+                                      const std::vector<int32_t>& batch) const
+{
+	if (batch.empty()) return {};
+	if (m_paging_budget_bytes == 0) return { batch };
+
+	const auto& psm = m_epsi.pawn_slice_manager();
+	const size_t nks = m_epsi.num_king_slices();
+	const size_t spg = tbl.slices_per_group();
+	const size_t bytes_per_group =
+		spg * m_epsi.within_slice_size() * sizeof(EntryT);
+	const size_t budget_groups =
+		std::max<size_t>(1, m_paging_budget_bytes / bytes_per_group);
+
+	auto pair_groups = [&](int32_t pair_sid) -> std::set<size_t> {
+		std::set<size_t> g;
+		for (int32_t pid : psm.pair_members(pair_sid))
+		{
+			const size_t base = static_cast<size_t>(pid) * nks;
+			for (size_t k = 0; k < nks; ++k)
+				g.insert((base + k) / spg);
+		}
+		return g;
+	};
+
+	std::vector<std::vector<int32_t>> fusions;
+	fusions.emplace_back();
+	std::set<size_t> covered;
+
+	for (int32_t pair_sid : batch)
+	{
+		const auto pg = pair_groups(pair_sid);
+		size_t added = 0;
+		for (size_t g : pg) if (!covered.count(g)) ++added;
+
+		if (!fusions.back().empty() && covered.size() + added > budget_groups)
+		{
+			fusions.emplace_back();
+			covered.clear();
+		}
+		for (size_t g : pg) covered.insert(g);
+		fusions.back().push_back(pair_sid);
+	}
+	if (fusions.back().empty()) fusions.pop_back();
+	return fusions;
+}
+
+template <typename EntryT>
+void EGTB_Generator::apply_working_set(
+	In_Out_Param<Thread_Pool> thread_pool,
+	Sliced_EGTB_File_For_Gen<EntryT>* w_tbl,
+	Sliced_EGTB_File_For_Gen<EntryT>* b_tbl,
+	const std::vector<uint8_t>& needed_w,
+	const std::vector<uint8_t>& needed_b)
+{
+	struct Group_Task {
+		Sliced_EGTB_File_For_Gen<EntryT>* tbl;
+		size_t group_id;
+		bool load;
+	};
+
+	Sliced_EGTB_File_For_Gen<EntryT>* tbls[COLOR_NB] = { w_tbl, b_tbl };
+	const std::vector<uint8_t>* needed[COLOR_NB] = { &needed_w, &needed_b };
+
+	const size_t bytes_per_group =
+		w_tbl->within_slice_size() * w_tbl->slices_per_group() * sizeof(EntryT);
+
+	++m_paging_tick;
+
+	std::vector<Group_Task> tasks;
+	size_t live_groups = 0;
+	for (Color c : { WHITE, BLACK })
+	{
+		auto& tbl = *tbls[c];
+		const auto& need = *needed[c];
+		const size_t ng = tbl.num_groups();
+		ASSERT(need.size() == ng);
+		for (size_t g = 0; g < ng; ++g)
+		{
+			const bool res = tbl.is_group_resident(g);
+			if (need[g])
+				m_last_used[c][g] = m_paging_tick;
+			if (need[g] && !res)
+				tasks.push_back({ &tbl, g, true });
+			if (res || need[g])
+				++live_groups;
+		}
+	}
+
+	if (m_paging_budget_bytes > 0)
+	{
+		size_t future_bytes = live_groups * bytes_per_group;
+		if (future_bytes > m_paging_budget_bytes)
+		{
+			struct Candidate { uint64_t last_used; Color c; size_t g; };
+			std::vector<Candidate> victims;
+			for (Color c : { WHITE, BLACK })
+			{
+				auto& tbl = *tbls[c];
+				const auto& need = *needed[c];
+				const size_t ng = tbl.num_groups();
+				for (size_t g = 0; g < ng; ++g)
+					if (!need[g] && tbl.is_group_resident(g))
+						victims.push_back({ m_last_used[c][g], c, g });
+			}
+			std::sort(victims.begin(), victims.end(),
+				[](const Candidate& a, const Candidate& b) {
+					return a.last_used < b.last_used;
+				});
+			for (const Candidate& v : victims)
+			{
+				if (future_bytes <= m_paging_budget_bytes) break;
+				tasks.push_back({ tbls[v.c], v.g, false });
+				future_bytes -= bytes_per_group;
+			}
+		}
+	}
+
+	if (tasks.empty()) return;
+
+	std::atomic<size_t> next(0);
+	thread_pool->run_sync_task_on_all_threads([&](size_t) {
+		for (;;)
+		{
+			const size_t i = next.fetch_add(1);
+			if (i >= tasks.size()) return;
+			const Group_Task& t = tasks[i];
+			if (t.load) t.tbl->load_group(t.group_id);
+			else        t.tbl->evict_group(t.group_id);
+		}
+	});
+}
+
+template <typename EntryT>
+Block_Source make_entry_block_source(
+	Sliced_EGTB_File_For_Gen<EntryT>& src,
+	Save_Group_Cache<EntryT>& cache,
+	Color color,
+	size_t block_size,
+	size_t entry_bytes)
+{
+	constexpr size_t kEntry = sizeof(EntryT);
+	ASSERT(block_size % entry_bytes == 0);
+	const size_t source_block_bytes = block_size * kEntry / entry_bytes;
+	const size_t within = src.within_slice_size();
+	const size_t spg = src.slices_per_group();
+	const size_t total_entries = src.num_slices() * within;
+	const size_t source_total_bytes = total_entries * kEntry;
+	const size_t output_total_bytes = total_entries * entry_bytes;
+	return Block_Source{
+		output_total_bytes,
+		[&src, &cache, color, within, spg, source_block_bytes, source_total_bytes](size_t block_id, Span<uint8_t> scratch) -> Const_Span<uint8_t> {
+			const size_t block_off = block_id * source_block_bytes;
+			const size_t this_block = std::min(source_block_bytes, source_total_bytes - block_off);
+			ASSERT(scratch.size() >= this_block);
+			ASSERT(block_off % kEntry == 0);
+			ASSERT(this_block % kEntry == 0);
+
+			const size_t entry_off = block_off / kEntry;
+			const size_t entry_cnt = this_block / kEntry;
+
+			const size_t first_g = (entry_off / within) / spg;
+			const size_t last_g  = (entry_cnt == 0 ? first_g
+			                                       : ((entry_off + entry_cnt - 1) / within) / spg);
+			Pinned_Group_Range<EntryT> pin(cache, color, first_g, last_g);
+
+			size_t done = 0;
+			while (done < entry_cnt)
+			{
+				const size_t cur = entry_off + done;
+				const size_t s = cur / within;
+				const size_t in_slice = cur - s * within;
+				const size_t take = std::min(entry_cnt - done, within - in_slice);
+				const auto* const raw = src.slice_data(s) + in_slice;
+				std::memcpy(scratch.data() + done * kEntry, raw, take * kEntry);
+				done += take;
+			}
+
+			return Const_Span<uint8_t>(scratch.data(), this_block);
+		}
+	};
+}
+
+template void EGTB_Generator::refresh_active_metadata<DTC_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTC_Final_Entry>&);
+template void EGTB_Generator::refresh_active_metadata<DTM_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&);
+
+template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTC_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTC_Final_Entry>&, const std::vector<int32_t>&) const;
+template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTM_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&, const std::vector<int32_t>&) const;
+
+template void EGTB_Generator::apply_working_set<DTC_Final_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTC_Final_Entry>*, Sliced_EGTB_File_For_Gen<DTC_Final_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
+template void EGTB_Generator::apply_working_set<DTM_Final_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTM_Final_Entry>*, Sliced_EGTB_File_For_Gen<DTM_Final_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
+
+template Block_Source make_entry_block_source<DTC_Final_Entry>(Sliced_EGTB_File_For_Gen<DTC_Final_Entry>&, Save_Group_Cache<DTC_Final_Entry>&, Color, size_t, size_t);
+template Block_Source make_entry_block_source<DTM_Final_Entry>(Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&, Save_Group_Cache<DTM_Final_Entry>&, Color, size_t, size_t);
