@@ -361,6 +361,8 @@ NODISCARD bool parse_dtm50(const Const_Span<uint8_t>& bytes,
 		}
 	}
 
+	r.align(8);
+
 	for (Color c : *out_table_colors)
 	{
 		if (!info[c].present) continue;
