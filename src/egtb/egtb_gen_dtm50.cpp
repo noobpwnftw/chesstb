@@ -857,49 +857,33 @@ struct RS_Block_Encoder
 			+ multi_dir.size() * 4                  // multi_dir (cumulative offsets)
 			+ multi_stream.size();                  // multi_stream
 
-		out.assign(total, 0);
-		size_t off = 0;
-		std::memcpy(out.data() + off, &np32,        4); off += 4;
-		std::memcpy(out.data() + off, &num_single,  4); off += 4;
-		std::memcpy(out.data() + off, &num_double,  4); off += 4;
-		std::memcpy(out.data() + off, &num_multi,   4); off += 4;
-		std::memcpy(out.data() + off, &ss_bytes32,  4); off += 4;
-		std::memcpy(out.data() + off, &ds_bytes32,  4); off += 4;
-		std::memcpy(out.data() + off, state_bits.data(), sb_bytes); off += sb_bytes;
+		out.resize(total);
+		Serial_Memory_Writer w{ Span<uint8_t>(out) };
+		w.write<uint32_t>(np32);
+		w.write<uint32_t>(num_single);
+		w.write<uint32_t>(num_double);
+		w.write<uint32_t>(num_multi);
+		w.write<uint32_t>(ss_bytes32);
+		w.write<uint32_t>(ds_bytes32);
+		w.write(Const_Span<uint8_t>(state_bits.data(), sb_bytes));
 		if (!const_stream.empty())
-		{
-			std::memcpy(out.data() + off, const_stream.data(), const_stream.size());
-			off += const_stream.size();
-		}
+			w.write(Const_Span<uint8_t>(const_stream.data(), const_stream.size()));
 		if (sh_bytes != 0)
-		{
-			std::memcpy(out.data() + off, single_hints.data(), sh_bytes);
-			off += sh_bytes;
-		}
+			w.write(Const_Span<uint8_t>(single_hints.data(), sh_bytes));
 		if (!single_stream.empty())
-		{
-			std::memcpy(out.data() + off, single_stream.data(), single_stream.size());
-			off += single_stream.size();
-		}
+			w.write(Const_Span<uint8_t>(single_stream.data(), single_stream.size()));
 		if (dh_bytes != 0)
-		{
-			std::memcpy(out.data() + off, double_hints.data(), dh_bytes);
-			off += dh_bytes;
-		}
+			w.write(Const_Span<uint8_t>(double_hints.data(), dh_bytes));
 		if (!double_stream.empty())
-		{
-			std::memcpy(out.data() + off, double_stream.data(), double_stream.size());
-			off += double_stream.size();
-		}
-		off = multi_dir_off;
-		std::memcpy(out.data() + off, multi_dir.data(), multi_dir.size() * 4);
-		off += multi_dir.size() * 4;
+			w.write(Const_Span<uint8_t>(double_stream.data(), double_stream.size()));
+		ASSERT(w.num_bytes_written() <= multi_dir_off);
+		w.zero_align(4);
+		w.write(Const_Span<uint8_t>(
+			reinterpret_cast<const uint8_t*>(multi_dir.data()),
+			multi_dir.size() * 4));
 		if (!multi_stream.empty())
-		{
-			std::memcpy(out.data() + off, multi_stream.data(), multi_stream.size());
-			off += multi_stream.size();
-		}
-		ASSERT(off == total);
+			w.write(Const_Span<uint8_t>(multi_stream.data(), multi_stream.size()));
+		ASSERT(w.num_bytes_written() == total);
 		return Const_Span<uint8_t>(out.data(), out.size());
 	}
 
@@ -1055,8 +1039,8 @@ void save_compress_dtm50(
 	out.block_positions = block_positions;
 	out.block_cnt = static_cast<uint32_t>(bcnt);
 	out.tail_positions = (tail == bp) ? 0u : static_cast<uint32_t>(tail);
-	out.compressed_blocks.assign(bcnt, {});
-	out.usizes.assign(bcnt, 0);
+	out.compressed_blocks.resize(bcnt);
+	out.usizes.resize(bcnt);
 
 	auto group_id_of_pos = [positions_per_group](size_t p) {
 		return positions_per_group == 0 ? size_t{ 0 } : p / positions_per_group;
