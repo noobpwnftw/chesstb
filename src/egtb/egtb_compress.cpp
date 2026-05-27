@@ -1099,13 +1099,13 @@ void load_dtm50_sub_flat(
 		// Strict upper bound: sums the worst case for each state region (they're
 		// mutually exclusive per position, so this overestimates).
 		const size_t max_payload =
-			24                                                  // header
-			+ (ppb * 2 + 7) / 8                                 // state_bits
-			+ ppb * eb                                          // all CONST
-			+ (ppb + 7) / 8 + ppb * (1 + 2 * eb)                // all SINGLE
-			+ (ppb + 7) / 8 + ppb * (2 + 3 * eb)                // all DOUBLE
+			24                                                       // header
+			+ (ppb * 2 + 7) / 8                                      // state_bits
+			+ ppb * eb                                               // all CONST
+			+ (ppb + 7) / 8 + ppb * (1 + 2 * eb)                     // all SINGLE
+			+ (ppb + 7) / 8 + ppb * (2 + 3 * eb)                     // all DOUBLE
 			+ (ppb + 1) * 4 + ppb * (1 + 16 + DTM50_HMC_COUNT * eb)  // all MULTI
-			+ 3;                                                // tail alignment
+			+ 3;                                                     // tail alignment
 
 		thread_pool->run_sync_task_on_all_threads([&](size_t thread_id) {
 			LZMA_Decompress_Helper dc_helper(max_payload);

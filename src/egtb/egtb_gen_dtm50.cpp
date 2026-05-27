@@ -845,7 +845,7 @@ struct RS_Block_Encoder
 		const uint32_t ds_bytes32 = static_cast<uint32_t>(double_stream.size());
 
 		size_t multi_dir_off =
-			4 + 4 + 4 + 4 + 4 + 4                  // np, ns, nd, nm, ss_bytes, ds_bytes
+			4 + 4 + 4 + 4 + 4 + 4                   // np, ns, nd, nm, ss_bytes, ds_bytes
 			+ sb_bytes                              // state_bits (2 bpp)
 			+ const_stream.size()                   // const_stream
 			+ sh_bytes + single_stream.size()       // SINGLE: hint bitmap + variable payload

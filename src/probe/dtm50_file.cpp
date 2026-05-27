@@ -173,13 +173,13 @@ Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 		const size_t ppb = pc.block_positions;
 		const size_t eb = pc.entry_bytes;
 		const size_t max_payload =
-			24                                                  // header
-			+ (ppb * 2 + 7) / 8                                 // state_bits
-			+ ppb * eb                                          // all CONST
-			+ (ppb + 7) / 8 + ppb * (1 + 2 * eb)                // all SINGLE
-			+ (ppb + 7) / 8 + ppb * (2 + 3 * eb)                // all DOUBLE
+			24                                                       // header
+			+ (ppb * 2 + 7) / 8                                      // state_bits
+			+ ppb * eb                                               // all CONST
+			+ (ppb + 7) / 8 + ppb * (1 + 2 * eb)                     // all SINGLE
+			+ (ppb + 7) / 8 + ppb * (2 + 3 * eb)                     // all DOUBLE
 			+ (ppb + 1) * 4 + ppb * (1 + 16 + DTM50_HMC_COUNT * eb)  // all MULTI
-			+ 3;                                                // tail alignment
+			+ 3;                                                     // tail alignment
 		pc.decomp = std::make_unique<LZMA_Decompress_Helper>(max_payload);
 	}
 	const Const_Span<uint8_t> raw = pc.decomp->decompress(
