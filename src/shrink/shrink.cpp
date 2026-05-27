@@ -1,14 +1,17 @@
 // Shrink EGTB files for shipping.
 //
 // Usage:
-//   ./shrink path/to/file.lzdtc path/to/file.lzdtm path/to/file.lzdtm50 path/to/file.lzw ...
-//   ./shrink path/to/dir/*       # shell glob
+//   ./shrink [-n|--dry-run] path/to/file.lzdtc path/to/file.lzdtm ...
+//   ./shrink path/to/dir/*               # shell glob
+//   ./shrink --dry-run path/to/dir/*     # report sizes without writing
 //
 // Each file is detected by magic. The larger side-to-move table is dropped
 // when it can be rederived by the probe library from the kept side and sub-TBs.
 // Already-shrunk and non-derivable files are skipped.
 //
-// Writes "<path>.shrink_tmp" and renames it over the original.
+// Writes "<path>.shrink_tmp" and renames it over the original. With -n/--dry-run
+// no files are modified; each file is parsed and the size it would shrink to is
+// reported instead. A grand total over all processed files is printed at the end.
 
 #include "egtb/egtb_entry.h"
 
@@ -35,6 +38,19 @@ namespace {
 constexpr uint8_t SINGULAR_FLAG = 0x80;
 constexpr uint8_t DROPPED_FLAG  = 0x40;
 constexpr uint64_t CHECKSUM_INIT = 0xf0f0f0f0f0f0;
+
+// When set, files are parsed and sizes computed but nothing is written.
+bool g_dry_run = false;
+
+// Running totals across all processed files (skipped files count unchanged).
+uint64_t g_total_orig = 0;
+uint64_t g_total_new  = 0;
+
+void account(size_t orig, size_t new_size)
+{
+	g_total_orig += orig;
+	g_total_new  += new_size;
+}
 
 INLINE bool flag_is_normal(uint8_t flag)
 {
@@ -186,6 +202,7 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 	if (drop == COLOR_NB)
 	{
 		std::printf("%s: skip (nothing droppable)\n", path.c_str());
+		account(bytes.size(), bytes.size());
 		return true;
 	}
 
@@ -213,6 +230,17 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 		if (!shrunk[c].present || !flag_is_normal(shrunk[c].flag)) continue;
 		out_size += shrunk[c].data_size;
 		out_size = ceil_to_multiple(out_size, (size_t)64);
+	}
+
+	if (g_dry_run)
+	{
+		const size_t orig = bytes.size();
+		std::printf("%s: %s would shrink %zu -> %zu (-%.1f%%), drop %s\n",
+			path.c_str(), label, orig, out_size + 8,
+			100.0 * (1.0 - double(out_size + 8) / double(orig)),
+			drop == WHITE ? "WHITE" : "BLACK");
+		account(orig, out_size + 8);
+		return true;
 	}
 
 	const std::filesystem::path tmp = path.string() + ".shrink_tmp";
@@ -298,6 +326,7 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 		path.c_str(), label, orig, out_size + 8,
 		100.0 * (1.0 - double(out_size + 8) / double(orig)),
 		drop == WHITE ? "WHITE" : "BLACK");
+	account(orig, out_size + 8);
 	return true;
 }
 
@@ -420,6 +449,7 @@ bool shrink_dtm50(const std::filesystem::path& path)
 	if (drop == COLOR_NB)
 	{
 		std::printf("%s: skip (nothing droppable)\n", path.c_str());
+		account(bytes.size(), bytes.size());
 		return true;
 	}
 
@@ -446,6 +476,17 @@ bool shrink_dtm50(const std::filesystem::path& path)
 		if (!shrunk[c].present || !flag_is_normal(shrunk[c].flag)) continue;
 		out_size += shrunk[c].data_size;
 		out_size = ceil_to_multiple(out_size, (size_t)64);
+	}
+
+	if (g_dry_run)
+	{
+		const size_t orig = bytes.size();
+		std::printf("%s: DTM50 would shrink %zu -> %zu (-%.1f%%), drop %s\n",
+			path.c_str(), orig, out_size + 8,
+			100.0 * (1.0 - double(out_size + 8) / double(orig)),
+			drop == WHITE ? "WHITE" : "BLACK");
+		account(orig, out_size + 8);
+		return true;
 	}
 
 	const std::filesystem::path tmp = path.string() + ".shrink_tmp";
@@ -531,6 +572,7 @@ bool shrink_dtm50(const std::filesystem::path& path)
 		path.c_str(), orig, out_size + 8,
 		100.0 * (1.0 - double(out_size + 8) / double(orig)),
 		drop == WHITE ? "WHITE" : "BLACK");
+	account(orig, out_size + 8);
 	return true;
 }
 
@@ -660,6 +702,7 @@ bool shrink_wdl(const std::filesystem::path& path)
 	if (drop == COLOR_NB)
 	{
 		std::printf("%s: skip (nothing droppable)\n", path.c_str());
+		account(bytes.size(), bytes.size());
 		return true;
 	}
 
@@ -703,6 +746,17 @@ bool shrink_wdl(const std::filesystem::path& path)
 		if (!ci.present || !flag_is_normal(ci.flag)) continue;
 		out_size += ci.data_size;
 		out_size = ceil_to_multiple(out_size, (size_t)64);
+	}
+
+	if (g_dry_run)
+	{
+		const size_t orig = bytes.size();
+		std::printf("%s: WDL would shrink %zu -> %zu (-%.1f%%), drop %s\n",
+			path.c_str(), orig, out_size + 8,
+			100.0 * (1.0 - double(out_size + 8) / double(orig)),
+			drop == WHITE ? "WHITE" : "BLACK");
+		account(orig, out_size + 8);
+		return true;
 	}
 
 	const std::filesystem::path tmp = path.string() + ".shrink_tmp";
@@ -797,6 +851,7 @@ bool shrink_wdl(const std::filesystem::path& path)
 		path.c_str(), orig, out_size + 8,
 		100.0 * (1.0 - double(out_size + 8) / double(orig)),
 		drop == WHITE ? "WHITE" : "BLACK");
+	account(orig, out_size + 8);
 	return true;
 }
 
@@ -832,14 +887,34 @@ bool shrink_one(const std::filesystem::path& path)
 int main(int argc, char** argv)
 {
 	try {
-		if (argc < 2)
+		int first_file = 1;
+		for (; first_file < argc; ++first_file)
 		{
-			std::fprintf(stderr, "usage: %s FILE [FILE...]\n", argv[0]);
+			const char* a = argv[first_file];
+			if (std::strcmp(a, "-n") == 0 || std::strcmp(a, "--dry-run") == 0)
+				g_dry_run = true;
+			else if (std::strcmp(a, "--") == 0)
+			{
+				++first_file;
+				break;
+			}
+			else
+				break;
+		}
+
+		if (first_file >= argc)
+		{
+			std::fprintf(stderr, "usage: %s [-n|--dry-run] FILE [FILE...]\n", argv[0]);
 			return 2;
 		}
 		int failures = 0;
-		for (int i = 1; i < argc; ++i)
+		for (int i = first_file; i < argc; ++i)
 			if (!shrink_one(argv[i])) ++failures;
+
+		std::printf("total: %s %llu -> %llu (-%.1f%%)\n",
+			g_dry_run ? "would shrink" : "shrunk",
+			(unsigned long long)g_total_orig, (unsigned long long)g_total_new,
+			g_total_orig ? 100.0 * (1.0 - double(g_total_new) / double(g_total_orig)) : 0.0);
 		return failures == 0 ? 0 : 1;
 	} catch (const std::exception& e) {
 		std::fprintf(stderr, "error: %s\n", e.what());
