@@ -844,15 +844,16 @@ struct RS_Block_Encoder
 		const uint32_t ss_bytes32 = static_cast<uint32_t>(single_stream.size());
 		const uint32_t ds_bytes32 = static_cast<uint32_t>(double_stream.size());
 
-		const size_t multi_dir_off =
+		size_t multi_dir_off =
 			4 + 4 + 4 + 4 + 4 + 4                  // np, ns, nd, nm, ss_bytes, ds_bytes
 			+ sb_bytes                              // state_bits (2 bpp)
 			+ const_stream.size()                   // const_stream
 			+ sh_bytes + single_stream.size()       // SINGLE: hint bitmap + variable payload
 			+ dh_bytes + double_stream.size();      // DOUBLE: hint bitmap + variable payload
+		multi_dir_off += (4 - (multi_dir_off & 3)) & 3;
 
 		const size_t total =
-			multi_dir_off + ((4 - (multi_dir_off & 3)) & 3)
+			multi_dir_off
 			+ multi_dir.size() * 4                  // multi_dir (cumulative offsets)
 			+ multi_stream.size();                  // multi_stream
 
@@ -890,7 +891,7 @@ struct RS_Block_Encoder
 			std::memcpy(out.data() + off, double_stream.data(), double_stream.size());
 			off += double_stream.size();
 		}
-		off += (4 - (off & 3)) & 3;
+		off = multi_dir_off;
 		std::memcpy(out.data() + off, multi_dir.data(), multi_dir.size() * 4);
 		off += multi_dir.size() * 4;
 		if (!multi_stream.empty())
