@@ -1156,6 +1156,7 @@ void load_dtm50_sub_flat(
 				const uint8_t* single_stream = p;                           p += ss_bytes32;
 				const uint8_t* double_hints = p;                            p += dh_bytes;
 				const uint8_t* double_stream = p;                           p += ds_bytes32;
+				p += (4 - ((p - raw.data()) & 3)) & 3;
 				const uint32_t* multi_dir = reinterpret_cast<const uint32_t*>(p);
 				p += (num_multi + 1) * 4;
 				const uint8_t* multi_data = p;

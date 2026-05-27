@@ -288,6 +288,7 @@ uint16_t DTM50_Traits::read(Per_Color& pc, bool is_singular, Board_Index pos,
 	const uint8_t* single_stream = p;               p += ss_bytes32;
 	const uint8_t* double_hints = p;                p += dh_bytes;
 	const uint8_t* double_stream = p;               p += ds_bytes32;
+	p += (4 - ((p - payload) & 3)) & 3;
 	const uint32_t* multi_dir = reinterpret_cast<const uint32_t*>(p);
 	p += (num_multi + 1) * 4;
 	const uint8_t* multi_data = p;
