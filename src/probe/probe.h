@@ -5,7 +5,7 @@
 // probe() and probe_root_*() are thread-safe after path setup. add_*_path()
 // and init() must not run concurrently with probes.
 
-#include "egtb/egtb_entry.h"
+#include "probe/entry.h"
 #include "chess/chess.h"
 #include "chess/move.h"
 #include "chess/piece_config.h"
@@ -29,12 +29,13 @@ struct Probe_Result
 	Status status = Status::TB_NOT_FOUND;
 	WDL_Entry wdl = WDL_Entry::ILLEGAL;
 	bool has_dtc = false;
-	DTC_Final_Entry dtc;
+	uint16_t dtc = 0;
 	bool has_dtm = false;
-	DTM_Final_Entry dtm;
-	// DTM50 at the caller's rule50; cursed/blessed → DRAW.
+	uint16_t dtm = 0;
+	// DTM50 at the caller's rule50; cursed/blessed -> DRAW.
 	bool has_dtm50 = false;
-	DTM_Final_Entry dtm50;
+	WDL_Entry dtm50_wdl = WDL_Entry::ILLEGAL;
+	uint16_t dtm50 = 0;
 };
 
 // Ranked legal move. Fields mirror Fathom's TbRootMove.

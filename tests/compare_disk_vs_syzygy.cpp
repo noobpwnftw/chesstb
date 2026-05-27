@@ -4,8 +4,8 @@
 //   ./run_compare --list FILE
 //   ./run_compare --enumerate N
 
-#include "egtb/egtb_gen_dtc.h"     // Position_For_Gen, board_index_of_position
 #include "probe/probe.h"
+#include "probe/position_index.h"
 #include "chess/attack.h"
 #include "chess/piece_config.h"
 #include "util/thread_pool.h"
@@ -104,7 +104,7 @@ static bool compare_material(const char* name)
 		return true;
 	}
 
-	Piece_Config_For_Gen epsi(ps);
+	Position_Index_Config epsi(ps);
 	// Symmetric materials store one color; BLACK would derive the same answers.
 	const auto [mat_key, mir_key] = ps.material_keys();
 	const bool symmetric = (mat_key == mir_key);
@@ -115,59 +115,64 @@ static bool compare_material(const char* name)
 	tables.add_dtc_path("./dtc/");
 
 	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
-	Shared_Board_Index_Iterator iter(
-		BOARD_INDEX_ZERO, static_cast<Board_Index>(N), CHUNK_SIZE);
+	std::atomic<size_t> next_idx{0};
 
 	auto shards = global_pool().run_sync_task_on_all_threads(
 		[&](size_t) -> Shard {
 			Shard s;
-			for (const Board_Index idx : iter.indices())
+			while (true)
 			{
-				const size_t i = static_cast<size_t>(idx);
-				for (Color stm : { WHITE, BLACK })
+				const size_t lo = next_idx.fetch_add(CHUNK_SIZE, std::memory_order_relaxed);
+				if (lo >= N) break;
+				const size_t hi = std::min(lo + CHUNK_SIZE, N);
+				for (size_t i = lo; i < hi; ++i)
 				{
-					if (symmetric && stm == BLACK) break;
-					Position_For_Gen pfg(epsi, idx, stm);
-					if (!pfg.is_legal(
-					        Position_For_Gen::Legality_Lower_Bound::CHESS_LEGAL))
-						continue;
-					const Position& pos = pfg.board();
-
-					// Keep one Board_Index per canonical position.
-					if (board_index_of_position(epsi, pos) != idx) continue;
-
-					const Probe_Result pr = tables.probe(ps, pos);
-					if (pr.status != Probe_Result::Status::OK) continue;
-					const WDL_Entry got = pr.wdl;
-					if (got == WDL_Entry::ILLEGAL) continue;
-
-					const Fathom_BBs bb = fathom_bbs(pos);
-					const unsigned r = tb_probe_wdl(bb.white, bb.black, bb.kings, bb.queens,
-					                                bb.rooks, bb.bishops, bb.knights, bb.pawns,
-					                                0, 0, 0, stm == WHITE);
-					if (r == TB_RESULT_FAILED) continue;
-
-					++s.total_legal;
-					if (pr.has_dtc && (got == WDL_Entry::WIN || got == WDL_Entry::CURSED_WIN))
+					for (Color stm : { WHITE, BLACK })
 					{
-						const uint16_t v = static_cast<uint16_t>(pr.dtc.value());
-						if (v > s.longest_win_ply)
+						if (symmetric && stm == BLACK) break;
+						Position pos;
+						const auto idx = static_cast<Board_Index>(i);
+						if (!position_from_index(epsi, idx, stm, out_param(pos)))
+							continue;
+						if (!pos.is_legal())
+							continue;
+
+						// Keep one index per canonical position.
+						if (board_index_of_position(epsi, pos) != idx) continue;
+
+						const Probe_Result pr = tables.probe(ps, pos);
+						if (pr.status != Probe_Result::Status::OK) continue;
+						const WDL_Entry got = pr.wdl;
+						if (got == WDL_Entry::ILLEGAL) continue;
+
+						const Fathom_BBs bb = fathom_bbs(pos);
+						const unsigned r = tb_probe_wdl(bb.white, bb.black, bb.kings, bb.queens,
+														bb.rooks, bb.bishops, bb.knights, bb.pawns,
+														0, 0, 0, stm == WHITE);
+						if (r == TB_RESULT_FAILED) continue;
+
+						++s.total_legal;
+						if (pr.has_dtc && (got == WDL_Entry::WIN || got == WDL_Entry::CURSED_WIN))
 						{
-							s.longest_win_ply = v;
-							s.longest_win_idx = i;
-							s.longest_win_stm = stm;
+							const uint16_t v = static_cast<uint16_t>(pr.dtc);
+							if (v > s.longest_win_ply)
+							{
+								s.longest_win_ply = v;
+								s.longest_win_idx = i;
+								s.longest_win_stm = stm;
+							}
 						}
-					}
 
-					const WDL_Entry want = fathom_to_wdl(r);
-					if (want == got) { ++s.matches; continue; }
+						const WDL_Entry want = fathom_to_wdl(r);
+						if (want == got) { ++s.matches; continue; }
 
-					++s.mismatches;
-					if (s.examples.size() < 5) {
-						char fen[128]; pos.to_fen(Span(fen, 128));
-						s.examples.push_back(std::string(name) + " idx=" + std::to_string(i)
-							+ " stm=" + (stm == WHITE ? "W" : "B") + " fen=" + fen
-							+ " ours=" + wdl_name(got) + " syzygy=" + wdl_name(want));
+						++s.mismatches;
+						if (s.examples.size() < 5) {
+							char fen[128]; pos.to_fen(Span(fen, 128));
+							s.examples.push_back(std::string(name) + " idx=" + std::to_string(i)
+								+ " stm=" + (stm == WHITE ? "W" : "B") + " fen=" + fen
+								+ " ours=" + wdl_name(got) + " syzygy=" + wdl_name(want));
+						}
 					}
 				}
 			}
@@ -195,8 +200,10 @@ static bool compare_material(const char* name)
 	bool ply_ok = true;
 	if (longest_win_ply > 0)
 	{
-		Position_For_Gen pfg(epsi, Board_Index(longest_win_idx), longest_win_stm);
-		const Position& pos = pfg.board();
+		Position pos;
+		(void)position_from_index(
+			epsi, static_cast<Board_Index>(longest_win_idx), longest_win_stm,
+			out_param(pos));
 		const Fathom_BBs bb = fathom_bbs(pos);
 		const unsigned rr = tb_probe_root(bb.white, bb.black, bb.kings, bb.queens,
 		                                  bb.rooks, bb.bishops, bb.knights, bb.pawns,

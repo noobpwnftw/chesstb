@@ -493,6 +493,8 @@ void save_egtb_table(
 		}
 	}
 
+	writer.zero_align(8);
+
 	for (const Color i : table_colors)
 	{
 		const Compressed_EGTB& t = save_info[i];
@@ -756,6 +758,8 @@ void load_dtm_table(
 		}
 	}
 
+	reader.align(8);
+
 	for (const Color i : table_colors)
 	{
 		if (dtm->m_is_singular[i]) continue;
@@ -863,6 +867,8 @@ void load_dtm_sub_flat(
 				rank_to_value[i][r] = reader.read<uint16_t>();
 		}
 	}
+
+	reader.align(8);
 
 	for (const Color i : table_colors)
 	{
@@ -1047,6 +1053,8 @@ void load_dtm50_sub_flat(
 		}
 	}
 
+	reader.align(8);
+
 	for (const Color i : table_colors)
 	{
 		if (is_singular[i]) continue;
@@ -1106,9 +1114,9 @@ void load_dtm50_sub_flat(
 				const size_t bidx = next_block.fetch_add(1, std::memory_order_relaxed);
 				if (bidx >= blocks) return;
 
-				uint64_t dso, usz;
-				std::memcpy(&dso, offset_tb[i] + bidx * 16,     8);
-				std::memcpy(&usz, offset_tb[i] + bidx * 16 + 8, 8);
+				const uint64_t* offset = reinterpret_cast<const uint64_t*>(offset_tb[i] + bidx * 16);
+				const uint64_t dso = offset[0];
+				const uint64_t usz = offset[1];
 				const size_t dsz  = dso & 0xFFFFFu;
 				const size_t doff = dso >> 20;
 

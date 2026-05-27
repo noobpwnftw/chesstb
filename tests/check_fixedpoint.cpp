@@ -6,18 +6,19 @@
 //   ./check_fixedpoint --dtc --list five.txt
 //   ./check_fixedpoint --enumerate 5 --wdl ./wdl --dtc ./dtc --dtm ./dtm
 
-#include "egtb/egtb_gen_dtc.h"   // Position_For_Gen, board_index_of_position
-#include "egtb/egtb_probe.h"     // tb_file_is_full_format, EGTB_Paths
-#include "egtb/piece_config_for_gen.h"
 #include "probe/probe.h"
+#include "probe/position_index.h"
 
 #include "chess/attack.h"
 #include "chess/piece_config.h"
 #include "chess/position.h"
+#include "util/filesystem.h"
+#include "util/memory.h"
 #include "util/thread_pool.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -29,6 +30,8 @@
 #include <vector>
 
 namespace {
+
+constexpr unsigned SKIP_DTM50 = ~0u;
 
 const char* wdl_name(WDL_Entry w)
 {
@@ -175,10 +178,10 @@ struct Child_DTM {
 Child_DTM probe_child_dtm(Probe_Tables& tables, const Child_Pos& c)
 {
 	if (c.is_kk) return {};
-	const Probe_Result pr = tables.probe(c.ps, c.pos);
+	const Probe_Result pr = tables.probe(c.ps, c.pos, SKIP_DTM50);
 	if (pr.status != Probe_Result::Status::OK || !pr.has_dtm)
 		return { WDL_Entry::ILLEGAL, 0, true };
-	return { fold_dtm_wdl(pr.wdl), static_cast<uint16_t>(pr.dtm.value()), false };
+	return { fold_dtm_wdl(pr.wdl), static_cast<uint16_t>(pr.dtm), false };
 }
 
 Child_DTM effective_child_dtm_after_move(Probe_Tables& tables, const Position& parent, Move m)
@@ -279,10 +282,10 @@ struct Child_DTC {
 Child_DTC probe_child_dtc(Probe_Tables& tables, const Child_Pos& c)
 {
 	if (c.is_kk) return {};
-	const Probe_Result pr = tables.probe(c.ps, c.pos);
+	const Probe_Result pr = tables.probe(c.ps, c.pos, SKIP_DTM50);
 	if (pr.status != Probe_Result::Status::OK || !pr.has_dtc)
 		return { WDL_Entry::ILLEGAL, 0, true };
-	return { pr.wdl, static_cast<uint16_t>(pr.dtc.value()), false };
+	return { pr.wdl, static_cast<uint16_t>(pr.dtc), false };
 }
 
 Child_DTC effective_child_dtc_after_move(Probe_Tables& tables, const Position& parent, Move m)
@@ -354,10 +357,10 @@ DTC_Derived derive_dtc_from_children(Probe_Tables& tables, const Position& pos)
 		                       || child.wdl == WDL_Entry::BLESSED_LOSS;
 		const uint16_t my_v = move_is_zeroing(pos, m)
 			? (cursed_child
-				? static_cast<uint16_t>(DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
+				? static_cast<uint16_t>(DTC_MAX_NON_CURSED_DTZ + 1)
 				: uint16_t{1})
 			: static_cast<uint16_t>(child.value + 1);
-		if (my_v > DTC_Final_Entry::MAX_NON_CURSED_DTZ)
+		if (my_v > DTC_MAX_NON_CURSED_DTZ)
 		{
 			if (my_w == WDL_Entry::WIN) my_w = WDL_Entry::CURSED_WIN;
 			if (my_w == WDL_Entry::LOSE) my_w = WDL_Entry::BLESSED_LOSS;
@@ -426,7 +429,52 @@ bool require_full_file(const std::filesystem::path& path, EGTB_Magic magic, cons
 		std::printf("  %s missing: %s\n", label, path.c_str());
 		return false;
 	}
-	if (!tb_file_is_full_format(path, magic))
+	constexpr uint8_t SINGULAR_FLAG = 0x80;
+	constexpr uint8_t DROPPED_FLAG  = 0x40;
+
+	Memory_Mapped_File m;
+	const bool full_format = [&]() {
+		if (!m.open_readonly(path.c_str())) return false;
+		const Const_Span<uint8_t> s = m.data_span();
+		if (s.size() < 12) return false;
+
+		Serial_Memory_Reader r(s);
+		if (r.read<uint32_t>() != narrowing_static_cast<uint32_t>(magic)) return false;
+
+		const uint32_t key_and_table_num = r.read<uint32_t>();
+		const Fixed_Vector<Color, 2> colors = egtb_table_colors(key_and_table_num & 3);
+		const bool egtb_table = magic == EGTB_Magic::DTC_MAGIC
+		                     || magic == EGTB_Magic::DTM_MAGIC
+		                     || magic == EGTB_Magic::DTM50_MAGIC;
+
+		for (size_t i = 0; i < colors.size(); ++i)
+		{
+			if (static_cast<size_t>(s.end() - r.caret()) < 1) return false;
+			const uint8_t flag = r.read<uint8_t>();
+			if (flag & DROPPED_FLAG) return false;
+			if (flag & SINGULAR_FLAG)
+			{
+				if (static_cast<size_t>(s.end() - r.caret()) < 1) return false;
+				r.advance(1);
+			}
+			else if (egtb_table)
+			{
+				if (static_cast<size_t>(s.end() - r.caret()) < 23) return false;
+				r.advance(21);
+				const uint16_t num_ranks = r.read<uint16_t>();
+				if (static_cast<size_t>(s.end() - r.caret()) < num_ranks * 2u) return false;
+				r.advance(num_ranks * 2);
+			}
+			else
+			{
+				if (static_cast<size_t>(s.end() - r.caret()) < 19) return false;
+				r.advance(19);
+			}
+		}
+		return true;
+	}();
+
+	if (!full_format)
 	{
 		std::printf("  %s is not full format: %s\n", label, path.c_str());
 		return false;
@@ -503,14 +551,13 @@ bool check_material(const Options& opt, const std::string& name)
 		? dtc_entry_bytes_by_color(dtc_path)
 		: std::array<size_t, COLOR_NB>{};
 
-	Piece_Config_For_Gen epsi(ps);
+	Position_Index_Config epsi(ps);
 	const auto [mat_key, mir_key] = ps.material_keys();
 	const bool symmetric = mat_key == mir_key;
 	const size_t N = epsi.num_positions();
 
 	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
-	Shared_Board_Index_Iterator iter(
-		BOARD_INDEX_ZERO, static_cast<Board_Index>(N), CHUNK_SIZE);
+	std::atomic<size_t> next_idx{0};
 
 	auto shards = global_pool().run_sync_task_on_all_threads([&](size_t) -> Shard {
 		Probe_Tables tables;
@@ -519,76 +566,83 @@ bool check_material(const Options& opt, const std::string& name)
 		tables.add_dtm_path(opt.dtm_dir);
 
 		Shard s;
-		for (const Board_Index idx : iter.indices())
+		while (true)
 		{
-			const size_t i = static_cast<size_t>(idx);
-			for (Color stm : { WHITE, BLACK })
+			const size_t lo = next_idx.fetch_add(CHUNK_SIZE, std::memory_order_relaxed);
+			if (lo >= N) break;
+			const size_t hi = std::min(lo + CHUNK_SIZE, N);
+			for (size_t i = lo; i < hi; ++i)
 			{
-				if (symmetric && stm == BLACK) break;
-				Position_For_Gen pfg(epsi, idx, stm);
-				if (!pfg.is_legal(Position_For_Gen::Legality_Lower_Bound::CHESS_LEGAL))
-					continue;
-				const Position& pos = pfg.board();
-				if (board_index_of_position(epsi, pos) != idx) continue;
-
-				const Probe_Result pr = tables.probe(ps, pos);
-				if (pr.status != Probe_Result::Status::OK) continue;
-				++s.scanned;
-
-				if (opt.check_dtm)
+				for (Color stm : { WHITE, BLACK })
 				{
-					const DTM_Derived d = derive_dtm_from_children(tables, pos);
-					if (d.missing_child || !pr.has_dtm)
+					if (symmetric && stm == BLACK) break;
+					Position pos;
+					const auto idx = static_cast<Board_Index>(i);
+					if (!position_from_index(epsi, idx, stm, out_param(pos)))
+						continue;
+					if (!pos.is_legal())
+						continue;
+					if (board_index_of_position(epsi, pos) != idx) continue;
+
+					const Probe_Result pr = tables.probe(ps, pos, SKIP_DTM50);
+					if (pr.status != Probe_Result::Status::OK) continue;
+					++s.scanned;
+
+					if (opt.check_dtm)
 					{
-						++s.missing;
-						push_sample(s, opt.sample_cap, "[DTM_MISSING] " + ps.name() + " fen=" + fen_of(pos));
-					}
-					else
-					{
-						++s.checked_dtm;
-						const WDL_Entry actual_w = fold_dtm_wdl(pr.wdl);
-						const uint16_t actual_v = static_cast<uint16_t>(pr.dtm.value());
-						const bool value_mismatch = d.wdl != WDL_Entry::DRAW && actual_v != d.value;
-						if (actual_w != d.wdl || value_mismatch)
+						const DTM_Derived d = derive_dtm_from_children(tables, pos);
+						if (d.missing_child || !pr.has_dtm)
 						{
-							++s.dtm_mismatch;
-							char line[512];
-							std::snprintf(line, sizeof(line),
-								"[DTM] idx=%zu stm=%s table=%s/%u derived=%s/%u fen=%s",
-								i, stm == WHITE ? "W" : "B",
-								wdl_name(actual_w), static_cast<unsigned>(actual_v),
-								wdl_name(d.wdl), static_cast<unsigned>(d.value),
-								fen_of(pos).c_str());
-							push_sample(s, opt.sample_cap, line);
+							++s.missing;
+							push_sample(s, opt.sample_cap, "[DTM_MISSING] " + ps.name() + " fen=" + fen_of(pos));
+						}
+						else
+						{
+							++s.checked_dtm;
+							const WDL_Entry actual_w = fold_dtm_wdl(pr.wdl);
+							const uint16_t actual_v = static_cast<uint16_t>(pr.dtm);
+							const bool value_mismatch = d.wdl != WDL_Entry::DRAW && actual_v != d.value;
+							if (actual_w != d.wdl || value_mismatch)
+							{
+								++s.dtm_mismatch;
+								char line[512];
+								std::snprintf(line, sizeof(line),
+									"[DTM] idx=%zu stm=%s table=%s/%u derived=%s/%u fen=%s",
+									i, stm == WHITE ? "W" : "B",
+									wdl_name(actual_w), static_cast<unsigned>(actual_v),
+									wdl_name(d.wdl), static_cast<unsigned>(d.value),
+									fen_of(pos).c_str());
+								push_sample(s, opt.sample_cap, line);
+							}
 						}
 					}
-				}
 
-				if (opt.check_dtc)
-				{
-					const DTC_Derived d = derive_dtc_from_children(tables, pos);
-					if (d.missing_child || !pr.has_dtc)
+					if (opt.check_dtc)
 					{
-						++s.missing;
-						push_sample(s, opt.sample_cap, "[DTC_MISSING] " + ps.name() + " fen=" + fen_of(pos));
-					}
-					else
-					{
-						++s.checked_dtc;
-						const uint16_t actual_v = static_cast<uint16_t>(pr.dtc.value());
-						const bool value_mismatch =
-							!dtc_values_match(d.wdl, actual_v, d.value, dtc_entry_bytes[stm]);
-						if (pr.wdl != d.wdl || value_mismatch)
+						const DTC_Derived d = derive_dtc_from_children(tables, pos);
+						if (d.missing_child || !pr.has_dtc)
 						{
-							++s.dtc_mismatch;
-							char line[512];
-							std::snprintf(line, sizeof(line),
-								"[DTC] idx=%zu stm=%s table=%s/%u derived=%s/%u fen=%s",
-								i, stm == WHITE ? "W" : "B",
-								wdl_name(pr.wdl), static_cast<unsigned>(actual_v),
-								wdl_name(d.wdl), static_cast<unsigned>(d.value),
-								fen_of(pos).c_str());
-							push_sample(s, opt.sample_cap, line);
+							++s.missing;
+							push_sample(s, opt.sample_cap, "[DTC_MISSING] " + ps.name() + " fen=" + fen_of(pos));
+						}
+						else
+						{
+							++s.checked_dtc;
+							const uint16_t actual_v = static_cast<uint16_t>(pr.dtc);
+							const bool value_mismatch =
+								!dtc_values_match(d.wdl, actual_v, d.value, dtc_entry_bytes[stm]);
+							if (pr.wdl != d.wdl || value_mismatch)
+							{
+								++s.dtc_mismatch;
+								char line[512];
+								std::snprintf(line, sizeof(line),
+									"[DTC] idx=%zu stm=%s table=%s/%u derived=%s/%u fen=%s",
+									i, stm == WHITE ? "W" : "B",
+									wdl_name(pr.wdl), static_cast<unsigned>(actual_v),
+									wdl_name(d.wdl), static_cast<unsigned>(d.value),
+									fen_of(pos).c_str());
+								push_sample(s, opt.sample_cap, line);
+							}
 						}
 					}
 				}

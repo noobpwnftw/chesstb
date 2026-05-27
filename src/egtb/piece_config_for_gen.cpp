@@ -8,9 +8,7 @@
 #include "util/defines.h"
 
 #include <cstring>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -23,39 +21,17 @@ INLINE Square diag_flip(Square s)
 
 }  // namespace
 
-namespace {
-
-// One King_Slice_Manager per symmetry group, lazily built.
-const King_Slice_Manager& slice_mgr_for(Symmetry_Group sym)
-{
-	static std::mutex mu;
-	static std::map<Symmetry_Group, std::unique_ptr<King_Slice_Manager>> cache;
-	std::lock_guard<std::mutex> lock(mu);
-	auto it = cache.find(sym);
-	if (it == cache.end())
-	{
-		auto p = std::make_unique<King_Slice_Manager>(sym);
-		auto* raw = p.get();
-		cache[sym] = std::move(p);
-		return *raw;
-	}
-	return *it->second;
-}
-
-}  // namespace
-
-const King_Slice_Manager& get_slice_manager(Symmetry_Group sym)
-{
-	return slice_mgr_for(sym);
-}
-
 bool Piece_Config_For_Gen::try_init()
 {
 	const auto counts = piece_counts();
 	for (size_t i = 0; i < PIECE_NB; ++i)
 		m_piece_counts_cached[i] = static_cast<int8_t>(counts[i]);
 	m_symmetry = pick_symmetry(*this);
-	m_king_slice_manager = &get_slice_manager(m_symmetry);
+	static const King_Slice_Manager file_mirror(Symmetry_Group::FILE_MIRROR);
+	static const King_Slice_Manager dihedral_8(Symmetry_Group::DIHEDRAL_8);
+	m_king_slice_manager = m_symmetry == Symmetry_Group::DIHEDRAL_8
+		? &dihedral_8
+		: &file_mirror;
 
 	m_both_sides_have_free_attackers =
 		   has_any_free_attackers(WHITE)
@@ -100,7 +76,7 @@ bool Piece_Config_For_Gen::try_init()
 	}
 	else
 	{
-		m_pawn_slice_manager = std::make_unique<Pawn_Slice_Manager>(Pawn_Slice_Manager::empty());
+		m_pawn_slice_manager = std::make_unique<Pawn_Slice_Manager>();
 	}
 	m_num_pawn_slices = m_pawn_slice_manager->num_slices();
 

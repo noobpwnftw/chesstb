@@ -11,9 +11,8 @@
 //   ./check_tables --limit 50 KRRK
 //   ./check_tables --wdl ./wdl --dtc ./dtc --dtm ./dtm --dtm50 ./dtm50 KRRK
 
-#include "egtb/egtb_gen_dtc.h"        // Position_For_Gen, board_index_of_position
-#include "egtb/piece_config_for_gen.h"
 #include "probe/probe.h"
+#include "probe/position_index.h"
 #include "chess/attack.h"
 #include "chess/move.h"
 #include "chess/piece_config.h"
@@ -22,6 +21,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -153,7 +153,7 @@ bool check_material(const Options& opt, const std::string& name)
 		std::printf("%-8s: no .lzdtc/.lzdtm/.lzdtm50 on disk, skipped\n", ps.name().c_str()); return true;
 	}
 
-	Piece_Config_For_Gen epsi(ps);
+	Position_Index_Config epsi(ps);
 	const auto [mat_key, mir_key] = ps.material_keys();
 	const bool symmetric = (mat_key == mir_key);
 	const size_t N = epsi.num_positions();
@@ -166,23 +166,28 @@ bool check_material(const Options& opt, const std::string& name)
 	tables.add_dtm50_path(opt.dtm50_dir);
 
 	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
-	Shared_Board_Index_Iterator iter(
-		BOARD_INDEX_ZERO, static_cast<Board_Index>(N), CHUNK_SIZE);
+	std::atomic<size_t> next_idx{0};
 
 	auto shards = global_pool().run_sync_task_on_all_threads(
 		[&](size_t) -> Shard
 	{
 		Shard s;
-		for (const Board_Index idx : iter.indices())
+		while (true)
 		{
-			const size_t i = static_cast<size_t>(idx);
+			const size_t lo = next_idx.fetch_add(CHUNK_SIZE, std::memory_order_relaxed);
+			if (lo >= N) break;
+			const size_t hi = std::min(lo + CHUNK_SIZE, N);
+			for (size_t i = lo; i < hi; ++i)
+			{
 			for (Color stm : { WHITE, BLACK })
 			{
 				if (symmetric && stm == BLACK) break;
-				Position_For_Gen pfg(epsi, idx, stm);
-				if (!pfg.is_legal(Position_For_Gen::Legality_Lower_Bound::CHESS_LEGAL))
+				Position pos;
+				const auto idx = static_cast<Board_Index>(i);
+				if (!position_from_index(epsi, idx, stm, out_param(pos)))
 					continue;
-				const Position& pos = pfg.board();
+				if (!pos.is_legal())
+					continue;
 				if (board_index_of_position(epsi, pos) != idx) continue;
 
 				const Probe_Result pr = tables.probe(ps, pos, /*rule50=*/0);
@@ -200,7 +205,7 @@ bool check_material(const Options& opt, const std::string& name)
 					if (!pr.has_dtc) { ++s.v_missing_dtc; }
 					else
 					{
-						const uint16_t dtc_v = static_cast<uint16_t>(pr.dtc.value());
+						const uint16_t dtc_v = static_cast<uint16_t>(pr.dtc);
 						if (is_win_class(w) && dtc_v == 0) {
 							++s.v_dtc_win_zero;
 							push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtc_v, "DTC_WIN_ZERO");
@@ -209,12 +214,12 @@ bool check_material(const Options& opt, const std::string& name)
 							++s.v_dtc_lose_zero_non_mate;
 							push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtc_v, "DTC_LOSE_ZERO_NOMATE");
 						}
-						if (is_cursed_class(w) && dtc_v <= DTC_Final_Entry::MAX_NON_CURSED_DTZ) {
+						if (is_cursed_class(w) && dtc_v <= DTC_MAX_NON_CURSED_DTZ) {
 							++s.v_dtc_cursed_range;
 							push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtc_v, "DTC_CURSED_RANGE");
 						}
 						if ((w == WDL_Entry::WIN || w == WDL_Entry::LOSE)
-						    && dtc_v > DTC_Final_Entry::MAX_NON_CURSED_DTZ) {
+						    && dtc_v > DTC_MAX_NON_CURSED_DTZ) {
 							++s.v_dtc_noncursed_range;
 							push_sample(s, opt.sample_cap, ps, i, stm, pos, w, dtc_v, "DTC_NONCURSED_RANGE");
 						}
@@ -224,7 +229,7 @@ bool check_material(const Options& opt, const std::string& name)
 				if (have_dtm)
 				{
 					if (!pr.has_dtm) { ++s.v_missing_dtm; continue; }
-					const uint16_t dtm_v = static_cast<uint16_t>(pr.dtm.value());
+					const uint16_t dtm_v = static_cast<uint16_t>(pr.dtm);
 
 					if (is_win_class(w) && dtm_v == 0) {
 						++s.v_dtm_win_zero;
@@ -254,15 +259,14 @@ bool check_material(const Options& opt, const std::string& name)
 					}
 					else
 					{
-						const WDL_Entry got = pr.dtm50.wdl();
-						if (got != expect) {
+						if (pr.dtm50_wdl != expect) {
 							++s.v_dtm50_class_mismatch;
 							push_sample(s, opt.sample_cap, ps, i, stm, pos, w,
-								static_cast<uint16_t>(pr.dtm50.value()), "DTM50_CLASS_MISMATCH");
+								static_cast<uint16_t>(pr.dtm50), "DTM50_CLASS_MISMATCH");
 						}
 						if (expect == WDL_Entry::WIN || expect == WDL_Entry::LOSE)
 						{
-							const uint16_t v50 = static_cast<uint16_t>(pr.dtm50.value());
+							const uint16_t v50 = static_cast<uint16_t>(pr.dtm50);
 							if (expect == WDL_Entry::WIN && v50 == 0) {
 								++s.v_dtm50_win_zero;
 								push_sample(s, opt.sample_cap, ps, i, stm, pos, w, v50, "DTM50_WIN_ZERO");
@@ -282,6 +286,7 @@ bool check_material(const Options& opt, const std::string& name)
 						}
 					}
 				}
+			}
 			}
 		}
 		return s;

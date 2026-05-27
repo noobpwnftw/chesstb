@@ -18,13 +18,9 @@ INLINE int pawn_life(Color c, Square sq)
 
 }  // namespace
 
-Pawn_Slice_Manager Pawn_Slice_Manager::empty()
+Pawn_Slice_Manager::Pawn_Slice_Manager()
 {
-	Pawn_Slice_Manager m;
-	m.m_has_pawns = false;
-	m.m_num_slices = 1;
-	m.m_pair_topo_batches.push_back({ 0 });
-	return m;
+	m_pair_topo_batches.push_back({ 0 });
 }
 
 Pawn_Slice_Manager::Pawn_Slice_Manager(const Piece_Group* white_pawns,

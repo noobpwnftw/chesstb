@@ -1185,6 +1185,7 @@ void save_dtm50_table(
 			for (uint16_t v : co.ranks.rank_to_value) w.write<uint16_t>(v);
 		}
 	}
+	w.zero_align(8);
 	for (Color c : colors)
 	{
 		const DTM50_Compressed_Color& co = color_out[c];

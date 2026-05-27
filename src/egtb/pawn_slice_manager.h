@@ -12,10 +12,9 @@
 
 struct Pawn_Slice_Manager
 {
+    Pawn_Slice_Manager();
     Pawn_Slice_Manager(const Piece_Group* white_pawns,
                        const Piece_Group* black_pawns);
-
-    NODISCARD static Pawn_Slice_Manager empty();
 
     NODISCARD size_t num_slices() const { return m_num_slices; }
     NODISCARD bool   has_pawns()  const { return m_has_pawns; }
@@ -50,8 +49,6 @@ struct Pawn_Slice_Manager
     NODISCARD std::vector<int32_t> push_target_slices(int32_t slice_id) const;
 
 private:
-    Pawn_Slice_Manager() = default;
-
     bool m_has_pawns = false;
     size_t m_num_slices = 1;
     size_t m_num_cartesian_slices = 1;

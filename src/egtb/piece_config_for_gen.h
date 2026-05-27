@@ -74,7 +74,6 @@ constexpr Square ANCHOR_TRIANGLE_SQUARES[] = {
 static_assert(sizeof(ANCHOR_TRIANGLE_SQUARES) / sizeof(Square) == 10);
 
 struct King_Slice_Manager;
-NODISCARD const King_Slice_Manager& get_slice_manager(Symmetry_Group sym);
 
 // Owns Piece_Groups for non-king classes and lays out the slice-based
 // Board_Index. Kings and pawns are handled by their respective slice managers.

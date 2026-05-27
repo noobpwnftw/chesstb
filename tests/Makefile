@@ -20,7 +20,6 @@ COMMON_C := \
 
 COMMON_CXX := \
   $(wildcard $(ROOT)/src/chess/*.cpp) \
-  $(wildcard $(ROOT)/src/egtb/*.cpp) \
   $(wildcard $(ROOT)/src/util/*.cpp) \
   $(wildcard $(ROOT)/src/probe/*.cpp)
 

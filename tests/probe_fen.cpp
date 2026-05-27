@@ -6,8 +6,6 @@
 
 #include "probe/probe.h"
 
-#include "egtb/egtb_entry.h"
-
 #include "chess/attack.h"
 #include "chess/piece_config.h"
 #include "chess/position.h"
@@ -159,18 +157,11 @@ void print_probe_result(const Probe_Result& r, const char* prefix)
 		case Probe_Result::Status::OK:           break;
 	}
 	std::printf("%swdl=%s", prefix, wdl_name(r.wdl));
-	if (r.has_dtc) std::printf(" dtz=%u", static_cast<unsigned>(r.dtc.value()));
+	if (r.has_dtc) std::printf(" dtz=%u", static_cast<unsigned>(r.dtc));
 	else           std::printf(" dtc=<missing>");
-	if (r.has_dtm) std::printf(" dtm=%u", static_cast<unsigned>(r.dtm.value()));
+	if (r.has_dtm) std::printf(" dtm=%u", static_cast<unsigned>(r.dtm));
 	if (r.has_dtm50)
-	{
-		std::printf(" dtm50=%s",
-			r.dtm50.is_win()  ? "WIN"  :
-			r.dtm50.is_loss() ? "LOSS" :
-			r.dtm50.is_draw() ? "DRAW" : "?");
-		if (r.dtm50.is_win() || r.dtm50.is_loss())
-			std::printf("(%u)", static_cast<unsigned>(r.dtm50.value()));
-	}
+		std::printf(" dtm50=%s/%u", wdl_name(r.dtm50_wdl), static_cast<unsigned>(r.dtm50));
 	std::printf("\n");
 }
 
@@ -260,9 +251,9 @@ void dump_children(const Options& opt, Probe_Tables* tables,
 		{
 			r.status = Probe_Result::Status::OK;
 			r.wdl = WDL_Entry::DRAW;
-			r.has_dtc = true; r.dtc = DTC_Final_Entry::make_draw();
-			r.has_dtm = true; r.dtm = DTM_Final_Entry::make_draw();
-			r.has_dtm50 = true; r.dtm50 = DTM_Final_Entry::make_draw();
+			r.has_dtc = true; r.dtc = 0;
+			r.has_dtm = true; r.dtm = 0;
+			r.has_dtm50 = true; r.dtm50_wdl = WDL_Entry::DRAW; r.dtm50 = 0;
 		}
 		else
 		{

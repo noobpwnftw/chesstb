@@ -128,6 +128,8 @@ NODISCARD bool parse_rank_encoded(const Const_Span<uint8_t>& bytes,
 		}
 	}
 
+	r.align(8);
+
 	for (Color c : *out_table_colors)
 	{
 		if (!info[c].present) continue;
@@ -201,6 +203,7 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 	size_t out_size = 8;
 	for (Color c : table_colors)
 		out_size += rank_color_header_bytes(shrunk[c]);
+	out_size = ceil_to_multiple(out_size, (size_t)8);
 	for (Color c : table_colors)
 		if (shrunk[c].present && flag_is_normal(shrunk[c].flag))
 			out_size += shrunk[c].block_cnt * 8;
@@ -249,6 +252,8 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 				w.write(Const_Span<uint8_t>(ci.rank_table_ptr, ci.num_ranks * 2));
 		}
 	}
+
+	w.zero_align(8);
 
 	for (Color c : table_colors)
 	{
@@ -429,6 +434,7 @@ bool shrink_dtm50(const std::filesystem::path& path)
 	size_t out_size = 8;  // magic + key_and_table_num
 	for (Color c : table_colors)
 		out_size += dtm50_color_header_bytes(shrunk[c]);
+	out_size = ceil_to_multiple(out_size, (size_t)8);
 	for (Color c : table_colors)
 		if (shrunk[c].present && flag_is_normal(shrunk[c].flag))
 			out_size += shrunk[c].block_cnt * 16;  // 16 bytes per block (dso + usz)
@@ -477,6 +483,8 @@ bool shrink_dtm50(const std::filesystem::path& path)
 				w.write(Const_Span<uint8_t>(ci.rank_table_ptr, ci.num_ranks * 2));
 		}
 	}
+
+	w.zero_align(8);
 
 	for (Color c : table_colors)
 	{
