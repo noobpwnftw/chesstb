@@ -18,8 +18,7 @@ COMMON_C := \
 COMMON_CXX := \
   $(wildcard src/chess/*.cpp) \
   $(wildcard src/egtb/*.cpp) \
-  $(wildcard src/util/*.cpp) \
-  $(wildcard src/probe/*.cpp)
+  $(wildcard src/util/*.cpp)
 
 SHRINK_C := lib/zstd/common/xxhash.c
 SHRINK_CXX := \
