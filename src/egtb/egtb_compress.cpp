@@ -8,6 +8,7 @@
 #include "util/progress_bar.h"
 #include "util/filesystem.h"
 #include "util/memory.h"
+#include "util/mono_uint_vec.h"
 
 namespace {
 // Run-stitch ILLEGAL spans with a neighboring value so the don't-care cells
@@ -271,8 +272,28 @@ void save_wdl_table(
 	EGTB_Magic magic
 )
 {
+	// Build the cumulative-offset arrays and delta-encode them up front so
+	// file_size accounting knows each color's offset-section byte count.
+	Mono_Uint_Vec::Encoded mono_enc[COLOR_NB];
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular()) continue;
+		const size_t n = t.num_blocks();
+		std::vector<uint64_t> off(n + 1);
+		size_t cur = 0;
+		const auto& blocks = t.compressed_blocks();
+		for (size_t k = 0; k < n; ++k)
+		{
+			off[k] = cur;
+			if (!blocks[k].empty()) cur += blocks[k].size();
+		}
+		off[n] = cur;
+		ASSERT(cur == t.total_compressed_size());
+		mono_enc[i] = Mono_Uint_Vec::encode(Const_Span<uint64_t>(off.data(), off.size()));
+	}
+
 	size_t file_size = 8;  // header
-	size_t offset_bits[COLOR_NB] = { 4, 4 };
 
 	for (const Color i : table_colors)
 	{
@@ -280,10 +301,8 @@ void save_wdl_table(
 		if (t.is_singular())
 			file_size += 2;
 		else
-		{
-			offset_bits[i] = t.total_compressed_size() <= 0xffffffff ? 4 : 6;
-			file_size += 20;
-		}
+			// flag(1) + tail(2) + block_size(4) + block_cnt(8) + total(8)
+			file_size += 23;
 	}
 
 	for (const Color i : table_colors)
@@ -306,7 +325,7 @@ void save_wdl_table(
 		if (t.is_singular())
 			continue;
 
-		file_size += (offset_bits[i] + 2) * t.num_blocks();
+		file_size += mono_section_bytes(mono_enc[i].on_disk_bytes);
 	}
 
 	file_size = ceil_to_multiple(file_size, (size_t)64);
@@ -341,11 +360,10 @@ void save_wdl_table(
 		else
 		{
 			writer.write<uint8_t>(0);
-			writer.write<uint8_t>(narrowing_static_cast<uint8_t>(offset_bits[i]));
 
 			writer.write<uint16_t>(narrowing_static_cast<uint16_t>(t.tail_size()));
 			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.block_size()));
-			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.num_blocks()));
+			writer.write<uint64_t>(narrowing_static_cast<uint64_t>(t.num_blocks()));
 			writer.write<uint64_t>(narrowing_static_cast<uint64_t>(t.total_compressed_size()));
 		}
 	}
@@ -366,32 +384,23 @@ void save_wdl_table(
 			writer.write<uint16_t>(0);
 	}
 
+	// Per-color delta-coded offset section:
+	//   [u8 log2_bu, sample_width, offset_width, usz_width=0]
+	//   align(8) -> mono blob -> align(8).
 	for (const Color i : table_colors)
 	{
 		const Compressed_EGTB& t = save_info[i];
 		if (t.is_singular())
 			continue;
 
-		size_t offset = 0;
-		for (const auto& block : t.compressed_blocks())
-		{
-			if (block.empty())
-			{
-				writer.write<uint16_t>(0);
-				writer.write<uint32_t>(0);
-				if (offset_bits[i] == 6)
-					writer.write<uint16_t>(0);
-				continue;
-			}
-
-			writer.write<uint16_t>(narrowing_static_cast<uint16_t>(block.size()));
-			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(offset));
-
-			if (offset_bits[i] == 6)
-				writer.write<uint16_t>(narrowing_static_cast<uint16_t>(offset >> 32));
-
-			offset += block.size();
-		}
+		const auto& m = mono_enc[i];
+		writer.write<uint8_t>(m.log2_bu);
+		writer.write<uint8_t>(m.sample_width);
+		writer.write<uint8_t>(m.offset_width);
+		writer.write<uint8_t>(0);  // usz_width: WDL has none
+		writer.zero_align(8);
+		writer.write(Const_Span<uint8_t>(m.blob.data(), m.on_disk_bytes));
+		writer.zero_align(8);
 	}
 
 	writer.zero_align(64);
@@ -424,6 +433,26 @@ void save_egtb_table(
 	EGTB_Magic magic
 )
 {
+	// Pre-encode each color's offsets as a delta-coded Mono_Uint_Vec.
+	Mono_Uint_Vec::Encoded mono_enc[COLOR_NB];
+	for (const Color i : table_colors)
+	{
+		const Compressed_EGTB& t = save_info[i];
+		if (t.is_singular()) continue;
+		const size_t n = t.num_blocks();
+		std::vector<uint64_t> off(n + 1);
+		size_t cur = 0;
+		const auto& blocks = t.compressed_blocks();
+		for (size_t k = 0; k < n; ++k)
+		{
+			off[k] = cur;
+			if (!blocks[k].empty()) cur += blocks[k].size();
+		}
+		off[n] = cur;
+		ASSERT(cur == t.total_compressed_size());
+		mono_enc[i] = Mono_Uint_Vec::encode(Const_Span<uint64_t>(off.data(), off.size()));
+	}
+
 	size_t file_size = 8;  // header
 
 	for (const Color i : table_colors)
@@ -434,7 +463,8 @@ void save_egtb_table(
 		}
 		else
 		{
-			file_size += 22 + 2 + save_info[i].rank_table().ranks.size() * 2;
+			// flag(1)+entry_bytes(1)+tail(4)+block_size(4)+block_cnt(8)+total(8) = 26
+			file_size += 26 + 2 + save_info[i].rank_table().ranks.size() * 2;
 		}
 	}
 
@@ -444,7 +474,7 @@ void save_egtb_table(
 		if (t.is_singular())
 			continue;
 
-		file_size += t.num_blocks() * 8;
+		file_size += mono_section_bytes(mono_enc[i].on_disk_bytes);
 	}
 
 	file_size = ceil_to_multiple(file_size, (size_t)64);
@@ -482,7 +512,7 @@ void save_egtb_table(
 
 			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.tail_size()));
 			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.block_size()));
-			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.num_blocks()));
+			writer.write<uint64_t>(narrowing_static_cast<uint64_t>(t.num_blocks()));
 			writer.write<uint64_t>(narrowing_static_cast<uint64_t>(t.total_compressed_size()));
 
 			// Inline rank table: num_ranks=0 means "no remap, stream stores storage values".
@@ -495,24 +525,21 @@ void save_egtb_table(
 
 	writer.zero_align(8);
 
+	// Per-color delta-coded offset section: widths + align(8) + mono blob + align(8).
 	for (const Color i : table_colors)
 	{
 		const Compressed_EGTB& t = save_info[i];
 		if (t.is_singular())
 			continue;
 
-		size_t offset = 0;
-		for (const auto& block : t.compressed_blocks())
-		{
-			if (block.empty())
-			{
-				writer.write<uint64_t>(0);
-				continue;
-			}
-			ASSERT(block.size() < (1 << 20));
-			writer.write<uint64_t>((offset << 20) + block.size());
-			offset += block.size();
-		}
+		const auto& m = mono_enc[i];
+		writer.write<uint8_t>(m.log2_bu);
+		writer.write<uint8_t>(m.sample_width);
+		writer.write<uint8_t>(m.offset_width);
+		writer.write<uint8_t>(0);  // usz_width: DTC/DTM have none
+		writer.zero_align(8);
+		writer.write(Const_Span<uint8_t>(m.blob.data(), m.on_disk_bytes));
+		writer.zero_align(8);
 	}
 
 	writer.zero_align(64);
@@ -584,7 +611,6 @@ void load_wdl_table(
 
 	size_t dict_size[COLOR_NB]{ 0, 0 };
 	const uint8_t* lp_dict[COLOR_NB]{ nullptr, nullptr };
-	size_t offset_bits[COLOR_NB]{ 0, 0 };
 	const uint8_t* data[COLOR_NB]{ nullptr, nullptr };
 	size_t data_size[COLOR_NB]{ 0, 0 };
 	const uint8_t* offset_tb[COLOR_NB]{ nullptr, nullptr };
@@ -613,10 +639,9 @@ void load_wdl_table(
 		{
 			wdl->m_is_singular[i] = false;
 
-			offset_bits[i] = reader.read<uint8_t>();
 			tail_size[i] = reader.read<uint16_t>();
 			block_size[i] = reader.read<uint32_t>();
-			block_cnt[i] = reader.read<uint32_t>();
+			block_cnt[i] = reader.read<uint64_t>();
 			data_size[i] = reader.read<uint64_t>();
 		}
 	}
@@ -635,13 +660,21 @@ void load_wdl_table(
 		}
 	}
 
+	uint8_t mono_params[COLOR_NB][3]{};  // log2_bu, sample_width, offset_width
 	for (const Color i : table_colors)
 	{
 		if (wdl->m_is_singular[i])
 			continue;
 
+		mono_params[i][0] = reader.read<uint8_t>();
+		mono_params[i][1] = reader.read<uint8_t>();
+		mono_params[i][2] = reader.read<uint8_t>();
+		reader.advance(1);  // usz_width: 0 for WDL
+		reader.align(8);
 		offset_tb[i] = reader.caret();
-		reader.advance((2 + offset_bits[i]) * block_cnt[i]);
+		reader.advance(Mono_Uint_Vec::on_disk_bytes(
+			block_cnt[i] + 1, mono_params[i][0], mono_params[i][1], mono_params[i][2]));
+		reader.align(8);
 	}
 
 	for (const Color i : table_colors)
@@ -676,23 +709,8 @@ void load_wdl_table(
 		pc.block_cnt = block_cnt[i];
 		pc.compressed_data = data[i];
 		pc.dict = LZ4_Dict::load(Const_Span(lp_dict[i], lp_dict[i] + dict_size[i]));
-
-		// On-disk offset table: 2 bytes comp_size + offset_bits bytes data_offset
-		// (offset_bits = 4 for tables <= 4 GiB compressed, else 6).
-		pc.index.resize(block_cnt[i]);
-		for (size_t idx = 0; idx < block_cnt[i]; ++idx)
-		{
-			Serial_Memory_Reader block_reader(Const_Span(offset_tb[i] + (offset_bits[i] + 2) * idx, 2 + 4 + 2));
-			const uint16_t comp_size = block_reader.read<uint16_t>();
-			size_t data_offset = block_reader.read<uint32_t>();
-			if (offset_bits[i] == 6)
-			{
-				const size_t hi = block_reader.read<uint16_t>();
-				data_offset += hi << 32;
-			}
-			pc.index[idx].data_offset = data_offset;
-			pc.index[idx].comp_size = comp_size;
-		}
+		pc.offsets = Mono_Uint_Vec(offset_tb[i], block_cnt[i] + 1,
+		                           mono_params[i][0], mono_params[i][1], mono_params[i][2]);
 	}
 }
 
@@ -748,7 +766,7 @@ void load_dtm_table(
 				throw std::runtime_error("Bad DTM entry_bytes in " + sub_dtm.string());
 			pc.tail_size  = reader.read<uint32_t>();
 			pc.block_size = reader.read<uint32_t>();
-			pc.block_cnt  = reader.read<uint32_t>();
+			pc.block_cnt  = reader.read<uint64_t>();
 			data_size[i]  = reader.read<uint64_t>();
 
 			const size_t num_ranks = reader.read<uint16_t>();
@@ -763,8 +781,19 @@ void load_dtm_table(
 	for (const Color i : table_colors)
 	{
 		if (dtm->m_is_singular[i]) continue;
-		dtm->m_per_color[i].offset_tb = reader.caret();
-		reader.advance(dtm->m_per_color[i].block_cnt * 8);
+		auto& pc = dtm->m_per_color[i];
+		const uint8_t log2_bu      = reader.read<uint8_t>();
+		const uint8_t sample_width = reader.read<uint8_t>();
+		const uint8_t offset_width = reader.read<uint8_t>();
+		reader.advance(1);  // usz_width: 0 for DTM
+		reader.align(8);
+		const uint8_t* mono_ptr = reader.caret();
+		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
+			pc.block_cnt + 1, log2_bu, sample_width, offset_width);
+		reader.advance(mono_bytes);
+		reader.align(8);
+		pc.offsets = Mono_Uint_Vec(mono_ptr, pc.block_cnt + 1,
+		                           log2_bu, sample_width, offset_width);
 	}
 
 	for (const Color i : table_colors)
@@ -840,7 +869,6 @@ void load_dtm_sub_flat(
 	size_t data_size[COLOR_NB]{ 0, 0 };
 	bool is_singular[COLOR_NB]{ false, false };
 	std::vector<uint16_t> rank_to_value[COLOR_NB];
-	const uint8_t* offset_tb[COLOR_NB]{ nullptr, nullptr };
 	const uint8_t* data[COLOR_NB]{ nullptr, nullptr };
 
 	for (const Color i : table_colors)
@@ -858,7 +886,7 @@ void load_dtm_sub_flat(
 				throw std::runtime_error("Bad DTM entry_bytes in " + dtm_path.string());
 			tail_size[i]  = reader.read<uint32_t>();
 			block_size[i] = reader.read<uint32_t>();
-			block_cnt[i]  = reader.read<uint32_t>();
+			block_cnt[i]  = reader.read<uint64_t>();
 			data_size[i]  = reader.read<uint64_t>();
 
 			const size_t num_ranks = reader.read<uint16_t>();
@@ -870,11 +898,22 @@ void load_dtm_sub_flat(
 
 	reader.align(8);
 
+	Mono_Uint_Vec offsets[COLOR_NB];
 	for (const Color i : table_colors)
 	{
 		if (is_singular[i]) continue;
-		offset_tb[i] = reader.caret();
-		reader.advance(block_cnt[i] * 8);
+		const uint8_t log2_bu      = reader.read<uint8_t>();
+		const uint8_t sample_width = reader.read<uint8_t>();
+		const uint8_t offset_width = reader.read<uint8_t>();
+		reader.advance(1);  // usz_width: 0 for DTM
+		reader.align(8);
+		const uint8_t* mono_ptr = reader.caret();
+		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
+			block_cnt[i] + 1, log2_bu, sample_width, offset_width);
+		reader.advance(mono_bytes);
+		reader.align(8);
+		offsets[i] = Mono_Uint_Vec(mono_ptr, block_cnt[i] + 1,
+		                           log2_bu, sample_width, offset_width);
 	}
 
 	for (const Color i : table_colors)
@@ -926,10 +965,9 @@ void load_dtm_sub_flat(
 					const size_t idx = next_block.fetch_add(1, std::memory_order_relaxed);
 					if (idx >= blocks) return;
 
-					const uint8_t* offset = offset_tb[i] + idx * 8;
-					const uint64_t dso = reinterpret_cast<const uint64_t*>(offset)[0];
-					const size_t dsz  = dso & 0xFFFFF;
-					const size_t doff = dso >> 20;
+					const auto pair = offsets[i].get2(idx);
+					const size_t doff = pair[0];
+					const size_t dsz  = pair[1] - pair[0];
 
 					const size_t decode_sz =
 						(idx == blocks - 1 && tail_size[i] != 0) ? tail_size[i] : block_size[i];
@@ -1025,7 +1063,6 @@ void load_dtm50_sub_flat(
 	size_t data_size[COLOR_NB]{ 0, 0 };
 	bool is_singular[COLOR_NB]{ false, false };
 	std::vector<uint16_t> rank_to_value[COLOR_NB];
-	const uint8_t* offset_tb[COLOR_NB]{ nullptr, nullptr };
 	const uint8_t* data[COLOR_NB]{ nullptr, nullptr };
 
 	for (const Color i : table_colors)
@@ -1042,7 +1079,7 @@ void load_dtm50_sub_flat(
 			if (entry_bytes[i] != 1 && entry_bytes[i] != 2)
 				throw std::runtime_error("Bad DTM50 entry_bytes in " + dtm_path.string());
 			block_positions[i] = reader.read<uint32_t>();
-			block_cnt[i]       = reader.read<uint32_t>();
+			block_cnt[i]       = reader.read<uint64_t>();
 			tail_positions[i]  = reader.read<uint32_t>();
 			data_size[i]       = reader.read<uint64_t>();
 
@@ -1055,11 +1092,28 @@ void load_dtm50_sub_flat(
 
 	reader.align(8);
 
+	Mono_Uint_Vec offsets[COLOR_NB];
+	Min0_Uint_Vec usizes[COLOR_NB];
 	for (const Color i : table_colors)
 	{
 		if (is_singular[i]) continue;
-		offset_tb[i] = reader.caret();
-		reader.advance(block_cnt[i] * 16);
+		const uint8_t log2_bu      = reader.read<uint8_t>();
+		const uint8_t sample_width = reader.read<uint8_t>();
+		const uint8_t offset_width = reader.read<uint8_t>();
+		const uint8_t usz_width    = reader.read<uint8_t>();
+		reader.align(8);
+		const uint8_t* mono_ptr = reader.caret();
+		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
+			block_cnt[i] + 1, log2_bu, sample_width, offset_width);
+		reader.advance(mono_bytes);
+		reader.align(8);
+		const uint8_t* usz_ptr = reader.caret();
+		const size_t usz_bytes = Min0_Uint_Vec::on_disk_bytes(block_cnt[i], usz_width);
+		reader.advance(usz_bytes);
+		reader.align(8);
+		offsets[i] = Mono_Uint_Vec(mono_ptr, block_cnt[i] + 1,
+		                           log2_bu, sample_width, offset_width);
+		usizes[i] = Min0_Uint_Vec(usz_ptr, block_cnt[i], usz_width);
 	}
 	for (const Color i : table_colors)
 	{
@@ -1115,18 +1169,17 @@ void load_dtm50_sub_flat(
 				const size_t bidx = next_block.fetch_add(1, std::memory_order_relaxed);
 				if (bidx >= blocks) return;
 
-				const uint64_t* offset = reinterpret_cast<const uint64_t*>(offset_tb[i] + bidx * 16);
-				const uint64_t dso = offset[0];
-				const uint64_t usz = offset[1];
-				const size_t dsz  = dso & 0xFFFFFu;
-				const size_t doff = dso >> 20;
+				const auto pair = offsets[i].get2(bidx);
+				const size_t doff = pair[0];
+				const size_t dsz  = pair[1] - pair[0];
+				const size_t usz  = usizes[i].get(bidx);
 
 				const size_t this_bp =
 					(bidx == blocks - 1 && tail_positions[i] != 0) ? tail_positions[i] : ppb;
 				const size_t base_pos = bidx * ppb;
 
-				// Skip sentinel: all-don't-care span, DRAW-fill (see above).
-				if (usz == 0)
+				// Skip sentinel (comp_size==0): all-don't-care span, DRAW-fill.
+				if (dsz == 0)
 				{
 					std::memset(out + base_pos, 0,
 						this_bp * sizeof(DTM_Final_Entry));

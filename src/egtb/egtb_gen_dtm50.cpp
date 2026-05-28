@@ -13,6 +13,7 @@
 #include "util/filesystem.h"
 #include "util/math.h"
 #include "util/memory.h"
+#include "util/mono_uint_vec.h"
 #include "util/progress_bar.h"
 #include "util/utility.h"
 
@@ -617,14 +618,17 @@ namespace {
 //     else:
 //       uint8  entry_bytes  (1 or 2)
 //       uint32 block_positions
-//       uint32 block_cnt
+//       uint64 block_cnt
 //       uint32 tail_positions
 //       uint64 data_size
 //       uint16 num_ranks
 //       uint16 rank_to_value[num_ranks]    W/L storage values, frequency-sorted
-//   per-color offset table (non-singular): block_cnt × (uint64 dso, uint64 usz)
-//     dso = (doff << 20) | dsz;  usz == 0 ⇒ skip sentinel (uniform DRAW/ILLEGAL,
-//     no payload bytes; probe / flat loader fill DRAW).
+//   per-color offset section (non-singular): delta-coded succinct index
+//     [u8 log2_bu, sample_width, offset_width, usz_width]
+//     align(8); Mono_Uint_Vec blob over (block_cnt+1) cumulative offsets
+//     align(8); Min0_Uint_Vec blob over block_cnt usz values
+//     align(8)
+//     skip-block sentinel: get2(i)[0]==get2(i)[1] (comp_size == 0).
 //   align 64
 //   per-color compressed data (non-singular), ceil64-aligned tail
 //   end-checksum (8 bytes, xxhash with EGTB_CHECKSUM_INIT_VALUE)
@@ -909,7 +913,7 @@ struct DTM50_Compressed_Color
 	WDL_Entry singular_wdl = WDL_Entry::DRAW;
 	DTM50_Rank_Table ranks;
 	uint32_t block_positions = 0;
-	uint32_t block_cnt = 0;
+	uint64_t block_cnt = 0;
 	uint32_t tail_positions = 0;
 	std::vector<std::vector<uint8_t>> compressed_blocks;
 	// Plain LZMA has no end-marker, so the decoder needs each block's usz.
@@ -1031,7 +1035,7 @@ void save_compress_dtm50(
 	const size_t bcnt = ceil_div(num_positions, bp);
 	const size_t tail = num_positions - (bcnt - 1) * bp;
 
-	constexpr size_t PRINT_PERIOD_BYTES = 1024 * 1024 * 8;
+	constexpr size_t PRINT_PERIOD_BYTES = 1024 * 1024 * 8 * DTM50_HMC_COUNT;
 	const size_t raw_block_bytes = bp * DTM50_HMC_COUNT * sizeof(DTM_Final_Entry);
 	const size_t print_period = std::max<size_t>(
 		1, ceil_div(PRINT_PERIOD_BYTES * thread_pool->num_workers(), raw_block_bytes));
@@ -1039,7 +1043,7 @@ void save_compress_dtm50(
 		std::string("save_compress_dtm50 ") + std::to_string(static_cast<int>(color)));
 
 	out.block_positions = block_positions;
-	out.block_cnt = static_cast<uint32_t>(bcnt);
+	out.block_cnt = bcnt;
 	out.tail_positions = (tail == bp) ? 0u : static_cast<uint32_t>(tail);
 	out.compressed_blocks.resize(bcnt);
 	out.usizes.resize(bcnt);
@@ -1104,7 +1108,7 @@ void save_compress_dtm50(
 
 			const Const_Span<uint8_t> payload = encoder.encode(chunk.data(), this_bp);
 			std::vector<uint8_t> compressed = lzma.compress(payload);
-			if (compressed.size() >= (1u << 20))
+			if (compressed.size() > 0xFFFFFFFFu)
 				throw std::runtime_error("rs block too large for offset encoding");
 
 			out.usizes[b] = payload.size();
@@ -1126,19 +1130,45 @@ void save_dtm50_table(
 	const std::filesystem::path& file_path,
 	Fixed_Vector<Color, 2> colors)
 {
+	// Pre-encode each color's offsets (mono) and per-block usz (min0).
+	Mono_Uint_Vec::Encoded mono_enc[COLOR_NB];
+	Min0_Uint_Vec::Encoded min0_enc[COLOR_NB];
+	for (Color c : colors)
+	{
+		const DTM50_Compressed_Color& co = color_out[c];
+		if (co.is_singular) continue;
+		const size_t n = co.block_cnt;
+		std::vector<uint64_t> off(n + 1);
+		size_t cur = 0;
+		for (size_t k = 0; k < n; ++k)
+		{
+			off[k] = cur;
+			cur += co.compressed_blocks[k].size();  // skip-block size == 0
+		}
+		off[n] = cur;
+		ASSERT(cur == co.total_compressed_size);
+		mono_enc[c] = Mono_Uint_Vec::encode(Const_Span<uint64_t>(off.data(), off.size()));
+
+		std::vector<uint64_t> usz(n);
+		for (size_t k = 0; k < n; ++k) usz[k] = co.usizes[k];
+		min0_enc[c] = Min0_Uint_Vec::encode(Const_Span<uint64_t>(usz.data(), usz.size()));
+	}
+
 	size_t file_size = 4 + 4;
 	for (Color c : colors)
 	{
 		file_size += 1;
 		if (color_out[c].is_singular) file_size += 1;
 		else {
-			file_size += 1 + 4 + 4 + 4 + 8 + 2;
+			// entry_bytes(1)+block_positions(4)+block_cnt(8)+tail_positions(4)+data_size(8)+num_ranks(2)
+			file_size += 1 + 4 + 8 + 4 + 8 + 2;
 			file_size += color_out[c].ranks.rank_to_value.size() * 2;
 		}
 	}
 	for (Color c : colors)
 		if (!color_out[c].is_singular)
-			file_size += color_out[c].block_cnt * 16;
+			file_size += mono_section_bytes(mono_enc[c].on_disk_bytes,
+			                                min0_enc[c].on_disk_bytes);
 	file_size = ceil_to_multiple(file_size, size_t{ 64 });
 	for (Color c : colors)
 	{
@@ -1170,7 +1200,7 @@ void save_dtm50_table(
 			w.write<uint8_t>(0);
 			w.write<uint8_t>(co.ranks.entry_bytes);
 			w.write<uint32_t>(co.block_positions);
-			w.write<uint32_t>(co.block_cnt);
+			w.write<uint64_t>(co.block_cnt);
 			w.write<uint32_t>(co.tail_positions);
 			w.write<uint64_t>(static_cast<uint64_t>(co.total_compressed_size));
 			w.write<uint16_t>(static_cast<uint16_t>(co.ranks.rank_to_value.size()));
@@ -1178,20 +1208,23 @@ void save_dtm50_table(
 		}
 	}
 	w.zero_align(8);
+	// Per-color delta-coded offset section: widths + align(8) + mono + align(8)
+	// + min0(usz) + align(8).
 	for (Color c : colors)
 	{
 		const DTM50_Compressed_Color& co = color_out[c];
 		if (co.is_singular) continue;
-		size_t offset = 0;
-		for (size_t b = 0; b < co.compressed_blocks.size(); ++b)
-		{
-			const size_t dsz = co.compressed_blocks[b].size();
-			ASSERT(dsz < (1u << 20));
-			w.write<uint64_t>((static_cast<uint64_t>(offset) << 20)
-				| static_cast<uint64_t>(dsz));
-			w.write<uint64_t>(co.usizes[b]);
-			offset += dsz;
-		}
+		const auto& m = mono_enc[c];
+		const auto& u = min0_enc[c];
+		w.write<uint8_t>(m.log2_bu);
+		w.write<uint8_t>(m.sample_width);
+		w.write<uint8_t>(m.offset_width);
+		w.write<uint8_t>(u.width);
+		w.zero_align(8);
+		w.write(Const_Span<uint8_t>(m.blob.data(), m.on_disk_bytes));
+		w.zero_align(8);
+		w.write(Const_Span<uint8_t>(u.blob.data(), u.on_disk_bytes));
+		w.zero_align(8);
 	}
 	w.zero_align(64);
 	for (Color c : colors)

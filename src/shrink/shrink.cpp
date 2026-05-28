@@ -22,6 +22,7 @@
 #include "util/filesystem.h"
 #include "util/math.h"
 #include "util/memory.h"
+#include "util/mono_uint_vec.h"
 #include "util/span.h"
 
 #include <algorithm>
@@ -96,11 +97,12 @@ struct Rank_Color_Info
 	uint8_t entry_bytes = 0;
 	uint32_t tail_size = 0;
 	uint32_t block_size = 0;
-	uint32_t block_cnt = 0;
+	uint64_t block_cnt = 0;
 	uint64_t data_size = 0;
 	uint16_t num_ranks = 0;
 	const uint8_t* rank_table_ptr = nullptr;
-	const uint8_t* offset_tb_ptr  = nullptr;
+	const uint8_t* offset_tb_ptr  = nullptr;  // start of delta-coded offset section
+	size_t  off_section_bytes = 0;            // verbatim copy length
 	const uint8_t* data_ptr       = nullptr;
 };
 
@@ -136,7 +138,7 @@ NODISCARD bool parse_rank_encoded(const Const_Span<uint8_t>& bytes,
 			info[c].entry_bytes = r.read<uint8_t>();
 			info[c].tail_size   = r.read<uint32_t>();
 			info[c].block_size  = r.read<uint32_t>();
-			info[c].block_cnt   = r.read<uint32_t>();
+			info[c].block_cnt   = r.read<uint64_t>();
 			info[c].data_size   = r.read<uint64_t>();
 			info[c].num_ranks   = r.read<uint16_t>();
 			info[c].rank_table_ptr = r.caret();
@@ -150,8 +152,17 @@ NODISCARD bool parse_rank_encoded(const Const_Span<uint8_t>& bytes,
 	{
 		if (!info[c].present) continue;
 		if (!flag_is_normal(info[c].flag)) continue;
-		info[c].offset_tb_ptr = r.caret();
-		r.advance(info[c].block_cnt * 8);
+		const uint8_t* sec_start = r.caret();
+		const uint8_t log2_bu      = r.read<uint8_t>();
+		const uint8_t sample_width = r.read<uint8_t>();
+		const uint8_t offset_width = r.read<uint8_t>();
+		r.advance(1);  // usz_width: 0 for DTC/DTM
+		r.align(8);
+		r.advance(Mono_Uint_Vec::on_disk_bytes(
+			info[c].block_cnt + 1, log2_bu, sample_width, offset_width));
+		r.align(8);
+		info[c].offset_tb_ptr = sec_start;
+		info[c].off_section_bytes = static_cast<size_t>(r.caret() - sec_start);
 	}
 
 	for (Color c : *out_table_colors)
@@ -170,7 +181,8 @@ NODISCARD size_t rank_color_header_bytes(const Rank_Color_Info& ci)
 {
 	if (ci.flag & SINGULAR_FLAG) return 2;
 	if (ci.flag & DROPPED_FLAG)  return 1;
-	return 22 + 2 + ci.num_ranks * 2;
+	// flag(1)+entry_bytes(1)+tail(4)+block_size(4)+block_cnt(8)+data_size(8) = 26
+	return 26 + 2 + ci.num_ranks * 2;
 }
 
 bool shrink_rank_encoded(const std::filesystem::path& path,
@@ -223,7 +235,7 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 	out_size = ceil_to_multiple(out_size, (size_t)8);
 	for (Color c : table_colors)
 		if (shrunk[c].present && flag_is_normal(shrunk[c].flag))
-			out_size += shrunk[c].block_cnt * 8;
+			out_size += shrunk[c].off_section_bytes;
 	out_size = ceil_to_multiple(out_size, (size_t)64);
 	for (Color c : table_colors)
 	{
@@ -273,7 +285,7 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 			w.write<uint8_t>(ci.entry_bytes);
 			w.write<uint32_t>(ci.tail_size);
 			w.write<uint32_t>(ci.block_size);
-			w.write<uint32_t>(ci.block_cnt);
+			w.write<uint64_t>(ci.block_cnt);
 			w.write<uint64_t>(ci.data_size);
 			w.write<uint16_t>(ci.num_ranks);
 			if (ci.num_ranks)
@@ -287,7 +299,7 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 	{
 		const Rank_Color_Info& ci = shrunk[c];
 		if (!ci.present || !flag_is_normal(ci.flag)) continue;
-		w.write(Const_Span<uint8_t>(ci.offset_tb_ptr, ci.block_cnt * 8));
+		w.write(Const_Span<uint8_t>(ci.offset_tb_ptr, ci.off_section_bytes));
 	}
 
 	w.zero_align(64);
@@ -342,12 +354,13 @@ struct Dtm50_Color_Info
 	// Fields below are populated only when flag_is_normal(flag).
 	uint8_t entry_bytes = 0;
 	uint32_t block_positions = 0;
-	uint32_t block_cnt = 0;
+	uint64_t block_cnt = 0;
 	uint32_t tail_positions = 0;
 	uint64_t data_size = 0;
 	uint16_t num_ranks = 0;
 	const uint8_t* rank_table_ptr = nullptr;
-	const uint8_t* offset_tb_ptr  = nullptr;   // 16 bytes per block
+	const uint8_t* offset_tb_ptr  = nullptr;   // start of delta-coded offset section
+	size_t  off_section_bytes = 0;             // verbatim copy length
 	const uint8_t* data_ptr       = nullptr;
 };
 
@@ -381,7 +394,7 @@ NODISCARD bool parse_dtm50(const Const_Span<uint8_t>& bytes,
 		{
 			info[c].entry_bytes     = r.read<uint8_t>();
 			info[c].block_positions = r.read<uint32_t>();
-			info[c].block_cnt       = r.read<uint32_t>();
+			info[c].block_cnt       = r.read<uint64_t>();
 			info[c].tail_positions  = r.read<uint32_t>();
 			info[c].data_size       = r.read<uint64_t>();
 			info[c].num_ranks       = r.read<uint16_t>();
@@ -396,8 +409,19 @@ NODISCARD bool parse_dtm50(const Const_Span<uint8_t>& bytes,
 	{
 		if (!info[c].present) continue;
 		if (!flag_is_normal(info[c].flag)) continue;
-		info[c].offset_tb_ptr = r.caret();
-		r.advance(info[c].block_cnt * 16);
+		const uint8_t* sec_start = r.caret();
+		const uint8_t log2_bu      = r.read<uint8_t>();
+		const uint8_t sample_width = r.read<uint8_t>();
+		const uint8_t offset_width = r.read<uint8_t>();
+		const uint8_t usz_width    = r.read<uint8_t>();
+		r.align(8);
+		r.advance(Mono_Uint_Vec::on_disk_bytes(
+			info[c].block_cnt + 1, log2_bu, sample_width, offset_width));
+		r.align(8);
+		r.advance(Min0_Uint_Vec::on_disk_bytes(info[c].block_cnt, usz_width));
+		r.align(8);
+		info[c].offset_tb_ptr = sec_start;
+		info[c].off_section_bytes = static_cast<size_t>(r.caret() - sec_start);
 	}
 
 	for (Color c : *out_table_colors)
@@ -416,9 +440,9 @@ NODISCARD size_t dtm50_color_header_bytes(const Dtm50_Color_Info& ci)
 {
 	if (ci.flag & SINGULAR_FLAG) return 2;
 	if (ci.flag & DROPPED_FLAG)  return 1;
-	// 1 flag + 1 eb + 4 block_positions + 4 block_cnt + 4 tail_positions
+	// 1 flag + 1 eb + 4 block_positions + 8 block_cnt + 4 tail_positions
 	// + 8 data_size + 2 num_ranks + ranks.
-	return 24 + ci.num_ranks * 2;
+	return 28 + ci.num_ranks * 2;
 }
 
 bool shrink_dtm50(const std::filesystem::path& path)
@@ -469,7 +493,7 @@ bool shrink_dtm50(const std::filesystem::path& path)
 	out_size = ceil_to_multiple(out_size, (size_t)8);
 	for (Color c : table_colors)
 		if (shrunk[c].present && flag_is_normal(shrunk[c].flag))
-			out_size += shrunk[c].block_cnt * 16;  // 16 bytes per block (dso + usz)
+			out_size += shrunk[c].off_section_bytes;  // 16 bytes per block (dso + usz)
 	out_size = ceil_to_multiple(out_size, (size_t)64);
 	for (Color c : table_colors)
 	{
@@ -518,7 +542,7 @@ bool shrink_dtm50(const std::filesystem::path& path)
 			w.write<uint8_t>(0);
 			w.write<uint8_t>(ci.entry_bytes);
 			w.write<uint32_t>(ci.block_positions);
-			w.write<uint32_t>(ci.block_cnt);
+			w.write<uint64_t>(ci.block_cnt);
 			w.write<uint32_t>(ci.tail_positions);
 			w.write<uint64_t>(ci.data_size);
 			w.write<uint16_t>(ci.num_ranks);
@@ -533,7 +557,7 @@ bool shrink_dtm50(const std::filesystem::path& path)
 	{
 		const Dtm50_Color_Info& ci = shrunk[c];
 		if (!ci.present || !flag_is_normal(ci.flag)) continue;
-		w.write(Const_Span<uint8_t>(ci.offset_tb_ptr, ci.block_cnt * 16));
+		w.write(Const_Span<uint8_t>(ci.offset_tb_ptr, ci.off_section_bytes));
 	}
 
 	w.zero_align(64);
@@ -583,14 +607,14 @@ struct Wdl_Color_Info
 	uint8_t flag = 0;
 	uint8_t single_val = 0;
 	// Present when flag_is_normal(flag).
-	uint8_t offset_bits = 0;
 	uint16_t tail_size = 0;
 	uint32_t block_size = 0;
-	uint32_t block_cnt = 0;
+	uint64_t block_cnt = 0;
 	uint64_t data_size = 0;
 	uint16_t dict_size = 0;
 	const uint8_t* dict_ptr = nullptr;
-	const uint8_t* offset_tb_ptr = nullptr;
+	const uint8_t* offset_tb_ptr = nullptr;  // start of delta-coded offset section
+	size_t  off_section_bytes = 0;           // verbatim copy length
 	const uint8_t* data_ptr = nullptr;
 	// Non-empty dictionaries are 2-byte aligned.
 	bool dict_pad_byte = false;
@@ -624,10 +648,9 @@ NODISCARD bool parse_wdl(const Const_Span<uint8_t>& bytes,
 		}
 		else
 		{
-			info[c].offset_bits = r.read<uint8_t>();
 			info[c].tail_size   = r.read<uint16_t>();
 			info[c].block_size  = r.read<uint32_t>();
-			info[c].block_cnt   = r.read<uint32_t>();
+			info[c].block_cnt   = r.read<uint64_t>();
 			info[c].data_size   = r.read<uint64_t>();
 		}
 	}
@@ -651,8 +674,17 @@ NODISCARD bool parse_wdl(const Const_Span<uint8_t>& bytes,
 	{
 		if (!info[c].present) continue;
 		if (!flag_is_normal(info[c].flag)) continue;
-		info[c].offset_tb_ptr = r.caret();
-		r.advance((2 + info[c].offset_bits) * info[c].block_cnt);
+		const uint8_t* sec_start = r.caret();
+		const uint8_t log2_bu      = r.read<uint8_t>();
+		const uint8_t sample_width = r.read<uint8_t>();
+		const uint8_t offset_width = r.read<uint8_t>();
+		r.advance(1);  // usz_width: 0 for WDL
+		r.align(8);
+		r.advance(Mono_Uint_Vec::on_disk_bytes(
+			info[c].block_cnt + 1, log2_bu, sample_width, offset_width));
+		r.align(8);
+		info[c].offset_tb_ptr = sec_start;
+		info[c].off_section_bytes = static_cast<size_t>(r.caret() - sec_start);
 	}
 
 	for (Color c : *out_table_colors)
@@ -671,7 +703,8 @@ NODISCARD size_t wdl_color_header_bytes(const Wdl_Color_Info& ci)
 {
 	if (ci.flag & SINGULAR_FLAG) return 2;
 	if (ci.flag & DROPPED_FLAG)  return 1;
-	return 20;
+	// flag(1)+tail(2)+block_size(4)+block_cnt(8)+data_size(8) = 23
+	return 23;
 }
 
 bool shrink_wdl(const std::filesystem::path& path)
@@ -718,9 +751,9 @@ bool shrink_wdl(const std::filesystem::path& path)
 
 	// Match save_wdl_table layout:
 	//   8B file header
-	//   per-color: header bytes (20/2/1)
+	//   per-color: header bytes (23/2/1)
 	//   per-color normal: 2B dict_size + dict bytes (+ 1B align if odd)
-	//   per-color normal: (2 + offset_bits)*block_cnt offset table bytes
+	//   per-color normal: delta-coded offset section (off_section_bytes)
 	//   ceil64
 	//   per-color normal: data_size bytes, each ceil64 after
 	size_t out_size = 8;
@@ -737,7 +770,7 @@ bool shrink_wdl(const std::filesystem::path& path)
 	{
 		const Wdl_Color_Info& ci = shrunk[c];
 		if (!ci.present || !flag_is_normal(ci.flag)) continue;
-		out_size += (2 + ci.offset_bits) * ci.block_cnt;
+		out_size += ci.off_section_bytes;
 	}
 	out_size = ceil_to_multiple(out_size, (size_t)64);
 	for (Color c : table_colors)
@@ -786,10 +819,9 @@ bool shrink_wdl(const std::filesystem::path& path)
 		else
 		{
 			w.write<uint8_t>(0);
-			w.write<uint8_t>(ci.offset_bits);
 			w.write<uint16_t>(ci.tail_size);
 			w.write<uint32_t>(ci.block_size);
-			w.write<uint32_t>(ci.block_cnt);
+			w.write<uint64_t>(ci.block_cnt);
 			w.write<uint64_t>(ci.data_size);
 		}
 	}
@@ -812,7 +844,7 @@ bool shrink_wdl(const std::filesystem::path& path)
 	{
 		const Wdl_Color_Info& ci = shrunk[c];
 		if (!ci.present || !flag_is_normal(ci.flag)) continue;
-		w.write(Const_Span<uint8_t>(ci.offset_tb_ptr, (2 + ci.offset_bits) * ci.block_cnt));
+		w.write(Const_Span<uint8_t>(ci.offset_tb_ptr, ci.off_section_bytes));
 	}
 
 	w.zero_align(64);

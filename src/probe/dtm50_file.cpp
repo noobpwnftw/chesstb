@@ -160,13 +160,12 @@ Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 	if (Block_Ptr cached = find_cached_block(pc.block_id, pc.data, pc.live, block_id))
 		return cached;
 
-	const uint64_t* offset = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 16);
-	const uint64_t dso = offset[0];
-	const uint64_t usz = offset[1];
-	ASSERT(usz != 0);  // read() checks the skip sentinel first
+	const auto pair = pc.offsets.get2(block_id);
+	const size_t doff = pair[0];
+	const size_t dsz  = pair[1] - pair[0];
+	const size_t usz  = pc.usizes.get(block_id);
+	ASSERT(dsz != 0);  // read() checks the skip sentinel (comp_size==0) first
 	ASSERT((usz & 3) == 0);
-	const size_t dsz  = dso & 0xFFFFFu;
-	const size_t doff = dso >> 20;
 
 	if (!pc.decomp)
 	{
@@ -250,7 +249,7 @@ void DTM50_Traits::parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
 	if (pc.entry_bytes != 1 && pc.entry_bytes != sizeof(uint16_t))
 		throw std::runtime_error("Bad DTM50 entry_bytes " + path.string());
 	pc.block_positions = reader.read<uint32_t>();
-	pc.block_cnt       = reader.read<uint32_t>();
+	pc.block_cnt       = reader.read<uint64_t>();
 	pc.tail_positions  = reader.read<uint32_t>();
 	pc.data_size       = reader.read<uint64_t>();
 
@@ -270,8 +269,24 @@ void DTM50_Traits::finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)
 	for (Color i : table_colors)
 	{
 		if (is_singular[i] || is_dropped[i]) continue;
-		per_color[i].offset_tb = reader.caret();
-		reader.advance(per_color[i].block_cnt * 16);
+		Per_Color& pc = per_color[i];
+		const uint8_t log2_bu      = reader.read<uint8_t>();
+		const uint8_t sample_width = reader.read<uint8_t>();
+		const uint8_t offset_width = reader.read<uint8_t>();
+		const uint8_t usz_width    = reader.read<uint8_t>();
+		reader.align(8);
+		const uint8_t* mono_ptr = reader.caret();
+		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
+			pc.block_cnt + 1, log2_bu, sample_width, offset_width);
+		reader.advance(mono_bytes);
+		reader.align(8);
+		const uint8_t* usz_ptr = reader.caret();
+		const size_t usz_bytes = Min0_Uint_Vec::on_disk_bytes(pc.block_cnt, usz_width);
+		reader.advance(usz_bytes);
+		reader.align(8);
+		pc.offsets = Mono_Uint_Vec(mono_ptr, pc.block_cnt + 1,
+		                           log2_bu, sample_width, offset_width);
+		pc.usizes = Min0_Uint_Vec(usz_ptr, pc.block_cnt, usz_width);
 	}
 	for (Color i : table_colors)
 	{
@@ -296,11 +311,11 @@ uint16_t DTM50_Traits::read(Per_Color& pc, bool is_singular, Board_Index pos,
 	const size_t block_id = static_cast<size_t>(pos) / ppb;
 	const size_t pos_in_block = static_cast<size_t>(pos) % ppb;
 
-	// Skip-block (usz==0): uniform DRAW. W/L would force a non-zero cell at
+	// Skip-block (comp_size==0): uniform DRAW. W/L would force a non-zero cell at
 	// some layer, and ILLEGAL is filtered by the upstream WDL guard, so wdl
 	// is DRAW/cursed/blessed here — all decode to DRAW regardless of hmc.
-	const uint64_t usz = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 16)[1];
-	if (usz == 0) return 0;
+	const auto pair_skip = pc.offsets.get2(block_id);
+	if (pair_skip[0] == pair_skip[1]) return 0;
 
 	const uint8_t* buf_data = fetch_block_cached(pc, block_id, dtm50_get_block);
 

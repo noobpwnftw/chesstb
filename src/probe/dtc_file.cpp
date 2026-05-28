@@ -23,9 +23,9 @@ Block_Ptr dtc_get_block(Lzma_Rank_Per_Color& pc, size_t block_id)
 		(block_id == pc.block_cnt - 1 && pc.tail_size != 0) ? pc.tail_size : pc.block_size;
 	const size_t positions = decode_sz / pc.entry_bytes;
 
-	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
-	const size_t dsz  = dso & 0xFFFFF;
-	const size_t doff = dso >> 20;
+	const auto pair = pc.offsets.get2(block_id);
+	const size_t doff = pair[0];
+	const size_t dsz  = pair[1] - pair[0];
 
 	const size_t slot = next_cache_slot(pc.live, pc.next_slot);
 	pc.block_id[slot] = block_id;
@@ -74,7 +74,7 @@ void DTC_Traits::parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
 		throw std::runtime_error("Bad DTC entry_bytes " + path.string());
 	pc.tail_size  = reader.read<uint32_t>();
 	pc.block_size = reader.read<uint32_t>();
-	pc.block_cnt  = reader.read<uint32_t>();
+	pc.block_cnt  = reader.read<uint64_t>();
 	pc.data_size  = reader.read<uint64_t>();
 
 	const size_t num_ranks = reader.read<uint16_t>();
@@ -93,8 +93,19 @@ void DTC_Traits::finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)[C
 	for (Color i : table_colors)
 	{
 		if (is_singular[i] || is_dropped[i]) continue;
-		per_color[i].offset_tb = reader.caret();
-		reader.advance(per_color[i].block_cnt * 8);
+		Per_Color& pc = per_color[i];
+		const uint8_t log2_bu      = reader.read<uint8_t>();
+		const uint8_t sample_width = reader.read<uint8_t>();
+		const uint8_t offset_width = reader.read<uint8_t>();
+		reader.advance(1);  // usz_width: 0 for DTC
+		reader.align(8);
+		const uint8_t* mono_ptr = reader.caret();
+		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
+			pc.block_cnt + 1, log2_bu, sample_width, offset_width);
+		reader.advance(mono_bytes);
+		reader.align(8);
+		pc.offsets = Mono_Uint_Vec(mono_ptr, pc.block_cnt + 1,
+		                           log2_bu, sample_width, offset_width);
 	}
 	for (Color i : table_colors)
 	{
@@ -125,8 +136,8 @@ uint16_t DTC_Traits::read(Per_Color& pc, bool is_singular, Board_Index pos, WDL_
 	const size_t block_id = static_cast<size_t>(pos) / positions_per_block;
 	const size_t in_block_pos = static_cast<size_t>(pos) % positions_per_block;
 
-	const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
-	if ((dso & 0xFFFFF) == 0)
+	const auto pair_skip = pc.offsets.get2(block_id);
+	if (pair_skip[0] == pair_skip[1])
 	{
 		// Skip-block: uniform DRAW/ILLEGAL. The WDL class has already
 		// filtered those out; W/L would have forced a non-zero cell.

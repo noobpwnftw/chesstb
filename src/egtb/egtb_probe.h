@@ -11,6 +11,7 @@
 #include "util/filesystem.h"
 #include "util/math.h"
 #include "util/memory.h"
+#include "util/mono_uint_vec.h"
 #include "util/param.h"
 #include "util/thread_pool.h"
 
@@ -37,7 +38,7 @@ NODISCARD inline bool tb_file_is_full_format(const std::filesystem::path& path, 
 
 	const uint32_t key_and_table_num = r.read<uint32_t>();
 	const Fixed_Vector<Color, 2> colors = egtb_table_colors(key_and_table_num & 3);
-	// DTC, DTM, and DTM50 share a 23-byte normal-flag color header plus inline
+	// DTC, DTM, and DTM50 share a 27-byte normal-flag color header plus inline
 	// rank table (field names differ but byte counts match); WDL uses the older
 	// flat header.
 	const bool egtb_table = expected_magic == EGTB_Magic::DTC_MAGIC
@@ -56,16 +57,16 @@ NODISCARD inline bool tb_file_is_full_format(const std::filesystem::path& path, 
 		}
 		else if (egtb_table)
 		{
-			if (static_cast<size_t>(s.end() - r.caret()) < 23) return false;
-			r.advance(21);
+			if (static_cast<size_t>(s.end() - r.caret()) < 27) return false;
+			r.advance(25);
 			const uint16_t num_ranks = r.read<uint16_t>();
 			if (static_cast<size_t>(s.end() - r.caret()) < num_ranks * 2u) return false;
 			r.advance(num_ranks * 2);
 		}
 		else
 		{
-			if (static_cast<size_t>(s.end() - r.caret()) < 19) return false;
-			r.advance(19);
+			if (static_cast<size_t>(s.end() - r.caret()) < 22) return false;
+			r.advance(22);
 		}
 	}
 	return true;
@@ -223,18 +224,12 @@ void load_wdl_table(
 
 struct WDL_File_For_Probe
 {
-	struct Block_Index_Entry
-	{
-		uint64_t data_offset;
-		uint32_t comp_size;
-	};
-
 	struct Per_Color
 	{
 		size_t block_size = 0;
 		size_t tail_size = 0;
 		size_t block_cnt = 0;
-		std::vector<Block_Index_Entry> index;
+		Mono_Uint_Vec offsets;          // (block_cnt + 1) cumulative offsets
 		const uint8_t* compressed_data = nullptr;
 		LZ4_Dict dict;
 	};
@@ -306,12 +301,11 @@ struct WDL_File_For_Probe
 		const size_t block_id = packed_byte / pc.block_size;
 		const size_t in_block = packed_byte % pc.block_size;
 
-		// comp_size == 0 is the save-side sentinel for an all-ILLEGAL block:
-		// save_wdl_table writes {comp_size=0, data_offset=0} and emits no
-		// payload bytes (see save_wdl_table in egtb_compress.cpp). Probing
-		// the block as LZ4 would feed a zero-byte span to the decoder and
-		// throw. Mirrors the same guard in probe.cpp's WDL read.
-		if (pc.index[block_id].comp_size == 0)
+		// Skip sentinel (comp_size == 0): get2 returns an equal pair. The
+		// save side emits no payload bytes for such blocks (see save_wdl_table);
+		// feeding a zero-byte span to LZ4 would throw.
+		const auto pair_skip = pc.offsets.get2(block_id);
+		if (pair_skip[0] == pair_skip[1])
 			return WDL_Entry::ILLEGAL;
 
 		ASSERT(thread_id < m_caches.size());
@@ -353,13 +347,15 @@ private:
 		if (!cache.decomp)
 			cache.decomp = std::make_unique<LZ4_Decompress_Helper>(pc.dict, pc.block_size);
 
-		const auto& ie = pc.index[block_id];
+		const auto pair = pc.offsets.get2(block_id);
+		const size_t doff = pair[0];
+		const size_t dsz  = pair[1] - pair[0];
 		const size_t out_sz =
 			(block_id == pc.block_cnt - 1 && pc.tail_size != 0)
 			? pc.tail_size
 			: pc.block_size;
 		const auto decompressed = cache.decomp->decompress(
-			Const_Span<uint8_t>(pc.compressed_data + ie.data_offset, ie.comp_size),
+			Const_Span<uint8_t>(pc.compressed_data + doff, dsz),
 			out_sz);
 
 		cache.data[slot].assign(decompressed.begin(), decompressed.end());
@@ -391,7 +387,7 @@ struct DTM_File_For_Probe
 		size_t block_size = 0;             // on-disk rank bytes per full block
 		size_t tail_size = 0;
 		size_t block_cnt = 0;
-		const uint8_t* offset_tb = nullptr;
+		Mono_Uint_Vec offsets;             // (block_cnt + 1) cumulative offsets
 		const uint8_t* compressed_data = nullptr;
 		std::vector<uint16_t> rank_to_value;  // rank -> raw storage value
 	};
@@ -483,9 +479,9 @@ struct DTM_File_For_Probe
 		const size_t block_id    = static_cast<size_t>(pos) / positions_per_block;
 		const size_t in_block_pos = static_cast<size_t>(pos) % positions_per_block;
 
-		// dsz == 0 marks an all-ILLEGAL block (paired with offset == 0 on disk).
-		const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
-		if ((dso & 0xFFFFF) == 0)
+		// Skip-block sentinel (comp_size == 0): equal consecutive offsets.
+		const auto pair_skip = pc.offsets.get2(block_id);
+		if (pair_skip[0] == pair_skip[1])
 			return DTM_Final_Entry::make_illegal();
 
 		ASSERT(thread_id < m_caches.size());
@@ -529,9 +525,9 @@ private:
 			(block_id == pc.block_cnt - 1 && pc.tail_size != 0) ? pc.tail_size : pc.block_size;
 		const size_t positions = decode_sz / pc.entry_bytes;
 
-		const uint64_t dso = reinterpret_cast<const uint64_t*>(pc.offset_tb + block_id * 8)[0];
-		const size_t dsz  = dso & 0xFFFFF;
-		const size_t doff = dso >> 20;
+		const auto pair = pc.offsets.get2(block_id);
+		const size_t doff = pair[0];
+		const size_t dsz  = pair[1] - pair[0];
 
 		auto& buf = cache.data[slot];
 		buf.assign(positions * sizeof(uint16_t), 0);

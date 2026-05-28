@@ -10,6 +10,7 @@
 #include "util/compress.h"
 #include "util/filesystem.h"
 #include "util/memory.h"
+#include "util/mono_uint_vec.h"
 
 #include <array>
 #include <cstdint>
@@ -28,28 +29,20 @@ constexpr uint8_t SINGULAR_FLAG = 0x80;
 constexpr uint8_t DROPPED_FLAG  = 0x40;
 constexpr uint64_t TABLE_CHECKSUM_INIT = 0xf0f0f0f0f0f0;
 
-struct WDL_Block_Index_Entry
-{
-	uint64_t data_offset;
-	uint32_t comp_size;
-};
-
 struct WDL_Per_Color : Block_Cache<LZ4_Decompress_Helper>
 {
 	size_t block_size = 0;
 	size_t tail_size = 0;
 	size_t block_cnt = 0;
-	std::vector<WDL_Block_Index_Entry> index;
+	Mono_Uint_Vec offsets;   // (block_cnt + 1) cumulative compressed offsets
 	const uint8_t* compressed_data = nullptr;
 	LZ4_Dict dict;
 	WDL_Entry single_val = WDL_Entry::DRAW;
 
 	// load scratch
-	size_t offset_bits = 0;
 	size_t dict_size = 0;
 	size_t data_size = 0;
 	const uint8_t* lp_dict = nullptr;
-	const uint8_t* offset_tb = nullptr;
 };
 
 struct Lzma_Rank_Per_Color : Block_Cache<LZMA_Decompress_Helper>
@@ -58,7 +51,7 @@ struct Lzma_Rank_Per_Color : Block_Cache<LZMA_Decompress_Helper>
 	size_t block_size = 0;
 	size_t tail_size = 0;
 	size_t block_cnt = 0;
-	const uint8_t* offset_tb = nullptr;
+	Mono_Uint_Vec offsets;   // (block_cnt + 1) cumulative compressed offsets
 	const uint8_t* compressed_data = nullptr;
 	std::vector<uint16_t> rank_to_value;
 
@@ -71,7 +64,8 @@ struct DTM50_Per_Color : Block_Cache<LZMA_Decompress_Helper>
 	size_t block_positions = 0;
 	size_t tail_positions = 0;
 	size_t block_cnt = 0;
-	const uint8_t* offset_tb = nullptr;
+	Mono_Uint_Vec offsets;   // (block_cnt + 1) cumulative compressed offsets
+	Min0_Uint_Vec usizes;    // block_cnt uncompressed-payload sizes
 	const uint8_t* compressed_data = nullptr;
 	std::vector<uint16_t> rank_to_value;
 
