@@ -964,6 +964,7 @@ void DTC_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths&
 
 		}
 	}
+	remove_checkpoint(ckpt_path);
 	const auto t_total_end = std::chrono::steady_clock::now();
 	std::printf("  gen (init + build): done in %s (%zu pawn-slice pairs in %zu batches, %zu fusion groups)\n",
 		format_elapsed_time(t_total_start, t_total_end).c_str(),
@@ -1325,6 +1326,9 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 		dtc_save[me] = save_compress_egtb(
 			thread_pool, src, me, m_info, dtc_entry_bytes[me], DTC_BLOCK_SIZE, max_workers,
 			chosen);
+		cache.purge(me);
+		m_table->m_dtc[me].remove_disk_files();
+		m_table->m_dtc[me].close();
 	}
 
 	save_wdl_table(m_epsi, wdl_save, paths.wdl_save_path(m_epsi), colors, EGTB_Magic::WDL_MAGIC);
@@ -1332,10 +1336,6 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 
 	std::ofstream fp(paths.dtc_info_save_path(m_epsi), std::ios::binary | std::ios::trunc);
 	fp.write(reinterpret_cast<const char*>(&m_info), sizeof(EGTB_Info));
-
-	remove_checkpoint(paths.dtc_checkpoint_path(m_epsi));
-	m_table->m_dtc[WHITE].remove_disk_files();
-	m_table->m_dtc[BLACK].remove_disk_files();
 
 	const auto t_save_end = std::chrono::steady_clock::now();
 	std::printf("  save_to_disk: done in %s\n",

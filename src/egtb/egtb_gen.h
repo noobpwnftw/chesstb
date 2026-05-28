@@ -733,6 +733,16 @@ struct Save_Group_Cache
 		pin_count[{ table_idx, g }]--;
 	}
 
+	void purge(size_t table_idx)
+	{
+		std::lock_guard<std::mutex> lk(mu);
+		for (auto it = fifo.begin(); it != fifo.end(); )
+			it = (it->first == table_idx) ? fifo.erase(it) : std::next(it);
+		for (auto it = pin_count.begin(); it != pin_count.end(); )
+			it = (it->first.first == table_idx) ? pin_count.erase(it) : std::next(it);
+		tables[table_idx] = nullptr;
+	}
+
 private:
 	void init_resident()
 	{

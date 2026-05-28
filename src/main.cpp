@@ -395,15 +395,9 @@ int main(int argc, char** argv)
 
 				auto subs = EGTB_Generator::open_sub_probes<WDL_File_For_Probe>(ps, paths, inout_param(pool));
 				DTC_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
-				try
-				{
-					g.gen(inout_param(pool), paths);
-					g.save_to_disk(inout_param(pool), paths);
-				}
-				catch (const DTC_Interrupted&)
-				{
-					return 130;
-				}
+				try { g.gen(inout_param(pool), paths); }
+				catch (const DTC_Interrupted&) { return 130; }
+				g.save_to_disk(inout_param(pool), paths);
 
 				const auto t_end = std::chrono::steady_clock::now();
 				std::cout << "  " << ps.name() << " DTC done in " << format_elapsed_time(t_start, t_end)
@@ -423,15 +417,9 @@ int main(int argc, char** argv)
 
 				auto subs = EGTB_Generator::open_sub_probes<DTM_Sub_File_Flat>(ps, paths, inout_param(pool));
 				DTM_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
-				try
-				{
-					g.gen(inout_param(pool), paths);
-					g.save_to_disk(inout_param(pool), paths);
-				}
-				catch (const DTM_Interrupted&)
-				{
-					return 130;
-				}
+				try { g.gen(inout_param(pool), paths); }
+				catch (const DTM_Interrupted&) { return 130; }
+				g.save_to_disk(inout_param(pool), paths);
 
 				const auto t_end = std::chrono::steady_clock::now();
 				std::cout << "  " << ps.name() << " DTM done in " << format_elapsed_time(t_start, t_end)
@@ -446,15 +434,9 @@ int main(int argc, char** argv)
 
 				auto subs = EGTB_Generator::open_sub_probes<DTM50_Sub_File_Flat>(ps, paths, inout_param(pool));
 				DTM50_Generator g(ps, subs, opt.tmp_dir, budget_bytes);
-				try
-				{
-					g.gen(inout_param(pool), paths);
-					g.save_to_disk(inout_param(pool), paths);
-				}
-				catch (const DTM50_Interrupted&)
-				{
-					return 130;
-				}
+				try { g.gen(inout_param(pool), paths); }
+				catch (const DTM50_Interrupted&) { return 130; }
+				g.save_to_disk(inout_param(pool), paths);
 
 				const auto t_end = std::chrono::steady_clock::now();
 				std::cout << "  " << ps.name() << " DTM50 done in " << format_elapsed_time(t_start, t_end)

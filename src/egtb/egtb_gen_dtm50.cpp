@@ -596,6 +596,7 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 		}
 	}
 
+	remove_checkpoint(ckpt_path);
 	const auto t_total_end = std::chrono::steady_clock::now();
 	std::printf("  gen (%u hmc layers): done in %s (%zu pawn-slice pairs in %zu batches, %zu fusion groups)\n",
 		DTM50_HMC_COUNT,
@@ -1289,12 +1290,20 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 		{
 			color_out[me].is_singular = true;
 			color_out[me].singular_wdl = WDL_Entry::DRAW;
-			continue;
+		}
+		else
+		{
+			save_compress_dtm50(
+				thread_pool, *m_table, cache, me, num_positions, positions_per_group,
+				RS_BLOCK_POSITIONS, max_workers, color_out[me]);
 		}
 
-		save_compress_dtm50(
-			thread_pool, *m_table, cache, me, num_positions, positions_per_group,
-			RS_BLOCK_POSITIONS, max_workers, color_out[me]);
+		for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
+		{
+			cache.purge(dtm50_table_idx_of(me, static_cast<int>(h)));
+			m_table->m_dtm[me][h].remove_disk_files();
+			m_table->m_dtm[me][h].close();
+		}
 	}
 
 	const auto out_path = paths.dtm50_save_path(m_epsi);
@@ -1311,16 +1320,6 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 	std::ofstream fp(paths.dtm50_info_save_path(m_epsi),
 		std::ios::binary | std::ios::trunc);
 	fp.write(reinterpret_cast<const char*>(&m_info), sizeof(EGTB_Info));
-
-	for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
-	{
-		m_table->m_dtm[WHITE][h].remove_disk_files();
-		m_table->m_dtm[BLACK][h].remove_disk_files();
-		m_table->m_dtm[WHITE][h].close();
-		m_table->m_dtm[BLACK][h].close();
-	}
-
-	remove_checkpoint(paths.dtm50_checkpoint_path(m_epsi));
 
 	const auto t_save_end = std::chrono::steady_clock::now();
 	std::printf("  save_to_disk: done in %s\n",

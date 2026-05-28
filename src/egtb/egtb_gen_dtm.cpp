@@ -967,6 +967,7 @@ void DTM_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths&
 		}
 	}
 
+	remove_checkpoint(ckpt_path);
 	const auto t_total_end = std::chrono::steady_clock::now();
 	std::printf("  gen (init + build): done in %s (%zu pawn-slice pairs in %zu batches, %zu fusion groups)\n",
 		format_elapsed_time(t_total_start, t_total_end).c_str(),
@@ -1164,21 +1165,22 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 
 	for (Color me : colors)
 	{
-		if (dtm_save[me].is_singular()) continue;
-		Block_Source src = make_entry_block_source(m_table->m_dtm[me], cache, me, DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
-		dtm_save[me] = save_compress_egtb(
-			thread_pool, src, me, m_info, dtm_entry_bytes[me], DTM_BLOCK_SIZE, max_workers,
-			dtm_rank[me], &dtm_storage_fn);
+		if (!dtm_save[me].is_singular())
+		{
+			Block_Source src = make_entry_block_source(m_table->m_dtm[me], cache, me, DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
+			dtm_save[me] = save_compress_egtb(
+				thread_pool, src, me, m_info, dtm_entry_bytes[me], DTM_BLOCK_SIZE, max_workers,
+				dtm_rank[me], &dtm_storage_fn);
+		}
+		cache.purge(me);
+		m_table->m_dtm[me].remove_disk_files();
+		m_table->m_dtm[me].close();
 	}
 
 	save_egtb_table(m_epsi, dtm_save, paths.dtm_save_path(m_epsi), colors, EGTB_Magic::DTM_MAGIC);
 
 	std::ofstream fp(paths.dtm_info_save_path(m_epsi), std::ios::binary | std::ios::trunc);
 	fp.write(reinterpret_cast<const char*>(&m_info), sizeof(EGTB_Info));
-
-	remove_checkpoint(paths.dtm_checkpoint_path(m_epsi));
-	m_table->m_dtm[WHITE].remove_disk_files();
-	m_table->m_dtm[BLACK].remove_disk_files();
 
 	const auto t_save_end = std::chrono::steady_clock::now();
 	std::printf("  save_to_disk: done in %s\n",
