@@ -455,22 +455,15 @@ NODISCARD constexpr uint16_t dtm_value_for_storage(DTM_Final_Entry e)
 // See dtc_entry_from_storage above for the DRAW-is-companion-authoritative rule.
 NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_Entry w)
 {
-	DTM_Final_Entry e;
 	switch (w)
 	{
-		case WDL_Entry::ILLEGAL:
-			return DTM_Final_Entry::make_illegal();
+		case WDL_Entry::ILLEGAL:      return DTM_Final_Entry::make_illegal();
 		case WDL_Entry::WIN:
-		case WDL_Entry::CURSED_WIN:
-			e.set_score_win(static_cast<uint16_t>((stored << 1) | 1u));
-			return e;
+		case WDL_Entry::CURSED_WIN:   return DTM_Final_Entry::make_win(static_cast<uint16_t>((stored << 1) | 1u));
 		case WDL_Entry::LOSE:
-		case WDL_Entry::BLESSED_LOSS:
-			e.set_score_loss(static_cast<uint16_t>(stored << 1));
-			return e;
+		case WDL_Entry::BLESSED_LOSS: return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
 		case WDL_Entry::DRAW:
-		default:
-			return DTM_Final_Entry::make_draw();
+		default:                      return DTM_Final_Entry::make_draw();
 	}
 }
 
@@ -478,22 +471,15 @@ NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_
 // strict-WIN in flat-DTM and DRAW in DTM50 at the reset window).
 NODISCARD constexpr DTM_Final_Entry dtm50_entry_from_storage(uint16_t stored, WDL_Entry w)
 {
-	DTM_Final_Entry e;
 	switch (w)
 	{
-		case WDL_Entry::ILLEGAL:
-			return DTM_Final_Entry::make_illegal();
-		case WDL_Entry::WIN:
-			e.set_score_win(static_cast<uint16_t>((stored << 1) | 1u));
-			return e;
-		case WDL_Entry::LOSE:
-			e.set_score_loss(static_cast<uint16_t>(stored << 1));
-			return e;
+		case WDL_Entry::ILLEGAL: return DTM_Final_Entry::make_illegal();
+		case WDL_Entry::WIN:     return DTM_Final_Entry::make_win(static_cast<uint16_t>((stored << 1) | 1u));
+		case WDL_Entry::LOSE:    return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
 		case WDL_Entry::CURSED_WIN:
 		case WDL_Entry::BLESSED_LOSS:
 		case WDL_Entry::DRAW:
-		default:
-			return DTM_Final_Entry::make_draw();
+		default:                 return DTM_Final_Entry::make_draw();
 	}
 }
 
@@ -504,20 +490,14 @@ NODISCARD constexpr DTM_Final_Entry dtm50_layered_entry_from_storage(uint16_t st
 {
 	if (w == WDL_Entry::ILLEGAL) return DTM_Final_Entry::make_illegal();
 	if (stored == 0)             return DTM_Final_Entry::make_draw();
-	DTM_Final_Entry e;
 	switch (w)
 	{
-		case WDL_Entry::WIN:
-			e.set_score_win(static_cast<uint16_t>((stored << 1) | 1u));
-			return e;
-		case WDL_Entry::LOSE:
-			e.set_score_loss(static_cast<uint16_t>(stored << 1));
-			return e;
+		case WDL_Entry::WIN:  return DTM_Final_Entry::make_win(static_cast<uint16_t>((stored << 1) | 1u));
+		case WDL_Entry::LOSE: return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
 		case WDL_Entry::CURSED_WIN:
 		case WDL_Entry::BLESSED_LOSS:
 		case WDL_Entry::DRAW:
-		default:
-			return DTM_Final_Entry::make_draw();
+		default:              return DTM_Final_Entry::make_draw();
 	}
 }
 
