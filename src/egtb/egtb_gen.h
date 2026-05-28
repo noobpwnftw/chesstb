@@ -475,6 +475,15 @@ struct Sliced_EGTB_File_For_Gen
 		return m_groups[g].data() + in_g * m_within;
 	}
 
+	// Zero-copy typed view over a slice's bytes — caller iterates as T directly.
+	template <typename T = MainEntryT>
+	NODISCARD const T* slice_view_as(size_t s) const
+	{
+		static_assert(sizeof(T) == sizeof(Underlying_Entry_Type));
+		static_assert(std::is_same_v<T, MainEntryT> || (std::is_same_v<T, OtherEntryTs> || ...));
+		return reinterpret_cast<const T*>(slice_data(s));
+	}
+
 	NODISCARD Underlying_Entry_Type* slice_data(size_t s)
 	{
 		const size_t g = group_id_of(s);
@@ -514,6 +523,18 @@ struct Sliced_EGTB_File_For_Gen
 		const auto [s, off] = split(p);
 		std::memcpy(&e, slice_data(s) + off, sizeof(T));
 		return e;
+	}
+
+	// Zero-copy typed view at a Board_Index. Caller must keep the slice resident.
+	template <typename T = MainEntryT>
+	NODISCARD const T& view_at(Board_Index pos) const
+	{
+		static_assert(sizeof(T) == sizeof(Underlying_Entry_Type));
+		static_assert(std::is_same_v<T, MainEntryT> || (std::is_same_v<T, OtherEntryTs> || ...));
+		const size_t p = static_cast<size_t>(pos);
+		ASSERT(p < num_entries());
+		const auto [s, off] = split(p);
+		return *reinterpret_cast<const T*>(slice_data(s) + off);
 	}
 
 	template <typename T>

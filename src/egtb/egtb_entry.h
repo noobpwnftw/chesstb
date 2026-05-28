@@ -144,6 +144,7 @@ struct DTC_Entry_Base
 
 	// Huge_Array's For_Overwrite_Tag path uses `new T`; this ctor must zero m_data.
 	constexpr DTC_Entry_Base() : m_data(0) {}
+	constexpr explicit DTC_Entry_Base(uint16_t bits) : m_data(bits) {}
 
 	NODISCARD constexpr bool is_legal()   const { return (m_data & VALUE_MASK) != ILLEGAL_VAL; }
 	NODISCARD constexpr bool is_illegal() const { return !is_legal(); }
@@ -175,19 +176,8 @@ struct DTC_Intermediate_Entry : DTC_Entry_Base
 
 	constexpr DTC_Intermediate_Entry() : DTC_Entry_Base{} {}
 
-	NODISCARD static constexpr DTC_Intermediate_Entry make_cap_cwin()
-	{
-		DTC_Intermediate_Entry e;
-		e.m_data = DTC_FLAG_CAP_CWIN;
-		return e;
-	}
-
-	NODISCARD static constexpr DTC_Intermediate_Entry make_cap_closs()
-	{
-		DTC_Intermediate_Entry e;
-		e.m_data = DTC_FLAG_CAP_CLOSS;
-		return e;
-	}
+	NODISCARD static constexpr DTC_Intermediate_Entry make_cap_cwin()  { return DTC_Intermediate_Entry{DTC_FLAG_CAP_CWIN}; }
+	NODISCARD static constexpr DTC_Intermediate_Entry make_cap_closs() { return DTC_Intermediate_Entry{DTC_FLAG_CAP_CLOSS}; }
 
 	NODISCARD constexpr bool is_draw() const
 	{
@@ -203,6 +193,9 @@ struct DTC_Intermediate_Entry : DTC_Entry_Base
 	constexpr void clear_flag(DTC_Intermediate_Entry_Flag f) { m_data &= ~f; }
 	using DTC_Entry_Base::set_flag;
 	using DTC_Entry_Base::clear_flag;
+
+private:
+	constexpr explicit DTC_Intermediate_Entry(uint16_t bits) : DTC_Entry_Base{bits} {}
 };
 static_assert(sizeof(DTC_Intermediate_Entry) == 2);
 
@@ -217,38 +210,24 @@ struct DTC_Final_Entry : DTC_Entry_Base
 
 	constexpr DTC_Final_Entry() : DTC_Entry_Base{} {}
 
-	NODISCARD static constexpr DTC_Final_Entry make_illegal()
-	{
-		DTC_Final_Entry e; e.m_data = ILLEGAL_VAL; return e;
-	}
-
-	NODISCARD static constexpr DTC_Final_Entry make_draw() { return {}; }
-
+	NODISCARD static constexpr DTC_Final_Entry make_illegal()           { return DTC_Final_Entry{ILLEGAL_VAL}; }
+	NODISCARD static constexpr DTC_Final_Entry make_draw()              { return {}; }
 	NODISCARD static constexpr DTC_Final_Entry make_score(DTC_Score v)
 	{
 		ASSERT(static_cast<uint16_t>(v) <= DTC_SCORE_MAX);
-		DTC_Final_Entry e;
-		e.m_data = static_cast<uint16_t>(v);
-		return e;
+		return DTC_Final_Entry{static_cast<uint16_t>(v)};
 	}
+	NODISCARD static constexpr DTC_Final_Entry make_win(uint16_t dtz)   { return DTC_Final_Entry{static_cast<uint16_t>(dtz | DTC_FLAG_WIN)}; }
+	NODISCARD static constexpr DTC_Final_Entry make_loss(uint16_t dtz)  { return DTC_Final_Entry{static_cast<uint16_t>(dtz | DTC_FLAG_LOSS)}; }
 
-	NODISCARD static constexpr DTC_Final_Entry make_win(uint16_t dtz)
-	{
-		DTC_Final_Entry e; e.set_score_win(dtz); return e;
-	}
-
-	NODISCARD static constexpr DTC_Final_Entry make_loss(uint16_t dtz)
-	{
-		DTC_Final_Entry e; e.set_score_loss(dtz); return e;
-	}
+	// Construct from raw storage bits (for direct slice scans).
+	NODISCARD static constexpr DTC_Final_Entry from_storage(uint16_t bits) { return DTC_Final_Entry{bits}; }
 
 	// Project rule bits (CAP_*) from an Intermediate into a fresh Final, so
 	// subsequent set_score_* preserves them when classifying.
 	NODISCARD static constexpr DTC_Final_Entry copy_rule(DTC_Intermediate_Entry intermediate)
 	{
-		DTC_Final_Entry e;
-		e.m_data = intermediate.m_data & RULE_MASK;
-		return e;
+		return DTC_Final_Entry{static_cast<uint16_t>(intermediate.m_data & RULE_MASK)};
 	}
 
 	// Mutators set classification + DTZ value, preserving CAP_* rule bits.
@@ -279,9 +258,7 @@ struct DTC_Final_Entry : DTC_Entry_Base
 
 	NODISCARD constexpr DTC_Final_Entry score_only() const
 	{
-		DTC_Final_Entry r;
-		r.m_data = m_data & VALUE_MASK;
-		return r;
+		return DTC_Final_Entry{static_cast<uint16_t>(m_data & VALUE_MASK)};
 	}
 
 	NODISCARD constexpr WDL_Entry wdl() const
@@ -299,6 +276,9 @@ struct DTC_Final_Entry : DTC_Entry_Base
 		}
 		return WDL_Entry::DRAW;
 	}
+
+private:
+	constexpr explicit DTC_Final_Entry(uint16_t bits) : DTC_Entry_Base{bits} {}
 };
 static_assert(sizeof(DTC_Final_Entry) == 2);
 
@@ -363,6 +343,7 @@ struct DTM_Entry_Base
 
 	// Huge_Array's For_Overwrite_Tag path uses `new T`; this ctor must zero m_data.
 	constexpr DTM_Entry_Base() : m_data(0) {}
+	constexpr explicit DTM_Entry_Base(uint16_t bits) : m_data(bits) {}
 
 	NODISCARD constexpr bool is_legal()   const { return (m_data & VALUE_MASK) != ILLEGAL_VAL; }
 	NODISCARD constexpr bool is_illegal() const { return !is_legal(); }
@@ -383,12 +364,7 @@ struct DTM_Intermediate_Entry : DTM_Entry_Base
 
 	constexpr DTM_Intermediate_Entry() : DTM_Entry_Base{} {}
 
-	NODISCARD static constexpr DTM_Intermediate_Entry make_pawn_eval()
-	{
-		DTM_Intermediate_Entry e;
-		e.m_data = DTM_FLAG_PAWN_EVAL;
-		return e;
-	}
+	NODISCARD static constexpr DTM_Intermediate_Entry make_pawn_eval() { return DTM_Intermediate_Entry{DTM_FLAG_PAWN_EVAL}; }
 
 	NODISCARD constexpr bool is_draw() const
 	{
@@ -402,6 +378,9 @@ struct DTM_Intermediate_Entry : DTM_Entry_Base
 
 	constexpr void set_flag(DTM_Intermediate_Entry_Flag f)   { m_data |= f; }
 	constexpr void clear_flag(DTM_Intermediate_Entry_Flag f) { m_data &= ~f; }
+
+private:
+	constexpr explicit DTM_Intermediate_Entry(uint16_t bits) : DTM_Entry_Base{bits} {}
 };
 static_assert(sizeof(DTM_Intermediate_Entry) == 2);
 
@@ -414,22 +393,13 @@ struct DTM_Final_Entry : DTM_Entry_Base
 
 	constexpr DTM_Final_Entry() : DTM_Entry_Base{} {}
 
-	NODISCARD static constexpr DTM_Final_Entry make_illegal()
-	{
-		DTM_Final_Entry e; e.m_data = ILLEGAL_VAL; return e;
-	}
+	NODISCARD static constexpr DTM_Final_Entry make_illegal()         { return DTM_Final_Entry{ILLEGAL_VAL}; }
+	NODISCARD static constexpr DTM_Final_Entry make_draw()            { return {}; }
+	NODISCARD static constexpr DTM_Final_Entry make_win(uint16_t v)   { return DTM_Final_Entry{static_cast<uint16_t>(v | DTM_FLAG_WIN)}; }
+	NODISCARD static constexpr DTM_Final_Entry make_loss(uint16_t v)  { return DTM_Final_Entry{static_cast<uint16_t>(v | DTM_FLAG_LOSS)}; }
 
-	NODISCARD static constexpr DTM_Final_Entry make_draw() { return {}; }
-
-	NODISCARD static constexpr DTM_Final_Entry make_win(uint16_t v)
-	{
-		DTM_Final_Entry e; e.set_score_win(v); return e;
-	}
-
-	NODISCARD static constexpr DTM_Final_Entry make_loss(uint16_t v)
-	{
-		DTM_Final_Entry e; e.set_score_loss(v); return e;
-	}
+	// Construct from raw storage bits (for direct slice scans).
+	NODISCARD static constexpr DTM_Final_Entry from_storage(uint16_t bits) { return DTM_Final_Entry{bits}; }
 
 	// Mutators set classification + ply value. DTM has no rule bits.
 	constexpr void set_score_win(uint16_t v)
@@ -464,6 +434,9 @@ struct DTM_Final_Entry : DTM_Entry_Base
 		if (is_loss())    return WDL_Entry::LOSE;
 		return WDL_Entry::DRAW;
 	}
+
+private:
+	constexpr explicit DTM_Final_Entry(uint16_t bits) : DTM_Entry_Base{bits} {}
 };
 static_assert(sizeof(DTM_Final_Entry) == 2);
 

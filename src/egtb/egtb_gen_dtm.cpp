@@ -1020,7 +1020,7 @@ NODISCARD DTM_Singular_Probe_Result dtm_singular_probe(
 			const size_t base = s * within;
 			if (base >= num_positions) break;
 			const size_t end_in_slice = std::min(within, num_positions - base);
-			const auto* const raw = src.slice_data(s);
+			const auto* const raw = src.template slice_view_as<DTM_Final_Entry>(s);
 			if (!didx_init)
 			{
 				epsi.decompose_board_index(static_cast<Board_Index>(base), out_param(didx));
@@ -1028,8 +1028,7 @@ NODISCARD DTM_Singular_Probe_Result dtm_singular_probe(
 			}
 			for (size_t i = 0; i < end_in_slice; ++i)
 			{
-				DTM_Final_Entry e;
-				std::memcpy(&e, &raw[i], sizeof(e));
+				const auto& e = raw[i];
 				const uint64_t w = epsi.orbit_weight(didx);
 				switch (e.wdl())
 				{
@@ -1084,7 +1083,7 @@ void gather_dtm_info(
 			}
 			for (size_t idx = base; idx < end; ++idx)
 			{
-				const DTM_Final_Entry e = src.template read<DTM_Final_Entry>(static_cast<Board_Index>(idx));
+				const auto& e = src.template view_at<DTM_Final_Entry>(static_cast<Board_Index>(idx));
 				const uint64_t w = epsi.orbit_weight(didx);
 				info.add_result(color, e.wdl(), w);
 				if (e.is_win())
