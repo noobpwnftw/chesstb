@@ -17,15 +17,17 @@
 #include <set>
 
 // One class per piece type per color.
-// Unlike xiangqi's DEFENDERS, chess does not merge classes — KINGS stands alone
-// as the natural anchor for symmetry canonicalization.
+// Order within a color is K, N, B, R, Q, P — kings first / pawns last (both
+// handled by dedicated slice managers), middle in ascending material so the
+// innermost index dimension is the lowest-impact piece. Adjacent linear-index
+// entries then often share EGTB values, lengthening runs for the block compressor.
 enum Piece_Type_Class : int8_t {
-	KINGS, QUEENS, ROOKS, BISHOPS, KNIGHTS, PAWNS, PIECE_TYPE_CLASS_NB = 6
+	KINGS, KNIGHTS, BISHOPS, ROOKS, QUEENS, PAWNS, PIECE_TYPE_CLASS_NB = 6
 };
 
 enum Piece_Class : int8_t {
-	WHITE_KINGS, WHITE_QUEENS, WHITE_ROOKS, WHITE_BISHOPS, WHITE_KNIGHTS, WHITE_PAWNS,
-	BLACK_KINGS, BLACK_QUEENS, BLACK_ROOKS, BLACK_BISHOPS, BLACK_KNIGHTS, BLACK_PAWNS,
+	WHITE_KINGS, WHITE_KNIGHTS, WHITE_BISHOPS, WHITE_ROOKS, WHITE_QUEENS, WHITE_PAWNS,
+	BLACK_KINGS, BLACK_KNIGHTS, BLACK_BISHOPS, BLACK_ROOKS, BLACK_QUEENS, BLACK_PAWNS,
 	PIECE_CLASS_START = 0, PIECE_CLASS_END = 12, PIECE_CLASS_NONE = -1, PIECE_CLASS_NB = 12
 };
 
