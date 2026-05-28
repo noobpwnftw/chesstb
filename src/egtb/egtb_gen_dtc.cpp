@@ -1308,6 +1308,10 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 		}
 	}
 
+	save_wdl_table(m_epsi, wdl_save, paths.wdl_save_path(m_epsi), colors, EGTB_Magic::WDL_MAGIC);
+
+	for (Color me : colors) wdl_save[me] = {};
+
 	Value_Rank_Table dtc_rank_1b[COLOR_NB];
 	Value_Rank_Table dtc_rank_2b[COLOR_NB];
 	size_t dtc_entry_bytes[COLOR_NB]{};
@@ -1331,7 +1335,6 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 		m_table->m_dtc[me].close();
 	}
 
-	save_wdl_table(m_epsi, wdl_save, paths.wdl_save_path(m_epsi), colors, EGTB_Magic::WDL_MAGIC);
 	save_egtb_table(m_epsi, dtc_save, paths.dtc_save_path(m_epsi), colors, EGTB_Magic::DTC_MAGIC);
 
 	std::ofstream fp(paths.dtc_info_save_path(m_epsi), std::ios::binary | std::ios::trunc);
