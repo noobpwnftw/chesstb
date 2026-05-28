@@ -84,7 +84,7 @@ private:
 	uint16_t m_max_dtm = 0;
 
 	template <typename EntryT = DTM_Final_Entry>
-	NODISCARD INLINE const EntryT& read_dtm(Board_Index pos, Color stm) const
+	NODISCARD INLINE EntryT read_dtm(Board_Index pos, Color stm) const
 	{
 		return m_table->m_dtm[stm].template view_at<EntryT>(pos);
 	}

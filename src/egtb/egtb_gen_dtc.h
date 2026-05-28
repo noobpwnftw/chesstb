@@ -73,7 +73,7 @@ private:
 	const WDL_File_For_Probe* m_sub_wdl_by_move[COLOR_NB][PIECE_NB][PIECE_TYPE_NB]{};
 
 	template <typename EntryT = DTC_Final_Entry>
-	NODISCARD INLINE const EntryT& read_dtc(Board_Index pos, Color stm) const
+	NODISCARD INLINE EntryT read_dtc(Board_Index pos, Color stm) const
 	{
 		return m_table->m_dtc[stm].template view_at<EntryT>(pos);
 	}

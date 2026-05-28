@@ -89,7 +89,7 @@ private:
 	std::map<Material_Key, std::shared_ptr<DTM50_Sub_File_Flat>> m_sub_dtm;
 	const DTM50_Sub_File_Flat* m_sub_dtm_by_move[COLOR_NB][PIECE_NB][PIECE_TYPE_NB]{};
 
-	NODISCARD INLINE const DTM_Final_Entry& read_dtm(Board_Index pos, Color stm, uint16_t hmc) const
+	NODISCARD INLINE DTM_Final_Entry read_dtm(Board_Index pos, Color stm, uint16_t hmc) const
 	{
 		return m_table->m_dtm[stm][hmc].template view_at<DTM_Final_Entry>(pos);
 	}
