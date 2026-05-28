@@ -100,7 +100,16 @@ constexpr void set_wdl_entry(Packed_WDL_Entries& packed, size_t pos, WDL_Entry v
 		(packed & PACKED_WDL_ENTRY_INV_MASK[pos]) | (static_cast<uint8_t>(v) << (pos * WDL_ENTRY_BITS)));
 }
 
-// DTC value = plies to next zeroing; class lives in flag bits.
+// =============================================================================
+// DTC (50MR-aware). value = plies to next zeroing; class lives in flag bits.
+// Final and Intermediate share 16-bit storage via DTC_Entry_Base. CAP_* bits
+// sit on the base: on Final WIN/LOSS they mark cursed-class, on Intermediate
+// draws they're cursed-route routing hints. CHANGE (Intermediate only) marks
+// a cell as reverify-pending; set via atomic OR (lock_add_flags) so a racing
+// retro_mark_wins Final write keeps its classification bits and the CHANGE
+// bit lands on top harmlessly (Final dispatch ignores it). Doing this
+// otherwise likely costs more than the atomics.
+// =============================================================================
 
 enum DTC_Score : uint16_t {
 	DTC_SCORE_ZERO = 0,
@@ -110,44 +119,110 @@ enum DTC_Score : uint16_t {
 ENUM_ENABLE_OPERATOR_INC(DTC_Score);
 ENUM_ENABLE_OPERATOR_ADD(DTC_Score);
 
-// Final and Intermediate share 16-bit storage.
-//   WIN/LOSS:        classified; value = DTZ.
-//   CAP_CWIN/CLOSS:  cursed-winning / cursed-losing zeroing class hint.
-//   CHANGE:          reverify-pending on Intermediates. Atomic OR via lock_add_flags;
-//                    cleared when write_dtc overwrites with a Final.
-enum DTC_Intermediate_Entry_Flag : uint16_t {
-	DTC_FLAG_WIN       = 0x0800u,
-	DTC_FLAG_LOSS      = 0x1000u,
-	DTC_FLAG_CAP_CWIN  = 0x2000u,
-	DTC_FLAG_CAP_CLOSS = 0x4000u,
-	DTC_FLAG_CHANGE    = 0x8000u,
+enum DTC_Final_Entry_Flag : uint16_t {
+	DTC_FLAG_WIN  = 0x0800u,
+	DTC_FLAG_LOSS = 0x1000u,
 };
 
-struct DTC_Intermediate_Entry;
+enum DTC_Rule_Flag : uint16_t {
+	DTC_FLAG_CAP_CWIN  = 0x2000u,
+	DTC_FLAG_CAP_CLOSS = 0x4000u,
+};
 
-struct DTC_Final_Entry
+enum DTC_Intermediate_Entry_Flag : uint16_t {
+	DTC_FLAG_CHANGE = 0x8000u,
+};
+
+struct DTC_Entry_Base
 {
-	friend struct DTC_Intermediate_Entry;
+	static constexpr uint16_t VALUE_MASK  = 0x07FFu;
+	static constexpr uint16_t ILLEGAL_VAL = VALUE_MASK;
+	static constexpr uint16_t RULE_MASK   = DTC_FLAG_CAP_CWIN | DTC_FLAG_CAP_CLOSS;
 
-	static constexpr uint16_t VALUE_MASK = 0x07FFu;
-	static constexpr uint16_t ILLEGAL_VAL = VALUE_MASK;  // = 0x07FF in the score field
-
-	// lock_add_flags accepts Intermediate flags on Final-typed storage (CHANGE OR during iterate).
 	template <typename FlagT>
-	static constexpr bool is_allowed_flag_type = std::is_same_v<FlagT, DTC_Intermediate_Entry_Flag>;
+	static constexpr bool is_allowed_flag_type = std::is_same_v<FlagT, DTC_Rule_Flag>;
 
 	// Huge_Array's For_Overwrite_Tag path uses `new T`; this ctor must zero m_data.
-	constexpr DTC_Final_Entry() : m_data(0) {}
+	constexpr DTC_Entry_Base() : m_data(0) {}
+
+	NODISCARD constexpr bool is_legal()   const { return (m_data & VALUE_MASK) != ILLEGAL_VAL; }
+	NODISCARD constexpr bool is_illegal() const { return !is_legal(); }
+
+	NODISCARD constexpr bool has_cap_cwin()  const { return (m_data & DTC_FLAG_CAP_CWIN)  != 0; }
+	NODISCARD constexpr bool has_cap_closs() const { return (m_data & DTC_FLAG_CAP_CLOSS) != 0; }
+	NODISCARD constexpr bool has_flag(DTC_Rule_Flag f) const { return (m_data & f) != 0; }
+
+	constexpr void set_flag(DTC_Rule_Flag f)   { m_data |= f; }
+	constexpr void clear_flag(DTC_Rule_Flag f) { m_data &= ~f; }
+
+	NODISCARD constexpr bool operator==(DTC_Entry_Base o) const { return m_data == o.m_data; }
+	NODISCARD constexpr bool operator!=(DTC_Entry_Base o) const { return m_data != o.m_data; }
+
+protected:
+	uint16_t m_data;
+};
+
+struct DTC_Final_Entry;
+
+struct DTC_Intermediate_Entry : DTC_Entry_Base
+{
+	friend struct DTC_Final_Entry;  // for DTC_Final_Entry::copy_rule
+
+	template <typename FlagT>
+	static constexpr bool is_allowed_flag_type =
+		DTC_Entry_Base::is_allowed_flag_type<FlagT>
+		|| std::is_same_v<FlagT, DTC_Intermediate_Entry_Flag>;
+
+	constexpr DTC_Intermediate_Entry() : DTC_Entry_Base{} {}
+
+	NODISCARD static constexpr DTC_Intermediate_Entry make_cap_cwin()
+	{
+		DTC_Intermediate_Entry e;
+		e.m_data = DTC_FLAG_CAP_CWIN;
+		return e;
+	}
+
+	NODISCARD static constexpr DTC_Intermediate_Entry make_cap_closs()
+	{
+		DTC_Intermediate_Entry e;
+		e.m_data = DTC_FLAG_CAP_CLOSS;
+		return e;
+	}
+
+	NODISCARD constexpr bool is_draw() const
+	{
+		return (m_data & (VALUE_MASK | DTC_FLAG_WIN | DTC_FLAG_LOSS)) == 0;
+	}
+	NODISCARD constexpr bool has_change()    const { return (m_data & DTC_FLAG_CHANGE) != 0; }
+	NODISCARD constexpr bool has_any_flags() const { return (m_data & ~VALUE_MASK)     != 0; }
+
+	NODISCARD constexpr bool has_flag(DTC_Intermediate_Entry_Flag f) const { return (m_data & f) != 0; }
+	using DTC_Entry_Base::has_flag;
+
+	constexpr void set_flag(DTC_Intermediate_Entry_Flag f)   { m_data |= f; }
+	constexpr void clear_flag(DTC_Intermediate_Entry_Flag f) { m_data &= ~f; }
+	using DTC_Entry_Base::set_flag;
+	using DTC_Entry_Base::clear_flag;
+};
+static_assert(sizeof(DTC_Intermediate_Entry) == 2);
+
+struct DTC_Final_Entry : DTC_Entry_Base
+{
+	template <typename FlagT>
+	static constexpr bool is_allowed_flag_type =
+		DTC_Entry_Base::is_allowed_flag_type<FlagT>
+		|| std::is_same_v<FlagT, DTC_Final_Entry_Flag>;
+
+	static constexpr uint16_t MAX_NON_CURSED_DTZ = 100;
+
+	constexpr DTC_Final_Entry() : DTC_Entry_Base{} {}
 
 	NODISCARD static constexpr DTC_Final_Entry make_illegal()
 	{
 		DTC_Final_Entry e; e.m_data = ILLEGAL_VAL; return e;
 	}
 
-	NODISCARD static constexpr DTC_Final_Entry make_draw()
-	{
-		return {};
-	}
+	NODISCARD static constexpr DTC_Final_Entry make_draw() { return {}; }
 
 	NODISCARD static constexpr DTC_Final_Entry make_score(DTC_Score v)
 	{
@@ -159,54 +234,48 @@ struct DTC_Final_Entry
 
 	NODISCARD static constexpr DTC_Final_Entry make_win(uint16_t dtz)
 	{
-		DTC_Final_Entry e;
-		e.m_data = static_cast<uint16_t>(dtz) | DTC_FLAG_WIN;
-		return e;
+		DTC_Final_Entry e; e.set_score_win(dtz); return e;
 	}
 
 	NODISCARD static constexpr DTC_Final_Entry make_loss(uint16_t dtz)
 	{
+		DTC_Final_Entry e; e.set_score_loss(dtz); return e;
+	}
+
+	// Project rule bits (CAP_*) from an Intermediate into a fresh Final, so
+	// subsequent set_score_* preserves them when classifying.
+	NODISCARD static constexpr DTC_Final_Entry copy_rule(DTC_Intermediate_Entry intermediate)
+	{
 		DTC_Final_Entry e;
-		e.m_data = static_cast<uint16_t>(dtz) | DTC_FLAG_LOSS;
+		e.m_data = intermediate.m_data & RULE_MASK;
 		return e;
 	}
 
-	static constexpr uint16_t MAX_NON_CURSED_DTZ = 100;
-
-	NODISCARD constexpr DTC_Final_Entry with_win() const
+	// Mutators set classification + DTZ value, preserving CAP_* rule bits.
+	constexpr void set_score_win(uint16_t dtz)
 	{
-		DTC_Final_Entry r = *this; r.m_data |= DTC_FLAG_WIN; return r;
+		ASSERT((dtz & VALUE_MASK) == dtz);
+		m_data = (m_data & RULE_MASK) | dtz | DTC_FLAG_WIN;
 	}
-	NODISCARD constexpr DTC_Final_Entry with_loss() const
+	constexpr void set_score_loss(uint16_t dtz)
 	{
-		DTC_Final_Entry r = *this; r.m_data |= DTC_FLAG_LOSS; return r;
+		ASSERT((dtz & VALUE_MASK) == dtz);
+		m_data = (m_data & RULE_MASK) | dtz | DTC_FLAG_LOSS;
 	}
-	NODISCARD constexpr DTC_Final_Entry with_cap_cwin() const
+	constexpr void set_score(DTC_Score v)
 	{
-		DTC_Final_Entry r = *this; r.m_data |= DTC_FLAG_CAP_CWIN; return r;
-	}
-	NODISCARD constexpr DTC_Final_Entry with_cap_closs() const
-	{
-		DTC_Final_Entry r = *this; r.m_data |= DTC_FLAG_CAP_CLOSS; return r;
-	}
-	NODISCARD constexpr DTC_Final_Entry without_change() const
-	{
-		DTC_Final_Entry r = *this; r.m_data &= ~DTC_FLAG_CHANGE; return r;
+		ASSERT((static_cast<uint16_t>(v) & VALUE_MASK) == static_cast<uint16_t>(v));
+		m_data = (m_data & ~VALUE_MASK) | static_cast<uint16_t>(v);
 	}
 
 	NODISCARD constexpr DTC_Score value() const { return static_cast<DTC_Score>(m_data & VALUE_MASK); }
 
-	NODISCARD constexpr bool is_illegal() const { return value() == static_cast<DTC_Score>(ILLEGAL_VAL); }
-	NODISCARD constexpr bool is_legal()   const { return !is_illegal(); }
-	NODISCARD constexpr bool is_win()     const { return (m_data & DTC_FLAG_WIN)  != 0; }
-	NODISCARD constexpr bool is_loss()    const { return (m_data & DTC_FLAG_LOSS) != 0; }
-	NODISCARD constexpr bool is_draw()    const { return is_legal() && !is_win() && !is_loss() && value() == DTC_SCORE_ZERO; }
-
-	NODISCARD constexpr bool has_cap_cwin()  const { return (m_data & DTC_FLAG_CAP_CWIN)  != 0; }
-	NODISCARD constexpr bool has_cap_closs() const { return (m_data & DTC_FLAG_CAP_CLOSS) != 0; }
-	NODISCARD constexpr bool has_change()    const { return (m_data & DTC_FLAG_CHANGE)    != 0; }
-
-	NODISCARD constexpr bool has_any_flags() const { return (m_data & ~VALUE_MASK) != 0; }
+	NODISCARD constexpr bool is_win()  const { return (m_data & DTC_FLAG_WIN)  != 0; }
+	NODISCARD constexpr bool is_loss() const { return (m_data & DTC_FLAG_LOSS) != 0; }
+	NODISCARD constexpr bool is_draw() const
+	{
+		return (m_data & (VALUE_MASK | DTC_FLAG_WIN | DTC_FLAG_LOSS)) == 0;
+	}
 
 	NODISCARD constexpr DTC_Final_Entry score_only() const
 	{
@@ -217,28 +286,19 @@ struct DTC_Final_Entry
 
 	NODISCARD constexpr WDL_Entry wdl() const
 	{
-		// CAP_* only projects cursed on Final WIN/LOSS; Intermediates with CAP_* are DRAW.
 		if (is_illegal()) return WDL_Entry::ILLEGAL;
 		if (is_win())
 		{
-			const bool cursed = has_cap_cwin()
-			                  || value() > MAX_NON_CURSED_DTZ;
+			const bool cursed = has_cap_cwin() || value() > MAX_NON_CURSED_DTZ;
 			return cursed ? WDL_Entry::CURSED_WIN : WDL_Entry::WIN;
 		}
 		if (is_loss())
 		{
-			const bool cursed = has_cap_closs()
-			                  || value() > MAX_NON_CURSED_DTZ;
+			const bool cursed = has_cap_closs() || value() > MAX_NON_CURSED_DTZ;
 			return cursed ? WDL_Entry::BLESSED_LOSS : WDL_Entry::LOSE;
 		}
-		return WDL_Entry::DRAW;  // Final DRAW or Intermediate
+		return WDL_Entry::DRAW;
 	}
-
-	NODISCARD constexpr bool operator==(DTC_Final_Entry o) const { return m_data == o.m_data; }
-	NODISCARD constexpr bool operator!=(DTC_Final_Entry o) const { return m_data != o.m_data; }
-
-private:
-	uint16_t m_data;
 };
 static_assert(sizeof(DTC_Final_Entry) == 2);
 
@@ -265,54 +325,14 @@ NODISCARD constexpr DTC_Final_Entry dtc_entry_from_storage(DTC_Final_Entry store
 		: stored;
 }
 
-// Distinct type, same 16-bit layout; conversions bit-identical.
-struct DTC_Intermediate_Entry
-{
-	template <typename FlagT>
-	static constexpr bool is_allowed_flag_type = std::is_same_v<FlagT, DTC_Intermediate_Entry_Flag>;
-
-	constexpr DTC_Intermediate_Entry() : m_data(0) {}
-
-	constexpr explicit DTC_Intermediate_Entry(DTC_Final_Entry f) : m_data(f.m_data) {}
-
-	NODISCARD static constexpr DTC_Intermediate_Entry make_cap_cwin()
-	{
-		DTC_Intermediate_Entry e;
-		e.m_data = DTC_FLAG_CAP_CWIN;
-		return e;
-	}
-
-	NODISCARD static constexpr DTC_Intermediate_Entry make_cap_closs()
-	{
-		DTC_Intermediate_Entry e;
-		e.m_data = DTC_FLAG_CAP_CLOSS;
-		return e;
-	}
-
-	NODISCARD constexpr bool has_flag(DTC_Intermediate_Entry_Flag f) const
-	{
-		return (m_data & f) != 0;
-	}
-
-
-	NODISCARD constexpr operator DTC_Final_Entry() const
-	{
-		DTC_Final_Entry f;
-		f.m_data = m_data;
-		return f;
-	}
-
-private:
-	uint16_t m_data;
-};
-static_assert(sizeof(DTC_Intermediate_Entry) == 2);
-
 using DTC_Any_Entry = std::variant<DTC_Intermediate_Entry, DTC_Final_Entry>;
 
 // =============================================================================
 // DTM (no 50MR). Flat ply count to mate; no zeroing, no cursed/blessed.
 // On disk: class stripped, recovered from companion .lzw (same split as DTC).
 // Parity invariant (WIN odd, LOSS even) lets both rank tiers halve storage.
+// Final holds WIN/LOSS+value; Intermediate holds PAWN_EVAL (forward-read marker)
+// + CHANGE (reverify-pending). No shared rule bits — base only carries legality.
 // =============================================================================
 
 enum DTM_Score : uint16_t {
@@ -323,63 +343,119 @@ enum DTM_Score : uint16_t {
 ENUM_ENABLE_OPERATOR_INC(DTM_Score);
 ENUM_ENABLE_OPERATOR_ADD(DTM_Score);
 
-enum DTM_Entry_Flag : uint16_t {
-	DTM_FLAG_WIN       = 0x0800u,
-	DTM_FLAG_LOSS      = 0x1000u,
+enum DTM_Final_Entry_Flag : uint16_t {
+	DTM_FLAG_WIN  = 0x0800u,
+	DTM_FLAG_LOSS = 0x1000u,
+};
+
+enum DTM_Intermediate_Entry_Flag : uint16_t {
 	DTM_FLAG_PAWN_EVAL = 0x2000u,
 	DTM_FLAG_CHANGE    = 0x4000u,
 };
 
-struct DTM_Intermediate_Entry;
-
-struct DTM_Final_Entry
+struct DTM_Entry_Base
 {
-	friend struct DTM_Intermediate_Entry;
-
 	static constexpr uint16_t VALUE_MASK  = 0x07FFu;
 	static constexpr uint16_t ILLEGAL_VAL = VALUE_MASK;
 
 	template <typename FlagT>
-	static constexpr bool is_allowed_flag_type = std::is_same_v<FlagT, DTM_Entry_Flag>;
+	static constexpr bool is_allowed_flag_type = false;
 
-	// Huge_Array For_Overwrite_Tag uses `new T`; this ctor must zero (0 == DRAW).
-	constexpr DTM_Final_Entry() : m_data(0) {}
+	// Huge_Array's For_Overwrite_Tag path uses `new T`; this ctor must zero m_data.
+	constexpr DTM_Entry_Base() : m_data(0) {}
 
-	NODISCARD static constexpr DTM_Final_Entry make_draw() { return {}; }
+	NODISCARD constexpr bool is_legal()   const { return (m_data & VALUE_MASK) != ILLEGAL_VAL; }
+	NODISCARD constexpr bool is_illegal() const { return !is_legal(); }
+
+	NODISCARD constexpr bool operator==(DTM_Entry_Base o) const { return m_data == o.m_data; }
+	NODISCARD constexpr bool operator!=(DTM_Entry_Base o) const { return m_data != o.m_data; }
+
+protected:
+	uint16_t m_data;
+};
+
+struct DTM_Intermediate_Entry : DTM_Entry_Base
+{
+	template <typename FlagT>
+	static constexpr bool is_allowed_flag_type =
+		DTM_Entry_Base::is_allowed_flag_type<FlagT>
+		|| std::is_same_v<FlagT, DTM_Intermediate_Entry_Flag>;
+
+	constexpr DTM_Intermediate_Entry() : DTM_Entry_Base{} {}
+
+	NODISCARD static constexpr DTM_Intermediate_Entry make_pawn_eval()
+	{
+		DTM_Intermediate_Entry e;
+		e.m_data = DTM_FLAG_PAWN_EVAL;
+		return e;
+	}
+
+	NODISCARD constexpr bool is_draw() const
+	{
+		return (m_data & (VALUE_MASK | DTM_FLAG_WIN | DTM_FLAG_LOSS)) == 0;
+	}
+	NODISCARD constexpr bool has_change()    const { return (m_data & DTM_FLAG_CHANGE)    != 0; }
+	NODISCARD constexpr bool has_pawn_eval() const { return (m_data & DTM_FLAG_PAWN_EVAL) != 0; }
+	NODISCARD constexpr bool has_any_flags() const { return (m_data & ~VALUE_MASK)        != 0; }
+
+	NODISCARD constexpr bool has_flag(DTM_Intermediate_Entry_Flag f) const { return (m_data & f) != 0; }
+
+	constexpr void set_flag(DTM_Intermediate_Entry_Flag f)   { m_data |= f; }
+	constexpr void clear_flag(DTM_Intermediate_Entry_Flag f) { m_data &= ~f; }
+};
+static_assert(sizeof(DTM_Intermediate_Entry) == 2);
+
+struct DTM_Final_Entry : DTM_Entry_Base
+{
+	template <typename FlagT>
+	static constexpr bool is_allowed_flag_type =
+		DTM_Entry_Base::is_allowed_flag_type<FlagT>
+		|| std::is_same_v<FlagT, DTM_Final_Entry_Flag>;
+
+	constexpr DTM_Final_Entry() : DTM_Entry_Base{} {}
 
 	NODISCARD static constexpr DTM_Final_Entry make_illegal()
 	{
 		DTM_Final_Entry e; e.m_data = ILLEGAL_VAL; return e;
 	}
 
+	NODISCARD static constexpr DTM_Final_Entry make_draw() { return {}; }
+
 	NODISCARD static constexpr DTM_Final_Entry make_win(uint16_t v)
 	{
-		DTM_Final_Entry e;
-		e.m_data = static_cast<uint16_t>(v) | DTM_FLAG_WIN;
-		return e;
+		DTM_Final_Entry e; e.set_score_win(v); return e;
 	}
 
 	NODISCARD static constexpr DTM_Final_Entry make_loss(uint16_t v)
 	{
-		DTM_Final_Entry e;
-		e.m_data = static_cast<uint16_t>(v) | DTM_FLAG_LOSS;
-		return e;
+		DTM_Final_Entry e; e.set_score_loss(v); return e;
 	}
 
-	NODISCARD constexpr DTM_Final_Entry without_change() const
+	// Mutators set classification + ply value. DTM has no rule bits.
+	constexpr void set_score_win(uint16_t v)
 	{
-		DTM_Final_Entry r = *this; r.m_data &= ~DTM_FLAG_CHANGE; return r;
+		ASSERT((v & VALUE_MASK) == v);
+		m_data = v | DTM_FLAG_WIN;
+	}
+	constexpr void set_score_loss(uint16_t v)
+	{
+		ASSERT((v & VALUE_MASK) == v);
+		m_data = v | DTM_FLAG_LOSS;
+	}
+	constexpr void set_score(DTM_Score v)
+	{
+		ASSERT((static_cast<uint16_t>(v) & VALUE_MASK) == static_cast<uint16_t>(v));
+		m_data = (m_data & ~VALUE_MASK) | static_cast<uint16_t>(v);
 	}
 
 	NODISCARD constexpr DTM_Score value() const { return static_cast<DTM_Score>(m_data & VALUE_MASK); }
 
-	NODISCARD constexpr bool is_illegal() const { return value() == static_cast<DTM_Score>(ILLEGAL_VAL); }
-	NODISCARD constexpr bool is_legal()   const { return !is_illegal(); }
-	NODISCARD constexpr bool is_win()     const { return (m_data & DTM_FLAG_WIN)  != 0; }
-	NODISCARD constexpr bool is_loss()    const { return (m_data & DTM_FLAG_LOSS) != 0; }
-	NODISCARD constexpr bool is_draw()    const { return is_legal() && !is_win() && !is_loss() && value() == DTM_SCORE_ZERO; }
-	NODISCARD constexpr bool has_change()       const { return (m_data & DTM_FLAG_CHANGE)       != 0; }
-	NODISCARD constexpr bool has_pawn_eval()    const { return (m_data & DTM_FLAG_PAWN_EVAL)    != 0; }
+	NODISCARD constexpr bool is_win()  const { return (m_data & DTM_FLAG_WIN)  != 0; }
+	NODISCARD constexpr bool is_loss() const { return (m_data & DTM_FLAG_LOSS) != 0; }
+	NODISCARD constexpr bool is_draw() const
+	{
+		return (m_data & (VALUE_MASK | DTM_FLAG_WIN | DTM_FLAG_LOSS)) == 0;
+	}
 
 	NODISCARD constexpr WDL_Entry wdl() const
 	{
@@ -388,12 +464,6 @@ struct DTM_Final_Entry
 		if (is_loss())    return WDL_Entry::LOSE;
 		return WDL_Entry::DRAW;
 	}
-
-	NODISCARD constexpr bool operator==(DTM_Final_Entry o) const { return m_data == o.m_data; }
-	NODISCARD constexpr bool operator!=(DTM_Final_Entry o) const { return m_data != o.m_data; }
-
-private:
-	uint16_t m_data;
 };
 static_assert(sizeof(DTM_Final_Entry) == 2);
 
@@ -412,17 +482,22 @@ NODISCARD constexpr uint16_t dtm_value_for_storage(DTM_Final_Entry e)
 // See dtc_entry_from_storage above for the DRAW-is-companion-authoritative rule.
 NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_Entry w)
 {
+	DTM_Final_Entry e;
 	switch (w)
 	{
-		case WDL_Entry::ILLEGAL:      return DTM_Final_Entry::make_illegal();
+		case WDL_Entry::ILLEGAL:
+			return DTM_Final_Entry::make_illegal();
 		case WDL_Entry::WIN:
 		case WDL_Entry::CURSED_WIN:
-			return DTM_Final_Entry::make_win(static_cast<uint16_t>((stored << 1) | 1u));
+			e.set_score_win(static_cast<uint16_t>((stored << 1) | 1u));
+			return e;
 		case WDL_Entry::LOSE:
 		case WDL_Entry::BLESSED_LOSS:
-			return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
+			e.set_score_loss(static_cast<uint16_t>(stored << 1));
+			return e;
 		case WDL_Entry::DRAW:
-		default:                      return DTM_Final_Entry::make_draw();
+		default:
+			return DTM_Final_Entry::make_draw();
 	}
 }
 
@@ -430,15 +505,22 @@ NODISCARD constexpr DTM_Final_Entry dtm_entry_from_storage(uint16_t stored, WDL_
 // strict-WIN in flat-DTM and DRAW in DTM50 at the reset window).
 NODISCARD constexpr DTM_Final_Entry dtm50_entry_from_storage(uint16_t stored, WDL_Entry w)
 {
+	DTM_Final_Entry e;
 	switch (w)
 	{
-		case WDL_Entry::ILLEGAL: return DTM_Final_Entry::make_illegal();
-		case WDL_Entry::WIN:     return DTM_Final_Entry::make_win(static_cast<uint16_t>((stored << 1) | 1u));
-		case WDL_Entry::LOSE:    return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
+		case WDL_Entry::ILLEGAL:
+			return DTM_Final_Entry::make_illegal();
+		case WDL_Entry::WIN:
+			e.set_score_win(static_cast<uint16_t>((stored << 1) | 1u));
+			return e;
+		case WDL_Entry::LOSE:
+			e.set_score_loss(static_cast<uint16_t>(stored << 1));
+			return e;
 		case WDL_Entry::CURSED_WIN:
 		case WDL_Entry::BLESSED_LOSS:
 		case WDL_Entry::DRAW:
-		default:                 return DTM_Final_Entry::make_draw();
+		default:
+			return DTM_Final_Entry::make_draw();
 	}
 }
 
@@ -449,44 +531,21 @@ NODISCARD constexpr DTM_Final_Entry dtm50_layered_entry_from_storage(uint16_t st
 {
 	if (w == WDL_Entry::ILLEGAL) return DTM_Final_Entry::make_illegal();
 	if (stored == 0)             return DTM_Final_Entry::make_draw();
+	DTM_Final_Entry e;
 	switch (w)
 	{
-		case WDL_Entry::WIN:  return DTM_Final_Entry::make_win(static_cast<uint16_t>((stored << 1) | 1u));
-		case WDL_Entry::LOSE: return DTM_Final_Entry::make_loss(static_cast<uint16_t>(stored << 1));
+		case WDL_Entry::WIN:
+			e.set_score_win(static_cast<uint16_t>((stored << 1) | 1u));
+			return e;
+		case WDL_Entry::LOSE:
+			e.set_score_loss(static_cast<uint16_t>(stored << 1));
+			return e;
 		case WDL_Entry::CURSED_WIN:
 		case WDL_Entry::BLESSED_LOSS:
 		case WDL_Entry::DRAW:
-		default:              return DTM_Final_Entry::make_draw();
+		default:
+			return DTM_Final_Entry::make_draw();
 	}
 }
-
-// Distinct type, same layout — lets init_entries std::visit Final vs Intermediate.
-struct DTM_Intermediate_Entry
-{
-	template <typename FlagT>
-	static constexpr bool is_allowed_flag_type = std::is_same_v<FlagT, DTM_Entry_Flag>;
-
-	constexpr DTM_Intermediate_Entry() : m_data(0) {}
-
-	constexpr explicit DTM_Intermediate_Entry(DTM_Final_Entry f) : m_data(f.m_data) {}
-
-	NODISCARD static constexpr DTM_Intermediate_Entry make_pawn_eval()
-	{
-		DTM_Intermediate_Entry e;
-		e.m_data = DTM_FLAG_PAWN_EVAL;
-		return e;
-	}
-
-	NODISCARD constexpr operator DTM_Final_Entry() const
-	{
-		DTM_Final_Entry f;
-		f.m_data = m_data;
-		return f;
-	}
-
-private:
-	uint16_t m_data;
-};
-static_assert(sizeof(DTM_Intermediate_Entry) == 2);
 
 using DTM_Any_Entry = std::variant<DTM_Intermediate_Entry, DTM_Final_Entry>;

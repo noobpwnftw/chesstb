@@ -508,8 +508,8 @@ Working_Set_Estimate compute_working_set(const Piece_Config& ps, bool include_pu
 // explicitly instantiated below for the closed {DTC, DTM} entry set.
 // =============================================================================
 
-template <typename EntryT>
-void EGTB_Generator::refresh_active_metadata(const Sliced_EGTB_File_For_Gen<EntryT>& tbl)
+template <typename EntryT, typename... OtherEntryTs>
+void EGTB_Generator::refresh_active_metadata(const Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& tbl)
 {
 	const size_t nps = m_epsi.num_pawn_slices();
 	const size_t nks = m_epsi.num_king_slices();
@@ -534,9 +534,9 @@ void EGTB_Generator::refresh_active_metadata(const Sliced_EGTB_File_For_Gen<Entr
 		if (in_pair[g]) m_pair_group_ids.push_back(g);
 }
 
-template <typename EntryT>
+template <typename EntryT, typename... OtherEntryTs>
 std::vector<std::vector<int32_t>>
-EGTB_Generator::compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT>& tbl,
+EGTB_Generator::compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& tbl,
                                       const std::vector<int32_t>& batch) const
 {
 	if (batch.empty()) return {};
@@ -583,21 +583,21 @@ EGTB_Generator::compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT>& tb
 	return fusions;
 }
 
-template <typename EntryT>
+template <typename EntryT, typename... OtherEntryTs>
 void EGTB_Generator::apply_working_set(
 	In_Out_Param<Thread_Pool> thread_pool,
-	Sliced_EGTB_File_For_Gen<EntryT>* w_tbl,
-	Sliced_EGTB_File_For_Gen<EntryT>* b_tbl,
+	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>* w_tbl,
+	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>* b_tbl,
 	const std::vector<uint8_t>& needed_w,
 	const std::vector<uint8_t>& needed_b)
 {
 	struct Group_Task {
-		Sliced_EGTB_File_For_Gen<EntryT>* tbl;
+		Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>* tbl;
 		size_t group_id;
 		bool load;
 	};
 
-	Sliced_EGTB_File_For_Gen<EntryT>* tbls[COLOR_NB] = { w_tbl, b_tbl };
+	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>* tbls[COLOR_NB] = { w_tbl, b_tbl };
 	const std::vector<uint8_t>* needed[COLOR_NB] = { &needed_w, &needed_b };
 
 	const size_t bytes_per_group =
@@ -669,10 +669,10 @@ void EGTB_Generator::apply_working_set(
 	});
 }
 
-template <typename EntryT>
+template <typename EntryT, typename... OtherEntryTs>
 Block_Source make_entry_block_source(
-	Sliced_EGTB_File_For_Gen<EntryT>& src,
-	Save_Group_Cache<EntryT>& cache,
+	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& src,
+	Save_Group_Cache<EntryT, OtherEntryTs...>& cache,
 	Color color,
 	size_t block_size,
 	size_t entry_bytes)
@@ -700,7 +700,7 @@ Block_Source make_entry_block_source(
 			const size_t first_g = (entry_off / within) / spg;
 			const size_t last_g  = (entry_cnt == 0 ? first_g
 			                                       : ((entry_off + entry_cnt - 1) / within) / spg);
-			Pinned_Group_Range<EntryT> pin(cache, color, first_g, last_g);
+			Pinned_Group_Range<EntryT, OtherEntryTs...> pin(cache, color, first_g, last_g);
 
 			size_t done = 0;
 			while (done < entry_cnt)
@@ -719,14 +719,20 @@ Block_Source make_entry_block_source(
 	};
 }
 
-template void EGTB_Generator::refresh_active_metadata<DTC_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTC_Final_Entry>&);
+// DTC/DTM gen tables expose both Final and Intermediate views; DTM50 layers
+// are single-variant Final.
+template void EGTB_Generator::refresh_active_metadata<DTC_Final_Entry, DTC_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>&);
+template void EGTB_Generator::refresh_active_metadata<DTM_Final_Entry, DTM_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&);
 template void EGTB_Generator::refresh_active_metadata<DTM_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&);
 
-template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTC_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTC_Final_Entry>&, const std::vector<int32_t>&) const;
+template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTC_Final_Entry, DTC_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>&, const std::vector<int32_t>&) const;
+template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTM_Final_Entry, DTM_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&, const std::vector<int32_t>&) const;
 template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTM_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&, const std::vector<int32_t>&) const;
 
-template void EGTB_Generator::apply_working_set<DTC_Final_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTC_Final_Entry>*, Sliced_EGTB_File_For_Gen<DTC_Final_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
+template void EGTB_Generator::apply_working_set<DTC_Final_Entry, DTC_Intermediate_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>*, Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
+template void EGTB_Generator::apply_working_set<DTM_Final_Entry, DTM_Intermediate_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>*, Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
 template void EGTB_Generator::apply_working_set<DTM_Final_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTM_Final_Entry>*, Sliced_EGTB_File_For_Gen<DTM_Final_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
 
-template Block_Source make_entry_block_source<DTC_Final_Entry>(Sliced_EGTB_File_For_Gen<DTC_Final_Entry>&, Save_Group_Cache<DTC_Final_Entry>&, Color, size_t, size_t);
+template Block_Source make_entry_block_source<DTC_Final_Entry, DTC_Intermediate_Entry>(Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>&, Save_Group_Cache<DTC_Final_Entry, DTC_Intermediate_Entry>&, Color, size_t, size_t);
+template Block_Source make_entry_block_source<DTM_Final_Entry, DTM_Intermediate_Entry>(Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&, Save_Group_Cache<DTM_Final_Entry, DTM_Intermediate_Entry>&, Color, size_t, size_t);
 template Block_Source make_entry_block_source<DTM_Final_Entry>(Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&, Save_Group_Cache<DTM_Final_Entry>&, Color, size_t, size_t);

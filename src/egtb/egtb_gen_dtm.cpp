@@ -286,8 +286,7 @@ DTM_Any_Entry DTM_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 		return DTM_Intermediate_Entry{};
 	}
 
-	if (saw_win)
-		return DTM_Final_Entry::make_win(best_win_dtm);
+	if (saw_win) return DTM_Final_Entry::make_win(best_win_dtm);
 
 	if (!any_in_material && !saw_draw)
 	{
@@ -422,7 +421,7 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 							}
 						},
 						[&](DTM_Intermediate_Entry entry) {
-							write_dtm(idx, us, entry);  // implicit-converts to Final (bit-identical)
+							write_dtm(idx, us, entry);
 							update_max(local_max, worst_loss_dtm);
 						},
 					}, make_initial_entry(pos_gen, tid, out_param(worst_loss_dtm)));
@@ -442,40 +441,41 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 // Retrograde sweep.
 // =============================================================================
 
-DTM_Generator::Iter_Action DTM_Generator::action_for_entry(DTM_Final_Entry e, uint16_t ply) const
+// Dispatch on Any_Entry via std::visit: Intermediate handles draws with flags
+// (CHANGE / PAWN_EVAL routing); Final handles classified WIN/LOSS retros and
+// stale-WIN bookkeeping.
+DTM_Generator::Iter_Action DTM_Generator::action_for_entry(
+	DTM_Any_Entry e, uint16_t ply) const
 {
-	if (e.is_illegal()) return Iter_Action::SKIP;
-
 	const bool has_pawns = m_epsi.pawn_slice_manager().has_pawns();
-
-	if (e.is_draw())
-	{
-		if (e.has_change()) return Iter_Action::CHANGE_REVERIFY;
-		// PAWN_EVAL: forward-read for retro-blind edges (cap/promo + pawn push).
-		if (ply > 0 && e.has_pawn_eval()) return Iter_Action::PAWN_EVAL;
-		return Iter_Action::SKIP;
-	}
-
-	if (ply == 0)
-	{
-		if (e.is_loss() && e.value() == 0) return Iter_Action::MARK_WIN_IN_1;
-		return Iter_Action::SKIP;
-	}
-
-	// WIN(ply) and WIN(ply-1) both MARK_CHANGED so pred check_loss sees a
-	// fully-classified child (same-ply just-overwritten + prior-ply settled).
-	if (e.is_win() && (e.value() == ply || e.value() == ply - 1))
-		return Iter_Action::MARK_CHANGED;
-
-	if (e.is_loss() && e.value() == ply)
-		return Iter_Action::MARK_WIN_PREDS;
-
-	// Stale WIN(value > ply) from init cap/promo seed; faster in-material pawn
-	// push can overwrite. Routes through PAWN_EVAL handler (no check_loss fallthrough).
-	if (has_pawns && e.is_win() && e.value() > ply)
-		return Iter_Action::PAWN_EVAL;
-
-	return Iter_Action::SKIP;
+	return std::visit(overload{
+		[&](DTM_Intermediate_Entry ie) -> Iter_Action {
+			if (ie.has_change()) return Iter_Action::CHANGE_REVERIFY;
+			// PAWN_EVAL: forward-read for retro-blind edges (cap/promo + pawn push).
+			if (ply > 0 && ie.has_pawn_eval()) return Iter_Action::PAWN_EVAL;
+			return Iter_Action::SKIP;
+		},
+		[&](DTM_Final_Entry fe) -> Iter_Action {
+			if (fe.is_illegal()) return Iter_Action::SKIP;
+			if (ply == 0)
+			{
+				if (fe.is_loss() && fe.value() == 0) return Iter_Action::MARK_WIN_IN_1;
+				return Iter_Action::SKIP;
+			}
+			// WIN(ply) and WIN(ply-1) both MARK_CHANGED so pred check_loss sees a
+			// fully-classified child (same-ply just-overwritten + prior-ply settled).
+			if (fe.is_win() && (fe.value() == ply || fe.value() == ply - 1))
+				return Iter_Action::MARK_CHANGED;
+			if (fe.is_loss() && fe.value() == ply)
+				return Iter_Action::MARK_WIN_PREDS;
+			// Stale WIN(value > ply) from init cap/promo seed; faster in-material
+			// pawn push can overwrite. Routes through PAWN_EVAL handler
+			// (no check_loss fallthrough).
+			if (has_pawns && fe.is_win() && fe.value() > ply)
+				return Iter_Action::PAWN_EVAL;
+			return Iter_Action::SKIP;
+		}
+	}, e);
 }
 
 DTM_Generator::Loss_Verification_Result DTM_Generator::check_loss(
@@ -566,9 +566,10 @@ void DTM_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
 		if (pred == BOARD_INDEX_NONE) continue;
-		const auto e = read_dtm(pred, opp);
+		const auto e = read_dtm<DTM_Intermediate_Entry>(pred, opp);
 		if (!e.is_draw() || e.has_change()) continue;
-		// Atomic OR; a concurrent retro_mark_wins overwrite to Final clears it.
+		// Atomic OR: a racing retro_mark_wins Final write keeps its bits; the
+		// CHANGE bit lands on top harmlessly (Final dispatch ignores it).
 		m_table->m_dtm[opp].lock_add_flags(pred, DTM_FLAG_CHANGE);
 		mark_iter(opp, pred, m_table->m_dtm[opp]);
 	}
@@ -635,19 +636,20 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 					const size_t pid_of_idx = m_epsi.pawn_slice_of(idx);
 					if (!pid_in_pair[pid_of_idx]) continue;
 
-					const DTM_Final_Entry e = read_dtm(idx, stm);
-					if (e.is_illegal()) continue;
+					const DTM_Any_Entry cell = read_dtm_any(idx, stm);
 
-					// Only flagged Intermediates revisit; bare DRAW skips forever.
-					if (e.is_draw() && (e.has_change() || e.has_pawn_eval()))
-						chunk.any_intermediate = true;
-					else
-					{
-						const uint16_t v = static_cast<uint16_t>(e.value());
-						update_max(chunk.max_classified, v);
-					}
+					std::visit(overload{
+						[&](DTM_Final_Entry fe) {
+							if (!fe.is_illegal())
+								update_max(chunk.max_classified, static_cast<uint16_t>(fe.value()));
+						},
+						[&](DTM_Intermediate_Entry ie) {
+							// Only flagged Intermediates revisit; bare DRAW skips forever.
+							if (ie.has_any_flags()) chunk.any_intermediate = true;
+						}
+					}, cell);
 
-					const Iter_Action action = action_for_entry(e, ply);
+					const Iter_Action action = action_for_entry(cell, ply);
 					if (action == Iter_Action::SKIP) continue;
 
 					if (prev != BOARD_INDEX_NONE
@@ -707,7 +709,8 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 							}
 						}
 
-						if (!e.is_draw()) break;  // stale-WIN path; nothing else to try
+						if (std::holds_alternative<DTM_Final_Entry>(cell))
+							break;  // stale-WIN path; nothing else to try
 
 						// Intermediate fallback: check_loss for both CHANGE_REVERIFY
 						// and PAWN_EVAL (forward edge may have just settled).
@@ -717,9 +720,11 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 							// Only CHANGE clears count as wrote — keeps iterate
 							// alive one more ply. PAWN_EVAL-no-change must not
 							// bump wrote, else iterate overshoots.
-							if (e.has_change())
+							auto ie = std::get<DTM_Intermediate_Entry>(cell);
+							if (ie.has_change())
 							{
-								write_dtm(idx, stm, e.without_change());
+								ie.clear_flag(DTM_FLAG_CHANGE);
+								write_dtm(idx, stm, ie);
 								local.wrote = true;
 							}
 							break;
@@ -986,12 +991,12 @@ struct DTM_Singular_Probe_Result {
 	uint64_t  illegal_cnt;
 };
 
-using DTM_Save_Cache = Save_Group_Cache<DTM_Final_Entry>;
-using DTM_Pinned_Range = Pinned_Group_Range<DTM_Final_Entry>;
+using DTM_Save_Cache = Save_Group_Cache<DTM_Final_Entry, DTM_Intermediate_Entry>;
+using DTM_Pinned_Range = Pinned_Group_Range<DTM_Final_Entry, DTM_Intermediate_Entry>;
 
 NODISCARD DTM_Singular_Probe_Result dtm_singular_probe(
 	const Piece_Config_For_Gen& epsi,
-	Sliced_EGTB_File_For_Gen<DTM_Final_Entry>& src,
+	Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>& src,
 	DTM_Save_Cache& cache,
 	Color color,
 	size_t num_positions)
@@ -1051,7 +1056,7 @@ NODISCARD DTM_Singular_Probe_Result dtm_singular_probe(
 void gather_dtm_info(
 	const Piece_Config_For_Gen& epsi,
 	DTM_Save_Cache& cache,
-	Sliced_EGTB_File_For_Gen<DTM_Final_Entry>& src,
+	Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>& src,
 	Color color,
 	size_t num_positions,
 	EGTB_Info& info,
@@ -1079,7 +1084,7 @@ void gather_dtm_info(
 			}
 			for (size_t idx = base; idx < end; ++idx)
 			{
-				const DTM_Final_Entry e = src.read(static_cast<Board_Index>(idx));
+				const DTM_Final_Entry e = src.template read<DTM_Final_Entry>(static_cast<Board_Index>(idx));
 				const uint64_t w = epsi.orbit_weight(didx);
 				info.add_result(color, e.wdl(), w);
 				if (e.is_win())

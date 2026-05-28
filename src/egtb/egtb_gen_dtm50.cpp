@@ -290,8 +290,11 @@ DTM_Final_Entry DTM50_Generator::make_initial_entry(Position_For_Gen& pos_gen, u
 		}
 	}
 	if (!any_legal)
-		return in_check ? DTM_Final_Entry::make_loss(0) : DTM_Final_Entry::make_draw();
-	if (saw_win)  return DTM_Final_Entry::make_win(best_win_dtm);
+	{
+		if (in_check) return DTM_Final_Entry::make_loss(0);
+		return DTM_Final_Entry::make_draw();
+	}
+	if (saw_win) return DTM_Final_Entry::make_win(best_win_dtm);
 	if (saw_draw) return DTM_Final_Entry::make_draw();
 	if (best_loss_dtm > 0) return DTM_Final_Entry::make_loss(best_loss_dtm);
 	return DTM_Final_Entry::make_draw();

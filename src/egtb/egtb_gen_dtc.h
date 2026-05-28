@@ -30,7 +30,7 @@ struct DTC_Interrupted
 struct DTC_Table
 {
 	Piece_Config_For_Gen m_epsi;
-	Sliced_EGTB_File_For_Gen<DTC_Final_Entry> m_dtc[COLOR_NB];
+	Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry> m_dtc[COLOR_NB];
 	bool m_is_symmetric = false;
 
 	DTC_Table(const Piece_Config& ps, const std::filesystem::path& tmp_dir) :
@@ -50,7 +50,7 @@ struct DTC_Table
 
 	NODISCARD INLINE DTC_Final_Entry read(Color stm, Board_Index pos) const
 	{
-		return m_dtc[stm].read(pos);
+		return m_dtc[stm].template read<DTC_Final_Entry>(pos);
 	}
 };
 
@@ -85,12 +85,20 @@ private:
 	template <typename EntryT = DTC_Final_Entry>
 	NODISCARD INLINE EntryT read_dtc(Board_Index pos, Color stm) const
 	{
-		return EntryT(m_table->m_dtc[stm].read(pos));
+		return m_table->m_dtc[stm].template read<EntryT>(pos);
+	}
+	// Polymorphic read: classify by Final view, return the role-correct variant.
+	NODISCARD INLINE DTC_Any_Entry read_dtc_any(Board_Index pos, Color stm) const
+	{
+		const DTC_Final_Entry fe = read_dtc<DTC_Final_Entry>(pos, stm);
+		if (fe.is_draw())
+			return read_dtc<DTC_Intermediate_Entry>(pos, stm);
+		return fe;
 	}
 	template <typename EntryT>
 	INLINE void write_dtc(Board_Index pos, Color stm, EntryT e)
 	{
-		m_table->m_dtc[stm].write(static_cast<DTC_Final_Entry>(e), pos);
+		m_table->m_dtc[stm].write(e, pos);
 		mark_iter(stm, pos, m_table->m_dtc[stm]);
 	}
 
@@ -124,7 +132,7 @@ private:
 		bool cursed = false;
 	};
 
-	NODISCARD Iter_Action action_for_entry(DTC_Final_Entry e,
+	NODISCARD Iter_Action action_for_entry(DTC_Any_Entry e,
 	                                       uint16_t ply,
 	                                       Iter_Phase phase) const;
 

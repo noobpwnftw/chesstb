@@ -35,7 +35,7 @@ struct DTM_Interrupted
 struct DTM_Table
 {
 	Piece_Config_For_Gen m_epsi;
-	Sliced_EGTB_File_For_Gen<DTM_Final_Entry> m_dtm[COLOR_NB];
+	Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry> m_dtm[COLOR_NB];
 	bool m_is_symmetric = false;
 
 	DTM_Table(const Piece_Config& ps, const std::filesystem::path& tmp_dir) :
@@ -55,7 +55,7 @@ struct DTM_Table
 
 	NODISCARD INLINE DTM_Final_Entry read(Color stm, Board_Index pos) const
 	{
-		return m_dtm[stm].read(pos);
+		return m_dtm[stm].template read<DTM_Final_Entry>(pos);
 	}
 };
 
@@ -88,11 +88,20 @@ private:
 	// return value, and iterate folds them after the join.
 	uint16_t m_max_dtm = 0;
 
-	NODISCARD INLINE DTM_Final_Entry read_dtm(Board_Index pos, Color stm) const
+	template <typename EntryT = DTM_Final_Entry>
+	NODISCARD INLINE EntryT read_dtm(Board_Index pos, Color stm) const
 	{
-		return m_table->m_dtm[stm].read(pos);
+		return m_table->m_dtm[stm].template read<EntryT>(pos);
 	}
-	INLINE void write_dtm(Board_Index pos, Color stm, DTM_Final_Entry e)
+	NODISCARD INLINE DTM_Any_Entry read_dtm_any(Board_Index pos, Color stm) const
+	{
+		const DTM_Final_Entry fe = read_dtm<DTM_Final_Entry>(pos, stm);
+		if (fe.is_draw())
+			return read_dtm<DTM_Intermediate_Entry>(pos, stm);
+		return fe;
+	}
+	template <typename EntryT>
+	INLINE void write_dtm(Board_Index pos, Color stm, EntryT e)
 	{
 		m_table->m_dtm[stm].write(e, pos);
 		mark_iter(stm, pos, m_table->m_dtm[stm]);
@@ -131,7 +140,7 @@ private:
 		uint16_t loss_dtm = 0;
 	};
 
-	NODISCARD Iter_Action action_for_entry(DTM_Final_Entry e, uint16_t ply) const;
+	NODISCARD Iter_Action action_for_entry(DTM_Any_Entry e, uint16_t ply) const;
 
 	struct Iter_Result {
 		bool wrote = false;     // any write this iter (incl. CHANGE-flag flips)

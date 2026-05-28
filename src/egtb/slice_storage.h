@@ -28,9 +28,9 @@ struct Slice_Index_Entry
 };
 static_assert(sizeof(Slice_Index_Entry) == 16);
 
-template <typename EntryT>
+template <typename EntryT, typename... OtherEntryTs>
 void save_slice_file(
-	Sliced_EGTB_File_For_Gen<EntryT>& src,
+	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& src,
 	const std::filesystem::path& path,
 	uint64_t magic);
 

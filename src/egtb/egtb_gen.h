@@ -676,25 +676,25 @@ private:
 // are quasi-sequential fanouts of a full scan, making FIFO eviction close to
 // recency-order eviction in practice. Templated on the entry type so DTC and
 // DTM share the implementation.
-template <typename EntryT>
+template <typename EntryT, typename... OtherEntryTs>
 struct Save_Group_Cache
 {
 	// Key is (table_idx, group_id). DTC/DTM use table_idx as Color; DTM50
 	// passes all HMC_COUNT × 2 layer tables to share one residency budget.
 	using Key = std::pair<size_t, size_t>;
 
-	std::vector<Sliced_EGTB_File_For_Gen<EntryT>*> tables;
+	std::vector<Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>*> tables;
 	size_t cap;
 	std::mutex mu;
 	std::list<Key> fifo;           // load order; front = oldest
 	std::map<Key, int> pin_count;  // present iff resident; value == active pins
 
-	Save_Group_Cache(Sliced_EGTB_File_For_Gen<EntryT>* w_tbl,
-	                 Sliced_EGTB_File_For_Gen<EntryT>* b_tbl,
+	Save_Group_Cache(Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>* w_tbl,
+	                 Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>* b_tbl,
 	                 size_t c)
 		: tables{ w_tbl, b_tbl }, cap(c) { init_resident(); }
 
-	Save_Group_Cache(std::vector<Sliced_EGTB_File_For_Gen<EntryT>*> tbls,
+	Save_Group_Cache(std::vector<Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>*> tbls,
 	                 size_t c)
 		: tables(std::move(tbls)), cap(c) { init_resident(); }
 
@@ -762,14 +762,14 @@ private:
 	}
 };
 
-template <typename EntryT>
+template <typename EntryT, typename... OtherEntryTs>
 struct Pinned_Group_Range
 {
-	Save_Group_Cache<EntryT>* cache;
+	Save_Group_Cache<EntryT, OtherEntryTs...>* cache;
 	size_t table_idx;
 	std::vector<size_t> held;
 
-	Pinned_Group_Range(Save_Group_Cache<EntryT>& c, size_t ti, size_t first_g, size_t last_g)
+	Pinned_Group_Range(Save_Group_Cache<EntryT, OtherEntryTs...>& c, size_t ti, size_t first_g, size_t last_g)
 		: cache(&c), table_idx(ti)
 	{
 		held.reserve(last_g - first_g + 1);
@@ -787,10 +787,10 @@ struct Pinned_Group_Range
 	Pinned_Group_Range& operator=(const Pinned_Group_Range&) = delete;
 };
 
-template <typename EntryT>
+template <typename EntryT, typename... OtherEntryTs>
 NODISCARD Block_Source make_entry_block_source(
-	Sliced_EGTB_File_For_Gen<EntryT>& src,
-	Save_Group_Cache<EntryT>& cache,
+	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& src,
+	Save_Group_Cache<EntryT, OtherEntryTs...>& cache,
 	Color color,
 	size_t block_size,
 	size_t entry_bytes);
@@ -937,33 +937,33 @@ protected:
 		}
 	}
 
-	template <typename EntryT>
+	template <typename EntryT, typename... OtherEntryTs>
 	INLINE void mark_iter(Color c, Board_Index pos,
-	                      const Sliced_EGTB_File_For_Gen<EntryT>& f)
+	                      const Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& f)
 	{
 		m_iter_groups[c][f.group_id_of(f.slice_id_of(static_cast<size_t>(pos)))] = 1;
 		m_iter_chunks[c][static_cast<size_t>(pos) / CHUNK_SIZE] = 1;
 	}
 
-	template <typename EntryT>
-	void refresh_active_metadata(const Sliced_EGTB_File_For_Gen<EntryT>& tbl);
+	template <typename EntryT, typename... OtherEntryTs>
+	void refresh_active_metadata(const Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& tbl);
 
 	// Pack a topo-batch of pair_sids into fusion groups whose unioned group-set
 	// fits m_paging_budget_bytes. Returns `{batch}` when budget is unbounded.
-	template <typename EntryT>
+	template <typename EntryT, typename... OtherEntryTs>
 	NODISCARD std::vector<std::vector<int32_t>>
-	compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT>& tbl,
+	compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& tbl,
 	                      const std::vector<int32_t>& batch) const;
 
 	// Drive the resident-group set toward (needed_w | needed_b): load any
 	// needed nonresident group, then evict LRU non-needed groups until residency
 	// fits m_paging_budget_bytes. Templated on EntryT so DTC and DTM share the
 	// body.
-	template <typename EntryT>
+	template <typename EntryT, typename... OtherEntryTs>
 	void apply_working_set(
 		In_Out_Param<Thread_Pool> thread_pool,
-		Sliced_EGTB_File_For_Gen<EntryT>* w_tbl,
-		Sliced_EGTB_File_For_Gen<EntryT>* b_tbl,
+		Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>* w_tbl,
+		Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>* b_tbl,
 		const std::vector<uint8_t>& needed_w,
 		const std::vector<uint8_t>& needed_b);
 };

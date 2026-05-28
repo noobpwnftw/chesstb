@@ -263,21 +263,30 @@ DTC_Any_Entry DTC_Generator::make_initial_entry(Position_For_Gen& pos_gen, size_
 	if (!any_legal)
 	{
 		// Stalemate: plain Intermediate; no pre_quiet pred lands here, never reclassified.
-		return in_check ? DTC_Final_Entry::make_loss(0)
-		                : DTC_Intermediate_Entry{};
+		if (in_check) return DTC_Final_Entry::make_loss(0);
+		return DTC_Intermediate_Entry{};
 	}
 
-	if (best == ValueClassicWin)
-		return DTC_Final_Entry::make_win(1);
+	if (best == ValueClassicWin) return DTC_Final_Entry::make_win(1);
 
 	if (!any_quiet_legal)
 	{
 		static constexpr uint16_t CURSED_BOUND = DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1;
 		switch (best)
 		{
-		case ValueCursedWin:   return DTC_Final_Entry::make_win(CURSED_BOUND).with_cap_cwin();
+		case ValueCursedWin:
+		{
+			DTC_Final_Entry e = DTC_Final_Entry::make_win(CURSED_BOUND);
+			e.set_flag(DTC_FLAG_CAP_CWIN);
+			return e;
+		}
 		case ValueDraw:        return DTC_Intermediate_Entry{};
-		case ValueCursedLoss:  return DTC_Final_Entry::make_loss(CURSED_BOUND).with_cap_closs();
+		case ValueCursedLoss:
+		{
+			DTC_Final_Entry e = DTC_Final_Entry::make_loss(CURSED_BOUND);
+			e.set_flag(DTC_FLAG_CAP_CLOSS);
+			return e;
+		}
 		case ValueClassicLoss: return DTC_Final_Entry::make_loss(1);
 		default: break;
 		}
@@ -409,7 +418,7 @@ bool DTC_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 						[&](DTC_Intermediate_Entry entry) {
 							write_dtc(idx, us, entry);
 							static constexpr auto CAP_HINTS =
-								static_cast<DTC_Intermediate_Entry_Flag>(
+								static_cast<DTC_Rule_Flag>(
 									DTC_FLAG_CAP_CWIN | DTC_FLAG_CAP_CLOSS);
 							if (entry.has_flag(CAP_HINTS))
 								any_cursed_hint = true;
@@ -495,47 +504,49 @@ INLINE bool wdl_is_opp_win(WDL_Entry w, bool cursed)
 
 // Syzygy class-driven iterate: WIN(dtz=ply) flags preds CHANGE; flagged preds
 // reverify; verified LOSS retros preds as WIN(ply+1).
+//
+// Dispatch on Any_Entry via std::visit: Intermediate handles the draw-with-flags
+// branch (CHANGE / cursed-route hints); Final handles classified WIN/LOSS retros.
 DTC_Generator::Iter_Action DTC_Generator::action_for_entry(
-	DTC_Final_Entry e, uint16_t ply, Iter_Phase phase) const
+	DTC_Any_Entry e, uint16_t ply, Iter_Phase phase) const
 {
-	if (e.is_illegal()) return Iter_Action::SKIP;
-
-	if (e.is_draw())
-	{
-		// Cursed-gate fires regardless of CHANGE. Otherwise a coincident CHANGE
-		// at ply 101 would route cap_cwin/cap_closs through CHANGE_REVERIFY,
-		// which can't classify them (check_loss fails / returns sub-clamp dtz),
-		// clearing CHANGE and leaving them SKIP forever. PROMOTE_CWIN and
-		// CAPT_CLOSS_REVERIFY overwrite anyway, so the stale CHANGE is fine.
-		if (phase == Iter_Phase::CURSED
-		    && ply == DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
-		{
-			if (e.has_cap_cwin()) return Iter_Action::PROMOTE_CWIN;
-			if (e.has_cap_closs()) return Iter_Action::CAPT_CLOSS_REVERIFY;
+	return std::visit(overload{
+		[&](DTC_Intermediate_Entry ie) -> Iter_Action {
+			// Cursed-gate fires regardless of CHANGE. Otherwise a coincident
+			// CHANGE at ply 101 would route cap_cwin/cap_closs through
+			// CHANGE_REVERIFY, which can't classify them (check_loss fails /
+			// returns sub-clamp dtz), clearing CHANGE and leaving them SKIP
+			// forever. PROMOTE_CWIN and CAPT_CLOSS_REVERIFY overwrite anyway,
+			// so the stale CHANGE is fine.
+			if (phase == Iter_Phase::CURSED
+			    && ply == DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
+			{
+				if (ie.has_cap_cwin())  return Iter_Action::PROMOTE_CWIN;
+				if (ie.has_cap_closs()) return Iter_Action::CAPT_CLOSS_REVERIFY;
+			}
+			if (ie.has_change())
+			{
+				return (phase == Iter_Phase::CURSED && ie.has_cap_closs())
+					? Iter_Action::CAPT_CLOSS_REVERIFY
+					: Iter_Action::CHANGE_REVERIFY;
+			}
+			return Iter_Action::SKIP;
+		},
+		[&](DTC_Final_Entry fe) -> Iter_Action {
+			if (fe.is_illegal()) return Iter_Action::SKIP;
+			if (ply == 0)
+			{
+				// Mate: preds become WIN(1).
+				if (fe.is_loss() && fe.value() == 0) return Iter_Action::MARK_WIN_IN_1;
+				return Iter_Action::SKIP;
+			}
+			if (fe.is_win() && (fe.value() == ply || fe.value() == ply - 1))
+				return Iter_Action::MARK_CHANGED;
+			if (fe.is_loss() && fe.value() == ply)
+				return Iter_Action::MARK_WIN_PREDS;
+			return Iter_Action::SKIP;
 		}
-		if (e.has_change())
-		{
-			return (phase == Iter_Phase::CURSED && e.has_cap_closs())
-				? Iter_Action::CAPT_CLOSS_REVERIFY
-				: Iter_Action::CHANGE_REVERIFY;
-		}
-		return Iter_Action::SKIP;
-	}
-
-	if (ply == 0)
-	{
-		// Mate: preds become WIN(1).
-		if (e.is_loss() && e.value() == 0) return Iter_Action::MARK_WIN_IN_1;
-		return Iter_Action::SKIP;
-	}
-
-	if (e.is_win() && (e.value() == ply || e.value() == ply - 1))
-		return Iter_Action::MARK_CHANGED;
-
-	if (e.is_loss() && e.value() == ply)
-		return Iter_Action::MARK_WIN_PREDS;
-
-	return Iter_Action::SKIP;
+	}, e);
 }
 
 DTC_Generator::Loss_Verification_Result DTC_Generator::check_loss(
@@ -630,7 +641,7 @@ void DTC_Generator::retro_mark_win_in_1(Position_For_Gen& pos_gen,
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
 		if (pred == BOARD_INDEX_NONE) continue;
 		// Never overwrite a Final pred.
-		if (!read_dtc(pred, opp).is_draw()) continue;
+		if (!read_dtc<DTC_Intermediate_Entry>(pred, opp).is_draw()) continue;
 		write_dtc(pred, opp, DTC_Final_Entry::make_win(1));
 	}
 }
@@ -644,9 +655,10 @@ void DTC_Generator::retro_mark_changed(Position_For_Gen& pos_gen,
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
 		if (pred == BOARD_INDEX_NONE) continue;
-		const auto e = read_dtc(pred, opp);
+		const auto e = read_dtc<DTC_Intermediate_Entry>(pred, opp);
 		if (!e.is_draw() || e.has_change()) continue;
-		// Atomic OR; a concurrent retro_mark_wins overwrite to Final clears it.
+		// Atomic OR: a racing retro_mark_wins Final write keeps its bits; the
+		// CHANGE bit lands on top harmlessly (Final dispatch ignores it).
 		m_table->m_dtc[opp].lock_add_flags(pred, DTC_FLAG_CHANGE);
 		mark_iter(opp, pred, m_table->m_dtc[opp]);
 	}
@@ -659,12 +671,12 @@ void DTC_Generator::retro_mark_wins(Position_For_Gen& pos_gen,
 	const Color opp = color_opp(stm);
 	pos_gen.board_unchecked().gen_pseudo_legal_pre_quiets(out_param(ml));
 	DTC_Final_Entry new_e = DTC_Final_Entry::make_win(target_dtz);
-	if (cursed) new_e = new_e.with_cap_cwin();
+	if (cursed) new_e.set_flag(DTC_FLAG_CAP_CWIN);
 	for (size_t i = 0; i < ml.size(); ++i)
 	{
 		const Board_Index pred = next_quiet_index(pos_gen, ml[i]);
 		if (pred == BOARD_INDEX_NONE) continue;
-		if (!read_dtc(pred, opp).is_draw()) continue;
+		if (!read_dtc<DTC_Intermediate_Entry>(pred, opp).is_draw()) continue;
 		write_dtc(pred, opp, new_e);  // overwrite drops CAP_* / CHANGE bits
 	}
 }
@@ -707,20 +719,22 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 					if (!pid_in_pair[pid_of_idx])
 						continue;
 
-					const DTC_Final_Entry e = read_dtc(idx, stm);
-					if (e.is_illegal()) continue;
+					const DTC_Any_Entry cell = read_dtc_any(idx, stm);
 
-					// Only flagged Intermediates fire future actions; bare DRAW
-					// stays inert until a write reinstates a bit via mark_iter.
-					if (e.is_draw()) { if (e.has_any_flags()) chunk.any_intermediate = true; }
-					else
-					{
-						const uint16_t v = static_cast<uint16_t>(e.value());
-						update_max(chunk.max_classified, v);
-					}
+					// Track chunk state by role: classified cells contribute to
+					// max_classified; flagged Intermediates contribute to
+					// any_intermediate (bare DRAW stays inert).
+					std::visit(overload{
+						[&](DTC_Final_Entry fe) {
+							if (!fe.is_illegal())
+								update_max(chunk.max_classified, static_cast<uint16_t>(fe.value()));
+						},
+						[&](DTC_Intermediate_Entry ie) {
+							if (ie.has_any_flags()) chunk.any_intermediate = true;
+						}
+					}, cell);
 
-					const Iter_Action action = action_for_entry(e, ply, phase);
-
+					const Iter_Action action = action_for_entry(cell, ply, phase);
 					if (action == Iter_Action::SKIP) continue;
 
 					if (prev != BOARD_INDEX_NONE
@@ -742,14 +756,18 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 						local.any = true;
 						break;
 					case Iter_Action::PROMOTE_CWIN:
-						write_dtc(idx, stm,
-							DTC_Final_Entry::make_win(ply).with_cap_cwin());
+					{
+						// Bridge Intermediate's CAP_CWIN routing hint into Final WIN's cursed marker.
+						auto promoted = DTC_Final_Entry::copy_rule(std::get<DTC_Intermediate_Entry>(cell));
+						promoted.set_score_win(ply);
+						write_dtc(idx, stm, promoted);
 						retro_mark_changed(pos_gen, ml, stm);
 						local.any = true;
 						break;
+					}
 					case Iter_Action::MARK_WIN_PREDS:
 					{
-						const bool cursed = is_cursed_class_entry(e)
+						const bool cursed = is_cursed_class_entry(std::get<DTC_Final_Entry>(cell))
 						                    || phase == Iter_Phase::CURSED;
 						retro_mark_wins(pos_gen, ml, stm,
 						                static_cast<uint16_t>(ply + 1), cursed);
@@ -763,7 +781,9 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 						if (!res.is_loss)
 						{
 							// Failed verify: clear CHANGE, preserve CAP_*.
-							write_dtc(idx, stm, e.without_change());
+							auto ie = std::get<DTC_Intermediate_Entry>(cell);
+							ie.clear_flag(DTC_FLAG_CHANGE);
+							write_dtc(idx, stm, ie);
 							break;
 						}
 						uint16_t loss_dtz = res.loss_dtz;
@@ -772,7 +792,7 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 						    && loss_dtz < DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
 							loss_dtz = DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1;
 						DTC_Final_Entry new_e = DTC_Final_Entry::make_loss(loss_dtz);
-						if (cursed) new_e = new_e.with_cap_closs();
+						if (cursed) new_e.set_flag(DTC_FLAG_CAP_CLOSS);
 						write_dtc(idx, stm, new_e);
 						retro_mark_wins(pos_gen, ml, stm,
 						                static_cast<uint16_t>(loss_dtz + 1),
@@ -983,8 +1003,8 @@ void DTC_Generator::save_slices(const EGTB_Paths& paths)
 
 namespace {
 
-using DTC_Save_Cache = Save_Group_Cache<DTC_Final_Entry>;
-using DTC_Pinned_Range = Pinned_Group_Range<DTC_Final_Entry>;
+using DTC_Save_Cache = Save_Group_Cache<DTC_Final_Entry, DTC_Intermediate_Entry>;
+using DTC_Pinned_Range = Pinned_Group_Range<DTC_Final_Entry, DTC_Intermediate_Entry>;
 
 struct Gather_Sink
 {
@@ -1004,7 +1024,7 @@ struct Singular_Probe_Result
 
 NODISCARD static Singular_Probe_Result singular_probe(
 	const Piece_Config_For_Gen& epsi,
-	Sliced_EGTB_File_For_Gen<DTC_Final_Entry>& src,
+	Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>& src,
 	DTC_Save_Cache& cache,
 	Color color,
 	size_t num_positions)
@@ -1117,7 +1137,7 @@ static Block_Source make_wdl_block_source(
 				for (size_t i = in_slice_start; i < in_slice_end; ++i)
 				{
 					const Board_Index idx = static_cast<Board_Index>(s * within + i);
-					const DTC_Final_Entry e = src.read(idx);
+					const DTC_Final_Entry e = src.template read<DTC_Final_Entry>(idx);
 					const WDL_Entry w = e.wdl();
 					const size_t cur_raw = raw + (i - in_slice_start);
 					const size_t packed_byte = cur_raw / WDL_ENTRY_PACK_RATIO - byte_off;
@@ -1220,7 +1240,7 @@ static void gather_dtc_info(
 			}
 			for (size_t idx = base; idx < end; ++idx)
 			{
-				const DTC_Final_Entry e = src.read(static_cast<Board_Index>(idx));
+				const DTC_Final_Entry e = src.template read<DTC_Final_Entry>(static_cast<Board_Index>(idx));
 				const uint64_t w = epsi.orbit_weight(didx);
 				info.add_result(color, e.wdl(), w);
 				if (e.is_win())

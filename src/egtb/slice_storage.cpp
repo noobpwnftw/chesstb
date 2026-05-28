@@ -36,9 +36,9 @@ void decompress_bytes_into(const uint8_t* src, size_t src_size,
 
 }  // namespace
 
-template <typename EntryT>
+template <typename EntryT, typename... OtherEntryTs>
 void save_slice_file(
-	Sliced_EGTB_File_For_Gen<EntryT>& src,
+	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& src,
 	const std::filesystem::path& path,
 	uint64_t magic)
 {
@@ -97,8 +97,14 @@ void save_slice_file(
 	if (!out) throw std::runtime_error("Write error on slice file: " + path.string());
 }
 
-template void save_slice_file<DTC_Final_Entry>(
-	Sliced_EGTB_File_For_Gen<DTC_Final_Entry>&,
+template void save_slice_file<DTC_Final_Entry, DTC_Intermediate_Entry>(
+	Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>&,
+	const std::filesystem::path&, uint64_t);
+template void save_slice_file<DTM_Final_Entry, DTM_Intermediate_Entry>(
+	Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&,
+	const std::filesystem::path&, uint64_t);
+template void save_slice_file<DTM_Final_Entry>(
+	Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&,
 	const std::filesystem::path&, uint64_t);
 
 namespace {
