@@ -1288,6 +1288,7 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 
 		if (!any)
 		{
+			std::printf("save dtm50 %d: singular\n", static_cast<int>(me));
 			color_out[me].is_singular = true;
 			color_out[me].singular_wdl = WDL_Entry::DRAW;
 		}

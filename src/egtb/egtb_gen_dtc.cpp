@@ -1275,18 +1275,19 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 		const Singular_Probe_Result probe = singular_probe(
 			m_epsi, m_table->m_dtc[me], cache, me, m_epsi.num_positions());
 
-		if (probe.singular == WDL_Entry::DRAW)
+		if (probe.singular != WDL_Entry::ILLEGAL)
 		{
-			m_info.draw_cnt[me]    = probe.legal_cnt;
-			m_info.illegal_cnt[me] = probe.illegal_cnt;
-			std::printf("save_compress_wdl %d: singular\n", static_cast<int>(me));
-			wdl_save[me] = Compressed_EGTB::make_singular(WDL_Entry::DRAW);
-		}
-		else if (probe.singular != WDL_Entry::ILLEGAL)
-		{
-			gather_dtc_info(m_epsi, cache, *m_table, me, m_epsi.num_positions(),
-				m_info, dtc_hist[me]);
-			std::printf("save_compress_wdl %d: singular\n", static_cast<int>(me));
+			if (probe.singular == WDL_Entry::DRAW)
+			{
+				m_info.draw_cnt[me]    = probe.legal_cnt;
+				m_info.illegal_cnt[me] = probe.illegal_cnt;
+			}
+			else
+			{
+				gather_dtc_info(m_epsi, cache, *m_table, me, m_epsi.num_positions(),
+					m_info, dtc_hist[me]);
+			}
+			std::printf("save wdl %d: singular\n", static_cast<int>(me));
 			wdl_save[me] = Compressed_EGTB::make_singular(probe.singular);
 		}
 		else
