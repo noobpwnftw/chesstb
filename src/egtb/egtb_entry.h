@@ -14,13 +14,13 @@
 // Magic values used for marking the EGTB files.
 enum struct EGTB_Magic : uint64_t
 {
-	WDL_MAGIC         = 0x7550918f,
-	DTC_MAGIC         = 0xb19122de,
-	DTC_SLICE_MAGIC   = 0xd1cef11e51ce0001ULL,
-	DTM_MAGIC         = 0xabc98e32,
-	DTM_SLICE_MAGIC   = 0xd1cef11e51ce0002ULL,
-	DTM50_MAGIC       = 0xabc98e50,
-	DTM50_SLICE_MAGIC = 0xd1cef11e51ce0050ULL,
+	WDL_MAGIC         = 0x9bd1e3a4,
+	DTC_MAGIC         = 0x2ec8b15f,
+	DTC_SLICE_MAGIC   = 0xd1cef11e51ce2001ULL,
+	DTM_MAGIC         = 0xab57c132,
+	DTM_SLICE_MAGIC   = 0xd1cef11e51ce2002ULL,
+	DTM50_MAGIC       = 0xab57c150,
+	DTM50_SLICE_MAGIC = 0xd1cef11e51ce2050ULL,
 };
 
 // 4 bits per entry. Syzygy-style ordering: higher = better for mover (`w > best` maxes).
