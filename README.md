@@ -248,7 +248,9 @@ to exhaustive:
 ## Shrink
 
 ```sh
+./shrink wdl dtc dtm dtm50
 ./shrink wdl/KQK.lzw dtc/KQK.lzdtc dtm/KQK.lzdtm
+./shrink --dry-run dtc/*
 ```
 
 `shrink` rewrites files in place, dropping the larger compressed STM
@@ -259,6 +261,10 @@ recursion so per-layer semantics are preserved). WDL, DTC, DTM, and
 DTM50 all dispatch through `shrink` by magic; DTC/DTM share the
 rank-encoded wire layout while DTM50 uses its own rs-pack header (16-byte
 offset entries: `dso` + uncompressed payload size).
+
+Arguments may be individual table files or generated table directories.
+Mixed shell globs are safe: non-table files such as `.info` metadata are
+skipped.
 
 Shrink is a postprocessing step. The generator does not accept any
 dependency on shrunken files -- shipping-format files are treated as

@@ -2,12 +2,13 @@
 //
 // Usage:
 //   ./shrink [-n|--dry-run] path/to/file.lzdtc path/to/file.lzdtm ...
-//   ./shrink path/to/dir/*               # shell glob
+//   ./shrink wdl dtc dtm dtm50           # generated table directories
+//   ./shrink path/to/dir/*               # shell glob; non-table files skipped
 //   ./shrink --dry-run path/to/dir/*     # report sizes without writing
 //
 // Each file is detected by magic. The larger side-to-move table is dropped
 // when it can be rederived by the probe library from the kept side and sub-TBs.
-// Already-shrunk and non-derivable files are skipped.
+// Already-shrunk, non-derivable, and non-table files are skipped.
 //
 // Writes "<path>.shrink_tmp" and renames it over the original. With -n/--dry-run
 // no files are modified; each file is parsed and the size it would shrink to is
@@ -101,8 +102,8 @@ struct Rank_Color_Info
 	uint64_t data_size = 0;
 	uint16_t num_ranks = 0;
 	const uint8_t* rank_table_ptr = nullptr;
-	const uint8_t* offset_tb_ptr  = nullptr;  // start of delta-coded offset section
-	size_t  off_section_bytes = 0;            // verbatim copy length
+	const uint8_t* offset_tb_ptr  = nullptr;
+	size_t off_section_bytes = 0;
 	const uint8_t* data_ptr       = nullptr;
 };
 
@@ -352,8 +353,8 @@ struct Dtm50_Color_Info
 	uint64_t data_size = 0;
 	uint16_t num_ranks = 0;
 	const uint8_t* rank_table_ptr = nullptr;
-	const uint8_t* offset_tb_ptr  = nullptr;   // start of delta-coded offset section
-	size_t  off_section_bytes = 0;             // verbatim copy length
+	const uint8_t* offset_tb_ptr  = nullptr;
+	size_t off_section_bytes = 0;
 	const uint8_t* data_ptr       = nullptr;
 };
 
@@ -475,7 +476,8 @@ bool shrink_dtm50(const std::filesystem::path& path)
 	shrunk[drop].data_size = 0;
 	shrunk[drop].block_cnt = 0;
 
-	size_t out_size = 8;  // magic + key_and_table_num
+	// Match save_dtm50_table layout.
+	size_t out_size = 8;
 	for (Color c : table_colors)
 		out_size += dtm50_color_header_bytes(shrunk[c]);
 	for (Color c : table_colors)
@@ -598,8 +600,8 @@ struct Wdl_Color_Info
 	uint64_t data_size = 0;
 	uint16_t dict_size = 0;
 	const uint8_t* dict_ptr = nullptr;
-	const uint8_t* offset_tb_ptr = nullptr;  // start of delta-coded offset section
-	size_t  off_section_bytes = 0;           // verbatim copy length
+	const uint8_t* offset_tb_ptr = nullptr;
+	size_t off_section_bytes = 0;
 	const uint8_t* data_ptr = nullptr;
 };
 
@@ -727,13 +729,7 @@ bool shrink_wdl(const std::filesystem::path& path)
 	shrunk[drop].data_size = 0;
 	shrunk[drop].block_cnt = 0;
 
-	// Match save_wdl_table layout:
-	//   8B file header
-	//   per-color: header bytes (23/2/1)
-	//   per-color normal: 2B dict_size + dict bytes
-	//   per-color normal: delta-coded offset section (off_section_bytes)
-	//   ceil64
-	//   per-color normal: data_size bytes, each ceil64 after
+	// Match save_wdl_table layout.
 	size_t out_size = 8;
 	for (Color c : table_colors)
 		out_size += wdl_color_header_bytes(shrunk[c]);
@@ -882,8 +878,41 @@ bool shrink_one(const std::filesystem::path& path)
 		return shrink_dtm50(path);
 	if (magic == static_cast<uint32_t>(EGTB_Magic::WDL_MAGIC))
 		return shrink_wdl(path);
-	std::fprintf(stderr, "%s: unknown magic 0x%08x (not DTC/DTM/DTM50/WDL)\n", path.c_str(), magic);
-	return false;
+	std::printf("%s: skip (not DTC/DTM/DTM50/WDL)\n", path.c_str());
+	return true;
+}
+
+bool shrink_path(const std::filesystem::path& path)
+{
+	std::error_code ec;
+	if (std::filesystem::is_directory(path, ec))
+	{
+		std::vector<std::filesystem::path> files;
+		for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec))
+		{
+			if (it->is_regular_file(ec))
+				files.push_back(it->path());
+		}
+		if (ec)
+		{
+			std::fprintf(stderr, "%s: directory scan failed: %s\n",
+				path.c_str(), ec.message().c_str());
+			return false;
+		}
+		std::sort(files.begin(), files.end());
+		bool ok = true;
+		for (const auto& file : files)
+			ok = shrink_one(file) && ok;
+		return ok;
+	}
+
+	if (!std::filesystem::is_regular_file(path, ec))
+	{
+		std::fprintf(stderr, "%s: not a regular file or directory\n", path.c_str());
+		return false;
+	}
+
+	return shrink_one(path);
 }
 
 }  // namespace
@@ -908,12 +937,12 @@ int main(int argc, char** argv)
 
 		if (first_file >= argc)
 		{
-			std::fprintf(stderr, "usage: %s [-n|--dry-run] FILE [FILE...]\n", argv[0]);
+			std::fprintf(stderr, "usage: %s [-n|--dry-run] FILE_OR_DIR [FILE_OR_DIR...]\n", argv[0]);
 			return 2;
 		}
 		int failures = 0;
 		for (int i = first_file; i < argc; ++i)
-			if (!shrink_one(argv[i])) ++failures;
+			if (!shrink_path(argv[i])) ++failures;
 
 		std::printf("total: %s %llu -> %llu (-%.1f%%)\n",
 			g_dry_run ? "would shrink" : "shrunk",
