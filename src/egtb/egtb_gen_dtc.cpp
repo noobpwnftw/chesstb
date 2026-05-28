@@ -113,7 +113,7 @@ DTC_Generator::DTC_Generator(
 	}
 }
 
-WDL_Entry DTC_Generator::read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const
+WDL_Entry DTC_Generator::read_sub_tb(Position_For_Gen& pos_gen, Move move, size_t thread_id) const
 {
 	Color sub_color;
 	const Piece_Config_For_Gen* sub_epsi = nullptr;
@@ -191,7 +191,7 @@ WDL_Entry DTC_Generator::effective_opp_wdl_after_dp(Position_For_Gen& pos_gen, M
 		? best_ep_for_opp : no_ep;
 }
 
-WDL_Entry DTC_Generator::read_post_move_wdl(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const
+WDL_Entry DTC_Generator::read_post_move_wdl(Position_For_Gen& pos_gen, Move move, size_t thread_id) const
 {
 	const Position& parent = pos_gen.board_unchecked();
 	const bool is_cap = move.is_ep_capture() || !parent.is_empty(move.to());

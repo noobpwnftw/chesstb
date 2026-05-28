@@ -116,7 +116,7 @@ DTM50_Generator::DTM50_Generator(
 // Sub-TB and post-move reads.
 // =============================================================================
 
-DTM_Final_Entry DTM50_Generator::read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const
+DTM_Final_Entry DTM50_Generator::read_sub_tb(Position_For_Gen& pos_gen, Move move, size_t thread_id) const
 {
 	Color sub_color;
 	const Piece_Config_For_Gen* sub_epsi = nullptr;
@@ -135,7 +135,7 @@ DTM_Final_Entry DTM50_Generator::read_sub_tb(const Position_For_Gen& pos_gen, Mo
 	return (sub == nullptr) ? DTM_Final_Entry::make_draw() : sub->read(sub_color, sub_idx, thread_id);
 }
 
-DTM_Final_Entry DTM50_Generator::read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, uint16_t hmc, size_t thread_id) const
+DTM_Final_Entry DTM50_Generator::read_post_move_dtm(Position_For_Gen& pos_gen, Move move, uint16_t hmc, size_t thread_id) const
 {
 	const Position& parent = pos_gen.board_unchecked();
 	const bool is_cap = move.is_ep_capture() || !parent.is_empty(move.to());

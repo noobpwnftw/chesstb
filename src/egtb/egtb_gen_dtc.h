@@ -47,11 +47,6 @@ struct DTC_Table
 
 	DTC_Table(const DTC_Table&) = delete;
 	DTC_Table& operator=(const DTC_Table&) = delete;
-
-	NODISCARD INLINE DTC_Final_Entry read(Color stm, Board_Index pos) const
-	{
-		return m_dtc[stm].template read<DTC_Final_Entry>(pos);
-	}
 };
 
 class DTC_Generator : public EGTB_Generator
@@ -72,27 +67,25 @@ public:
 
 	void save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths& paths);
 
-	NODISCARD WDL_Entry probe_read_post_move_wdl(const Position_For_Gen& pos_gen, Move move) const
-	{
-		return read_post_move_wdl(pos_gen, move, 0);
-	}
-
 private:
 	std::shared_ptr<DTC_Table> m_table;
 	std::map<Material_Key, std::shared_ptr<WDL_File_For_Probe>> m_sub_wdl;
 	const WDL_File_For_Probe* m_sub_wdl_by_move[COLOR_NB][PIECE_NB][PIECE_TYPE_NB]{};
 
 	template <typename EntryT = DTC_Final_Entry>
-	NODISCARD INLINE EntryT read_dtc(Board_Index pos, Color stm) const
+	NODISCARD INLINE const EntryT& read_dtc(Board_Index pos, Color stm) const
 	{
-		return m_table->m_dtc[stm].template read<EntryT>(pos);
+		return m_table->m_dtc[stm].template view_at<EntryT>(pos);
 	}
 	// Polymorphic read: classify by Final view, return the role-correct variant.
+	// view_at is zero-copy (reinterpret of the underlying byte); on draws the
+	// second view_at aliases the same byte without a re-load.
 	NODISCARD INLINE DTC_Any_Entry read_dtc_any(Board_Index pos, Color stm) const
 	{
-		const DTC_Final_Entry fe = read_dtc<DTC_Final_Entry>(pos, stm);
+		auto& tbl = m_table->m_dtc[stm];
+		const DTC_Final_Entry& fe = tbl.template view_at<DTC_Final_Entry>(pos);
 		if (fe.is_draw())
-			return read_dtc<DTC_Intermediate_Entry>(pos, stm);
+			return tbl.template view_at<DTC_Intermediate_Entry>(pos);
 		return fe;
 	}
 	template <typename EntryT>
@@ -102,9 +95,9 @@ private:
 		mark_iter(stm, pos, m_table->m_dtc[stm]);
 	}
 
-	NODISCARD WDL_Entry read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
+	NODISCARD WDL_Entry read_sub_tb(Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 
-	NODISCARD WDL_Entry read_post_move_wdl(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
+	NODISCARD WDL_Entry read_post_move_wdl(Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 
 	NODISCARD WDL_Entry effective_opp_wdl_after_dp(Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
 

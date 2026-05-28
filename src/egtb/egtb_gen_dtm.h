@@ -52,11 +52,6 @@ struct DTM_Table
 
 	DTM_Table(const DTM_Table&) = delete;
 	DTM_Table& operator=(const DTM_Table&) = delete;
-
-	NODISCARD INLINE DTM_Final_Entry read(Color stm, Board_Index pos) const
-	{
-		return m_dtm[stm].template read<DTM_Final_Entry>(pos);
-	}
 };
 
 class DTM_Generator : public EGTB_Generator
@@ -89,15 +84,18 @@ private:
 	uint16_t m_max_dtm = 0;
 
 	template <typename EntryT = DTM_Final_Entry>
-	NODISCARD INLINE EntryT read_dtm(Board_Index pos, Color stm) const
+	NODISCARD INLINE const EntryT& read_dtm(Board_Index pos, Color stm) const
 	{
-		return m_table->m_dtm[stm].template read<EntryT>(pos);
+		return m_table->m_dtm[stm].template view_at<EntryT>(pos);
 	}
+	// view_at is zero-copy (reinterpret of the underlying byte); on draws the
+	// second view_at aliases the same byte without a re-load.
 	NODISCARD INLINE DTM_Any_Entry read_dtm_any(Board_Index pos, Color stm) const
 	{
-		const DTM_Final_Entry fe = read_dtm<DTM_Final_Entry>(pos, stm);
+		auto& tbl = m_table->m_dtm[stm];
+		const DTM_Final_Entry& fe = tbl.template view_at<DTM_Final_Entry>(pos);
 		if (fe.is_draw())
-			return read_dtm<DTM_Intermediate_Entry>(pos, stm);
+			return tbl.template view_at<DTM_Intermediate_Entry>(pos);
 		return fe;
 	}
 	template <typename EntryT>
@@ -107,8 +105,8 @@ private:
 		mark_iter(stm, pos, m_table->m_dtm[stm]);
 	}
 
-	NODISCARD DTM_Final_Entry read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
-	NODISCARD DTM_Final_Entry read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
+	NODISCARD DTM_Final_Entry read_sub_tb(Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
+	NODISCARD DTM_Final_Entry read_post_move_dtm(Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
 
 	// Out `worst_loss_dtm` is the largest `sub_e.value()+1` contribution from

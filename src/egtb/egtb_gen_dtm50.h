@@ -66,11 +66,6 @@ struct DTM50_Table
 
 	DTM50_Table(const DTM50_Table&) = delete;
 	DTM50_Table& operator=(const DTM50_Table&) = delete;
-
-	NODISCARD INLINE DTM_Final_Entry read(Color stm, Board_Index pos, uint16_t hmc) const
-	{
-		return m_dtm[stm][hmc].read(pos);
-	}
 };
 
 class DTM50_Generator : public EGTB_Generator
@@ -94,17 +89,17 @@ private:
 	std::map<Material_Key, std::shared_ptr<DTM50_Sub_File_Flat>> m_sub_dtm;
 	const DTM50_Sub_File_Flat* m_sub_dtm_by_move[COLOR_NB][PIECE_NB][PIECE_TYPE_NB]{};
 
-	NODISCARD INLINE DTM_Final_Entry read_dtm(Board_Index pos, Color stm, uint16_t hmc) const
+	NODISCARD INLINE const DTM_Final_Entry& read_dtm(Board_Index pos, Color stm, uint16_t hmc) const
 	{
-		return m_table->m_dtm[stm][hmc].read(pos);
+		return m_table->m_dtm[stm][hmc].template view_at<DTM_Final_Entry>(pos);
 	}
 	INLINE void write_dtm(Board_Index pos, Color stm, uint16_t hmc, DTM_Final_Entry e)
 	{
 		m_table->m_dtm[stm][hmc].write(e, pos);
 	}
 
-	NODISCARD DTM_Final_Entry read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
-	NODISCARD DTM_Final_Entry read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, uint16_t hmc, size_t thread_id) const;
+	NODISCARD DTM_Final_Entry read_sub_tb(Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
+	NODISCARD DTM_Final_Entry read_post_move_dtm(Position_For_Gen& pos_gen, Move move, uint16_t hmc, size_t thread_id) const;
 	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(Position_For_Gen& pos_gen, Move dp_move, uint16_t hmc, size_t thread_id) const;
 
 	NODISCARD DTM_Final_Entry make_initial_entry(Position_For_Gen& pos_gen, uint16_t hmc, size_t thread_id) const;

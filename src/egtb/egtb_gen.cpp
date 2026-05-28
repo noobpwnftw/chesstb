@@ -281,13 +281,15 @@ static std::pair<Piece, Piece_Type> decode_move_kind(Move m, const Position& p)
 }
 
 Board_Index EGTB_Generator::next_sub_index(
-	const Position_For_Gen& pos_for_gen, Move move,
+	Position_For_Gen& pos_for_gen, Move move,
 	Out_Param<Color> sub_color,
 	Out_Param<const Piece_Config_For_Gen*> sub_epsi_out) const
 {
-	const Position& parent = pos_for_gen.board();
-	const Color mover = parent.turn();
-	const auto [captured, promo] = decode_move_kind(move, parent);
+	// do_move/undo_move on pos_for_gen's own board: pos_for_gen's cached board
+	// matches its index again after the undo, so callers see no change.
+	Position& p = pos_for_gen.board();
+	const Color mover = p.turn();
+	const auto [captured, promo] = decode_move_kind(move, p);
 
 	const Piece_Config_For_Gen* sub = m_sub_epsi_by_move[mover][captured][promo];
 	ASSERT(sub != nullptr);
@@ -296,23 +298,29 @@ Board_Index EGTB_Generator::next_sub_index(
 	*sub_epsi_out = sub;
 	*sub_color = m_sub_read_color_by_move[mover][captured][promo];
 
-	Position p = parent;
-	(void)p.do_move(move);
+	const Piece captured_by_move = p.do_move(move);
 
+	Board_Index result;
 	if (mirr)
 	{
 		Position swapped;
 		swapped.clear();
-		for (Square sq = SQ_A1; sq < SQ_END; sq = static_cast<Square>(sq + 1))
+		Bitboard occ = p.occupied();
+		while (occ)
 		{
-			const Piece q = p.piece_at(sq);
-			if (q != PIECE_NONE)
-				swapped.put_piece(piece_opp_color(q), sq_rank_mirror(sq));
+			const Square sq = occ.pop_first_square();
+			swapped.put_piece(piece_opp_color(p.piece_at(sq)), sq_rank_mirror(sq));
 		}
 		swapped.set_turn(color_opp(p.turn()));
-		return board_index_of_position(*sub, swapped);
+		result = board_index_of_position(*sub, swapped);
 	}
-	return board_index_of_position(*sub, p);
+	else
+	{
+		result = board_index_of_position(*sub, p);
+	}
+
+	p.undo_move(move, captured_by_move);
+	return result;
 }
 
 std::map<Material_Key, Piece_Config> EGTB_Generator::enumerate_sub_materials(const Piece_Config& ps)

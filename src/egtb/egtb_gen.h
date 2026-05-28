@@ -885,7 +885,8 @@ protected:
 
 	// Forward sub-move: apply `move`, look up sub-material, mirror if needed,
 	// return Board_Index in the sub-epsi. Handles cap/promo/cap-promo uniformly.
-	NODISCARD Board_Index next_sub_index(const Position_For_Gen& pos_for_gen, Move move,
+	// Mutates pos_for_gen's board across the call and restores via undo_move.
+	NODISCARD Board_Index next_sub_index(Position_For_Gen& pos_for_gen, Move move,
 	                                     Out_Param<Color> sub_color,
 	                                     Out_Param<const Piece_Config_For_Gen*> sub_epsi) const;
 
