@@ -244,12 +244,12 @@ Board_Index EGTB_Generator::next_quiet_index(const Position_For_Gen& pos_gen, Mo
 	{
 		// Quiet pawn move is a same-file push: file-mirror orientation preserved
 		// and kings unchanged, so only pawn_slice_id needs recomputing.
-		auto placements = pos_gen.placements_unchecked();
-		placements[piece_class(mover)] =
-			placements[piece_class(mover)].with_moved_square(from, to);
+		const auto& orig = pos_gen.placements_unchecked();
+		const Piece_Class moved_cls = piece_class(mover);
+		const auto new_pl = orig[moved_cls].with_moved_square(from, to);
+		const auto& w_pl = (moved_cls == WHITE_PAWNS) ? new_pl : orig[WHITE_PAWNS];
+		const auto& b_pl = (moved_cls == BLACK_PAWNS) ? new_pl : orig[BLACK_PAWNS];
 		Decomposed_Board_Index dix = pos_gen.index();
-		const auto& w_pl = placements[WHITE_PAWNS];
-		const auto& b_pl = placements[BLACK_PAWNS];
 		dix.pawn_slice_id = m_epsi.pawn_slice_manager().lookup_from_squares(
 			Const_Span<Square>(w_pl.begin(), w_pl.size()),
 			Const_Span<Square>(b_pl.begin(), b_pl.size()));
