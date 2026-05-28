@@ -42,9 +42,9 @@ struct Probe_Result
 struct Root_Move
 {
 	Move      move;
-	WDL_Entry wdl  = WDL_Entry::DRAW;
-	int       dtz  = 0;   // +N means side-to-move wins in N plies
-	int       rank = 0;
+	WDL_Entry wdl   = WDL_Entry::DRAW;
+	int       dtz   = 0;   // +N means side-to-move wins in N plies
+	int       rank  = 0;
 	int       score = 0;
 };
 
@@ -87,6 +87,13 @@ struct Probe_Tables
 		unsigned rule50, bool use_rule50, bool has_repeated);
 	NODISCARD std::vector<Root_Move> probe_root_wdl(
 		const Position& pos, Square ep_square, bool use_rule50);
+	// Shortest forced mate that respects the 50-move rule at the given rule50
+	// clock. Unlike the DTZ ranker, wdl is the rule-true verdict and is only ever
+	// WIN/DRAW/LOSE: cursed/blessed and clock-expired wins fold to DRAW. The dtz
+	// field carries the signed mate distance in plies (+N = side to move mates in
+	// N). Empty when DTM50 is unavailable for any child (or on partial failure).
+	NODISCARD std::vector<Root_Move> probe_root_dtm50(
+		const Position& pos, Square ep_square, unsigned rule50);
 
 private:
 	struct Impl;

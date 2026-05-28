@@ -1150,3 +1150,67 @@ std::vector<Root_Move> Probe_Tables::probe_root_wdl(
 		[](const Root_Move& a, const Root_Move& b) { return a.rank > b.rank; });
 	return out;
 }
+
+std::vector<Root_Move> Probe_Tables::probe_root_dtm50(
+	const Position& pos, Square ep_square, unsigned rule50)
+{
+	std::vector<Root_Move> out;
+	const Canonical_Root root = canonical_root_from_position(pos, ep_square);
+	const Position& probe_pos = root.pos;
+
+	Move_List ml;
+	probe_pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
+	add_ep_moves(probe_pos, root.ep_square, ml);
+
+	for (size_t i = 0; i < ml.size(); ++i)
+	{
+		const Move m = ml[i];
+		if (!probe_pos.is_pseudo_legal_move_legal(m)) continue;
+
+		Child_Pos c = make_child(probe_pos, m);
+		// Advance the clock into the child the same way probe_impl does: a zeroing
+		// move opens a fresh window, anything else costs one halfmove.
+		const unsigned child_rule50 = c.is_zeroing ? 0u : rule50 + 1u;
+
+		Probe_Result cr;
+		if (c.is_kk)
+		{
+			cr.status    = Probe_Result::Status::OK;
+			cr.has_dtm50 = true;
+			cr.dtm50_wdl = WDL_Entry::DRAW;
+			cr.dtm50     = 0;
+		}
+		else
+		{
+			cr = m_impl->probe_impl(c.ps, c.pos, child_rule50, 0);
+		}
+		// DTM50 must resolve for every child or the ranking would be unsound.
+		if (cr.status != Probe_Result::Status::OK || !cr.has_dtm50
+		    || cr.dtm50_wdl == WDL_Entry::ILLEGAL)
+			return {};
+
+		// dtm50_wdl is the rule-true result at child_rule50 and is only ever
+		// WIN/DRAW/LOSE; cursed/blessed and clock-expired wins fold to DRAW.
+		const WDL_Entry my_wdl = invert_wdl(cr.dtm50_wdl);
+		int v = 0, rank = 0, score = 0;
+		if (my_wdl == WDL_Entry::WIN)
+		{
+			// DTM50 is exact in plies; my move adds one. mate-in-1 needs no fixup.
+			v = static_cast<int>(cr.dtm50) + 1;
+			score = rank = TB_VALUE_MATE - v;       // shorter mate -> higher rank
+		}
+		else if (my_wdl == WDL_Entry::LOSE)
+		{
+			const int d = static_cast<int>(cr.dtm50) + 1;
+			v = -d;
+			score = rank = -TB_VALUE_MATE + d;      // slower loss -> higher rank
+		}
+		// DRAW: v = rank = score = 0, ordered between wins and losses.
+
+		out.push_back(Root_Move{root.mirrored ? rank_mirror_move(m) : m, my_wdl, v, rank, score});
+	}
+
+	std::sort(out.begin(), out.end(),
+		[](const Root_Move& a, const Root_Move& b) { return a.rank > b.rank; });
+	return out;
+}
