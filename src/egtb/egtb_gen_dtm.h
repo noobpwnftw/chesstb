@@ -109,7 +109,7 @@ private:
 
 	NODISCARD DTM_Final_Entry read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 	NODISCARD DTM_Final_Entry read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
-	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
+	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
 
 	// Out `worst_loss_dtm` is the largest `sub_e.value()+1` contribution from
 	// cap/promo children when the return is Intermediate; 0 otherwise.
@@ -139,8 +139,6 @@ private:
 		bool is_loss = false;
 		uint16_t loss_dtm = 0;
 	};
-
-	NODISCARD Iter_Action action_for_entry(DTM_Any_Entry e, uint16_t ply) const;
 
 	struct Iter_Result {
 		bool wrote = false;     // any write this iter (incl. CHANGE-flag flips)

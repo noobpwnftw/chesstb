@@ -105,7 +105,7 @@ private:
 
 	NODISCARD DTM_Final_Entry read_sub_tb(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 	NODISCARD DTM_Final_Entry read_post_move_dtm(const Position_For_Gen& pos_gen, Move move, uint16_t hmc, size_t thread_id) const;
-	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, uint16_t hmc, size_t thread_id) const;
+	NODISCARD DTM_Final_Entry effective_opp_dtm_after_dp(Position_For_Gen& pos_gen, Move dp_move, uint16_t hmc, size_t thread_id) const;
 
 	NODISCARD DTM_Final_Entry make_initial_entry(Position_For_Gen& pos_gen, uint16_t hmc, size_t thread_id) const;
 	void init_entries(In_Out_Param<Thread_Pool> thread_pool, uint16_t hmc);

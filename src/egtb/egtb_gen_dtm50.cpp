@@ -189,15 +189,15 @@ INLINE bool dtm_better_for_mover(DTM_Final_Entry a, DTM_Final_Entry b)
 
 }  // namespace
 
-DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, uint16_t hmc, size_t thread_id) const
+DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(Position_For_Gen& pos_gen, Move dp_move, uint16_t hmc, size_t thread_id) const
 {
 	const DTM_Final_Entry no_ep = read_post_move_dtm(pos_gen, dp_move, hmc, thread_id);
 
-	const Position& parent = pos_gen.board_unchecked();
-	const Color mover = parent.turn();
-	const Color opp = color_opp(mover);
-	Position p = parent;
-	(void)p.do_move(dp_move);
+	// do_move/undo_move on pos_gen's own board: pos_gen's cached board matches
+	// its index again after the undo, so callers see no change.
+	Position& p = pos_gen.board_unchecked();
+	const Color opp = color_opp(p.turn());
+	const Piece captured_by_dp = p.do_move(dp_move);
 
 	const Rank opp_ep_rank    = (opp == WHITE) ? RANK_5 : RANK_4;
 	const Rank ep_target_rank = (opp == WHITE) ? RANK_6 : RANK_3;
@@ -238,6 +238,8 @@ DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(const Position_For_G
 			best_ep_for_opp = opp_at_pre_ep;
 		any_ep = true;
 	}
+
+	p.undo_move(dp_move, captured_by_dp);
 
 	if (!any_ep) return no_ep;
 	return dtm_better_for_mover(best_ep_for_opp, no_ep) ? best_ep_for_opp : no_ep;

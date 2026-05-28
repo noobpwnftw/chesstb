@@ -167,15 +167,15 @@ INLINE bool dtm_better_for_mover(DTM_Final_Entry a, DTM_Final_Entry b)
 
 }  // namespace
 
-DTM_Final_Entry DTM_Generator::effective_opp_dtm_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const
+DTM_Final_Entry DTM_Generator::effective_opp_dtm_after_dp(Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const
 {
 	const DTM_Final_Entry no_ep = read_post_move_dtm(pos_gen, dp_move, thread_id);
 
-	const Position& parent = pos_gen.board_unchecked();
-	const Color mover = parent.turn();
-	const Color opp = color_opp(mover);
-	Position p = parent;
-	(void)p.do_move(dp_move);
+	// do_move/undo_move on pos_gen's own board: pos_gen's cached board matches
+	// its index again after the undo, so callers see no change.
+	Position& p = pos_gen.board_unchecked();
+	const Color opp = color_opp(p.turn());
+	const Piece captured_by_dp = p.do_move(dp_move);
 
 	const Rank opp_ep_rank    = (opp == WHITE) ? RANK_5 : RANK_4;
 	const Rank ep_target_rank = (opp == WHITE) ? RANK_6 : RANK_3;
@@ -215,6 +215,8 @@ DTM_Final_Entry DTM_Generator::effective_opp_dtm_after_dp(const Position_For_Gen
 			best_ep_for_opp = opp_at_pre_ep;
 		any_ep = true;
 	}
+
+	p.undo_move(dp_move, captured_by_dp);
 
 	if (!any_ep) return no_ep;
 	return dtm_better_for_mover(best_ep_for_opp, no_ep) ? best_ep_for_opp : no_ep;
@@ -441,43 +443,6 @@ uint16_t DTM_Generator::init_entries(In_Out_Param<Thread_Pool> thread_pool)
 // Retrograde sweep.
 // =============================================================================
 
-// Dispatch on Any_Entry via std::visit: Intermediate handles draws with flags
-// (CHANGE / PAWN_EVAL routing); Final handles classified WIN/LOSS retros and
-// stale-WIN bookkeeping.
-DTM_Generator::Iter_Action DTM_Generator::action_for_entry(
-	DTM_Any_Entry e, uint16_t ply) const
-{
-	const bool has_pawns = m_epsi.pawn_slice_manager().has_pawns();
-	return std::visit(overload{
-		[&](DTM_Intermediate_Entry ie) -> Iter_Action {
-			if (ie.has_change()) return Iter_Action::CHANGE_REVERIFY;
-			// PAWN_EVAL: forward-read for retro-blind edges (cap/promo + pawn push).
-			if (ply > 0 && ie.has_pawn_eval()) return Iter_Action::PAWN_EVAL;
-			return Iter_Action::SKIP;
-		},
-		[&](DTM_Final_Entry fe) -> Iter_Action {
-			if (fe.is_illegal()) return Iter_Action::SKIP;
-			if (ply == 0)
-			{
-				if (fe.is_loss() && fe.value() == 0) return Iter_Action::MARK_WIN_IN_1;
-				return Iter_Action::SKIP;
-			}
-			// WIN(ply) and WIN(ply-1) both MARK_CHANGED so pred check_loss sees a
-			// fully-classified child (same-ply just-overwritten + prior-ply settled).
-			if (fe.is_win() && (fe.value() == ply || fe.value() == ply - 1))
-				return Iter_Action::MARK_CHANGED;
-			if (fe.is_loss() && fe.value() == ply)
-				return Iter_Action::MARK_WIN_PREDS;
-			// Stale WIN(value > ply) from init cap/promo seed; faster in-material
-			// pawn push can overwrite. Routes through PAWN_EVAL handler
-			// (no check_loss fallthrough).
-			if (has_pawns && fe.is_win() && fe.value() > ply)
-				return Iter_Action::PAWN_EVAL;
-			return Iter_Action::SKIP;
-		}
-	}, e);
-}
-
 DTM_Generator::Loss_Verification_Result DTM_Generator::check_loss(
 	Position_For_Gen& pos_gen,
 	Move_List& ml,
@@ -638,18 +603,41 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 
 					const DTM_Any_Entry cell = read_dtm_any(idx, stm);
 
-					std::visit(overload{
-						[&](DTM_Final_Entry fe) {
-							if (!fe.is_illegal())
-								update_max(chunk.max_classified, static_cast<uint16_t>(fe.value()));
-						},
-						[&](DTM_Intermediate_Entry ie) {
+					// Intermediate handles draws with flags (CHANGE / PAWN_EVAL
+					// routing); Final handles classified WIN/LOSS retros and
+					// stale-WIN bookkeeping. Visit fuses chunk-state bookkeeping
+					// with the action decode; bare DRAW Intermediates stay inert.
+					const Iter_Action action = std::visit(overload{
+						[&](DTM_Intermediate_Entry ie) -> Iter_Action {
 							// Only flagged Intermediates revisit; bare DRAW skips forever.
 							if (ie.has_any_flags()) chunk.any_intermediate = true;
+							if (ie.has_change()) return Iter_Action::CHANGE_REVERIFY;
+							// PAWN_EVAL: forward-read for retro-blind edges (cap/promo + pawn push).
+							if (ply > 0 && ie.has_pawn_eval()) return Iter_Action::PAWN_EVAL;
+							return Iter_Action::SKIP;
+						},
+						[&](DTM_Final_Entry fe) -> Iter_Action {
+							if (fe.is_illegal()) return Iter_Action::SKIP;
+							update_max(chunk.max_classified, static_cast<uint16_t>(fe.value()));
+							if (ply == 0)
+							{
+								if (fe.is_loss() && fe.value() == 0) return Iter_Action::MARK_WIN_IN_1;
+								return Iter_Action::SKIP;
+							}
+							// WIN(ply) and WIN(ply-1) both MARK_CHANGED so pred check_loss sees a
+							// fully-classified child (same-ply just-overwritten + prior-ply settled).
+							if (fe.is_win() && (fe.value() == ply || fe.value() == ply - 1))
+								return Iter_Action::MARK_CHANGED;
+							if (fe.is_loss() && fe.value() == ply)
+								return Iter_Action::MARK_WIN_PREDS;
+							// Stale WIN(value > ply) from init cap/promo seed; faster in-material
+							// pawn push can overwrite. Routes through PAWN_EVAL handler
+							// (no check_loss fallthrough).
+							if (has_pawns && fe.is_win() && fe.value() > ply)
+								return Iter_Action::PAWN_EVAL;
+							return Iter_Action::SKIP;
 						}
 					}, cell);
-
-					const Iter_Action action = action_for_entry(cell, ply);
 					if (action == Iter_Action::SKIP) continue;
 
 					if (prev != BOARD_INDEX_NONE
@@ -759,7 +747,7 @@ DTM_Generator::Iter_Result DTM_Generator::run_iter(In_Out_Param<Thread_Pool> thr
 			update_max(max_classified, r.max_classified);
 		}
 		// Evict: no Intermediates and every classified value < ply-1 → no
-		// action_for_entry will fire here again. Later writes reinstate via mark_iter.
+		// dispatch will fire here again. Later writes reinstate via mark_iter.
 		if (!any_intermediate && max_classified + 1 < ply)
 			m_iter_groups[stm][g] = 0;
 	}

@@ -106,7 +106,7 @@ private:
 
 	NODISCARD WDL_Entry read_post_move_wdl(const Position_For_Gen& pos_gen, Move move, size_t thread_id) const;
 
-	NODISCARD WDL_Entry effective_opp_wdl_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
+	NODISCARD WDL_Entry effective_opp_wdl_after_dp(Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const;
 
 	NODISCARD DTC_Any_Entry make_initial_entry(Position_For_Gen& pos_gen, size_t thread_id) const;
 	bool init_entries(In_Out_Param<Thread_Pool> thread_pool);
@@ -131,10 +131,6 @@ private:
 		uint16_t loss_dtz = 0;
 		bool cursed = false;
 	};
-
-	NODISCARD Iter_Action action_for_entry(DTC_Any_Entry e,
-	                                       uint16_t ply,
-	                                       Iter_Phase phase) const;
 
 	NODISCARD bool run_iter(In_Out_Param<Thread_Pool> thread_pool,
 	                        Color stm, uint16_t ply, Iter_Phase phase);

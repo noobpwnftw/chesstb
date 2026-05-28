@@ -131,15 +131,15 @@ WDL_Entry DTC_Generator::read_sub_tb(const Position_For_Gen& pos_gen, Move move,
 	return (sub == nullptr) ? WDL_Entry::DRAW : sub->read(sub_color, sub_idx, thread_id);
 }
 
-WDL_Entry DTC_Generator::effective_opp_wdl_after_dp(const Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const
+WDL_Entry DTC_Generator::effective_opp_wdl_after_dp(Position_For_Gen& pos_gen, Move dp_move, size_t thread_id) const
 {
 	const WDL_Entry no_ep = read_post_move_wdl(pos_gen, dp_move, thread_id);
 
-	const Position& parent = pos_gen.board_unchecked();
-	const Color mover = parent.turn();
-	const Color opp = color_opp(mover);
-	Position p = parent;
-	(void)p.do_move(dp_move);
+	// do_move/undo_move on pos_gen's own board: pos_gen's cached board matches
+	// its index again after the undo, so callers see no change.
+	Position& p = pos_gen.board_unchecked();
+	const Color opp = color_opp(p.turn());
+	const Piece captured_by_dp = p.do_move(dp_move);
 
 	const Rank opp_ep_rank    = (opp == WHITE) ? RANK_5 : RANK_4;
 	const Rank ep_target_rank = (opp == WHITE) ? RANK_6 : RANK_3;
@@ -183,6 +183,8 @@ WDL_Entry DTC_Generator::effective_opp_wdl_after_dp(const Position_For_Gen& pos_
 			best_ep_for_opp = w_opp;
 		any_ep = true;
 	}
+
+	p.undo_move(dp_move, captured_by_dp);
 
 	if (!any_ep) return no_ep;
 	return static_cast<int>(best_ep_for_opp) > static_cast<int>(no_ep)
@@ -502,53 +504,6 @@ INLINE bool wdl_is_opp_win(WDL_Entry w, bool cursed)
 
 } // namespace
 
-// Syzygy class-driven iterate: WIN(dtz=ply) flags preds CHANGE; flagged preds
-// reverify; verified LOSS retros preds as WIN(ply+1).
-//
-// Dispatch on Any_Entry via std::visit: Intermediate handles the draw-with-flags
-// branch (CHANGE / cursed-route hints); Final handles classified WIN/LOSS retros.
-DTC_Generator::Iter_Action DTC_Generator::action_for_entry(
-	DTC_Any_Entry e, uint16_t ply, Iter_Phase phase) const
-{
-	return std::visit(overload{
-		[&](DTC_Intermediate_Entry ie) -> Iter_Action {
-			// Cursed-gate fires regardless of CHANGE. Otherwise a coincident
-			// CHANGE at ply 101 would route cap_cwin/cap_closs through
-			// CHANGE_REVERIFY, which can't classify them (check_loss fails /
-			// returns sub-clamp dtz), clearing CHANGE and leaving them SKIP
-			// forever. PROMOTE_CWIN and CAPT_CLOSS_REVERIFY overwrite anyway,
-			// so the stale CHANGE is fine.
-			if (phase == Iter_Phase::CURSED
-			    && ply == DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
-			{
-				if (ie.has_cap_cwin())  return Iter_Action::PROMOTE_CWIN;
-				if (ie.has_cap_closs()) return Iter_Action::CAPT_CLOSS_REVERIFY;
-			}
-			if (ie.has_change())
-			{
-				return (phase == Iter_Phase::CURSED && ie.has_cap_closs())
-					? Iter_Action::CAPT_CLOSS_REVERIFY
-					: Iter_Action::CHANGE_REVERIFY;
-			}
-			return Iter_Action::SKIP;
-		},
-		[&](DTC_Final_Entry fe) -> Iter_Action {
-			if (fe.is_illegal()) return Iter_Action::SKIP;
-			if (ply == 0)
-			{
-				// Mate: preds become WIN(1).
-				if (fe.is_loss() && fe.value() == 0) return Iter_Action::MARK_WIN_IN_1;
-				return Iter_Action::SKIP;
-			}
-			if (fe.is_win() && (fe.value() == ply || fe.value() == ply - 1))
-				return Iter_Action::MARK_CHANGED;
-			if (fe.is_loss() && fe.value() == ply)
-				return Iter_Action::MARK_WIN_PREDS;
-			return Iter_Action::SKIP;
-		}
-	}, e);
-}
-
 DTC_Generator::Loss_Verification_Result DTC_Generator::check_loss(
 	Position_For_Gen& pos_gen,
 	Move_List& ml,
@@ -721,20 +676,50 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 
 					const DTC_Any_Entry cell = read_dtc_any(idx, stm);
 
-					// Track chunk state by role: classified cells contribute to
-					// max_classified; flagged Intermediates contribute to
-					// any_intermediate (bare DRAW stays inert).
-					std::visit(overload{
-						[&](DTC_Final_Entry fe) {
-							if (!fe.is_illegal())
-								update_max(chunk.max_classified, static_cast<uint16_t>(fe.value()));
-						},
-						[&](DTC_Intermediate_Entry ie) {
+					// Syzygy class-driven iterate: WIN(dtz=ply) flags preds CHANGE;
+					// flagged preds reverify; verified LOSS retros preds as WIN(ply+1).
+					// Visit fuses chunk-state bookkeeping with the action decode;
+					// bare DRAW Intermediates stay inert.
+					const Iter_Action action = std::visit(overload{
+						[&](DTC_Intermediate_Entry ie) -> Iter_Action {
 							if (ie.has_any_flags()) chunk.any_intermediate = true;
+							// Cursed-gate fires regardless of CHANGE. Otherwise a
+							// coincident CHANGE at ply 101 would route
+							// cap_cwin/cap_closs through CHANGE_REVERIFY, which
+							// can't classify them (check_loss fails / returns
+							// sub-clamp dtz), clearing CHANGE and leaving them
+							// SKIP forever. PROMOTE_CWIN and CAPT_CLOSS_REVERIFY
+							// overwrite anyway, so the stale CHANGE is fine.
+							if (phase == Iter_Phase::CURSED
+							    && ply == DTC_Final_Entry::MAX_NON_CURSED_DTZ + 1)
+							{
+								if (ie.has_cap_cwin())  return Iter_Action::PROMOTE_CWIN;
+								if (ie.has_cap_closs()) return Iter_Action::CAPT_CLOSS_REVERIFY;
+							}
+							if (ie.has_change())
+							{
+								return (phase == Iter_Phase::CURSED && ie.has_cap_closs())
+									? Iter_Action::CAPT_CLOSS_REVERIFY
+									: Iter_Action::CHANGE_REVERIFY;
+							}
+							return Iter_Action::SKIP;
+						},
+						[&](DTC_Final_Entry fe) -> Iter_Action {
+							if (fe.is_illegal()) return Iter_Action::SKIP;
+							update_max(chunk.max_classified, static_cast<uint16_t>(fe.value()));
+							if (ply == 0)
+							{
+								// Mate: preds become WIN(1).
+								if (fe.is_loss() && fe.value() == 0) return Iter_Action::MARK_WIN_IN_1;
+								return Iter_Action::SKIP;
+							}
+							if (fe.is_win() && (fe.value() == ply || fe.value() == ply - 1))
+								return Iter_Action::MARK_CHANGED;
+							if (fe.is_loss() && fe.value() == ply)
+								return Iter_Action::MARK_WIN_PREDS;
+							return Iter_Action::SKIP;
 						}
 					}, cell);
-
-					const Iter_Action action = action_for_entry(cell, ply, phase);
 					if (action == Iter_Action::SKIP) continue;
 
 					if (prev != BOARD_INDEX_NONE
@@ -823,7 +808,7 @@ bool DTC_Generator::run_iter(In_Out_Param<Thread_Pool> thread_pool,
 			update_max(max_classified, r.max_classified);
 		}
 		// Evict: no Intermediates and every classified value < ply-1 → no
-		// action_for_entry will fire here again. Later writes reinstate via mark_iter.
+		// dispatch will fire here again. Later writes reinstate via mark_iter.
 		if (!any_intermediate && max_classified + 1 < ply)
 			m_iter_groups[stm][g] = 0;
 	}
