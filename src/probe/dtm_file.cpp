@@ -91,8 +91,6 @@ void DTM_Traits::finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)[C
                           const Fixed_Vector<Color, 2>& table_colors, const Piece_Config& ps,
                           const std::filesystem::path& path)
 {
-	reader.align(8);
-
 	for (Color i : table_colors)
 	{
 		if (is_singular[i] || is_dropped[i]) continue;
@@ -100,13 +98,11 @@ void DTM_Traits::finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)[C
 		const uint8_t log2_bu      = reader.read<uint8_t>();
 		const uint8_t sample_width = reader.read<uint8_t>();
 		const uint8_t offset_width = reader.read<uint8_t>();
-		reader.advance(1);  // usz_width: 0 for DTM
-		reader.align(8);
+		reader.advance(1);  // usz_width
 		const uint8_t* mono_ptr = reader.caret();
 		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
 			pc.block_cnt + 1, log2_bu, sample_width, offset_width);
 		reader.advance(mono_bytes);
-		reader.align(8);
 		pc.offsets = Mono_Uint_Vec(mono_ptr, pc.block_cnt + 1,
 		                           log2_bu, sample_width, offset_width);
 	}

@@ -154,7 +154,7 @@ NODISCARD INLINE State_Prefix state_prefix_indexed(
 
 // Cached buffer: [DTM50_Cached_Block][payload][DTM50_Prefix_Entry prefix...].
 // Offsets are cached so read() does not reparse the payload layout every probe.
-// Skipped blocks (usz==0) are short-circuited in read() before reaching here.
+// Skipped blocks are short-circuited in read() before reaching here.
 Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 {
 	if (Block_Ptr cached = find_cached_block(pc.block_id, pc.data, pc.live, block_id))
@@ -164,7 +164,7 @@ Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 	const size_t doff = pair[0];
 	const size_t dsz  = pair[1] - pair[0];
 	const size_t usz  = pc.usizes.get(block_id);
-	ASSERT(dsz != 0);  // read() checks the skip sentinel (comp_size==0) first
+	ASSERT(dsz != 0);  // read() short-circuits the skip sentinel before us
 	ASSERT((usz & 3) == 0);
 
 	if (!pc.decomp)
@@ -264,8 +264,6 @@ void DTM50_Traits::finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)
                             const Fixed_Vector<Color, 2>& table_colors, const Piece_Config&,
                             const std::filesystem::path&)
 {
-	reader.align(8);
-
 	for (Color i : table_colors)
 	{
 		if (is_singular[i] || is_dropped[i]) continue;
@@ -274,16 +272,13 @@ void DTM50_Traits::finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)
 		const uint8_t sample_width = reader.read<uint8_t>();
 		const uint8_t offset_width = reader.read<uint8_t>();
 		const uint8_t usz_width    = reader.read<uint8_t>();
-		reader.align(8);
 		const uint8_t* mono_ptr = reader.caret();
 		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
 			pc.block_cnt + 1, log2_bu, sample_width, offset_width);
 		reader.advance(mono_bytes);
-		reader.align(8);
 		const uint8_t* usz_ptr = reader.caret();
 		const size_t usz_bytes = Min0_Uint_Vec::on_disk_bytes(pc.block_cnt, usz_width);
 		reader.advance(usz_bytes);
-		reader.align(8);
 		pc.offsets = Mono_Uint_Vec(mono_ptr, pc.block_cnt + 1,
 		                           log2_bu, sample_width, offset_width);
 		pc.usizes = Min0_Uint_Vec(usz_ptr, pc.block_cnt, usz_width);
@@ -311,9 +306,8 @@ uint16_t DTM50_Traits::read(Per_Color& pc, bool is_singular, Board_Index pos,
 	const size_t block_id = static_cast<size_t>(pos) / ppb;
 	const size_t pos_in_block = static_cast<size_t>(pos) % ppb;
 
-	// Skip-block (comp_size==0): uniform DRAW. W/L would force a non-zero cell at
-	// some layer, and ILLEGAL is filtered by the upstream WDL guard, so wdl
-	// is DRAW/cursed/blessed here — all decode to DRAW regardless of hmc.
+	// Skip-block (uniform DRAW): W/L would force a non-zero cell at some
+	// layer, and ILLEGAL is filtered upstream by the WDL guard.
 	const auto pair_skip = pc.offsets.get2(block_id);
 	if (pair_skip[0] == pair_skip[1]) return 0;
 

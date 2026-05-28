@@ -272,8 +272,7 @@ void save_wdl_table(
 	EGTB_Magic magic
 )
 {
-	// Build the cumulative-offset arrays and delta-encode them up front so
-	// file_size accounting knows each color's offset-section byte count.
+	// Pre-encode each color's offsets so file_size knows the section bytes.
 	Mono_Uint_Vec::Encoded mono_enc[COLOR_NB];
 	for (const Color i : table_colors)
 	{
@@ -313,11 +312,7 @@ void save_wdl_table(
 
 		file_size += 2;
 		if (t.dict().has_value())
-		{
 			file_size += t.dict()->size();
-			if (file_size & 1)
-				file_size += 1;
-		}
 	}
 	for (const Color i : table_colors)
 	{
@@ -325,7 +320,7 @@ void save_wdl_table(
 		if (t.is_singular())
 			continue;
 
-		file_size += mono_section_bytes(mono_enc[i].on_disk_bytes);
+		file_size += MONO_SECTION_WIDTH_BYTES + mono_enc[i].on_disk_bytes;
 	}
 
 	file_size = ceil_to_multiple(file_size, (size_t)64);
@@ -378,15 +373,11 @@ void save_wdl_table(
 		{
 			writer.write<uint16_t>(narrowing_static_cast<uint16_t>(t.dict()->size()));
 			writer.write(Const_Span(t.dict()->data(), t.dict()->size()));
-			writer.zero_align(2);
 		}
 		else
 			writer.write<uint16_t>(0);
 	}
 
-	// Per-color delta-coded offset section:
-	//   [u8 log2_bu, sample_width, offset_width, usz_width=0]
-	//   align(8) -> mono blob -> align(8).
 	for (const Color i : table_colors)
 	{
 		const Compressed_EGTB& t = save_info[i];
@@ -397,10 +388,8 @@ void save_wdl_table(
 		writer.write<uint8_t>(m.log2_bu);
 		writer.write<uint8_t>(m.sample_width);
 		writer.write<uint8_t>(m.offset_width);
-		writer.write<uint8_t>(0);  // usz_width: WDL has none
-		writer.zero_align(8);
+		writer.write<uint8_t>(0);  // usz_width
 		writer.write(Const_Span<uint8_t>(m.blob.data(), m.on_disk_bytes));
-		writer.zero_align(8);
 	}
 
 	writer.zero_align(64);
@@ -433,7 +422,7 @@ void save_egtb_table(
 	EGTB_Magic magic
 )
 {
-	// Pre-encode each color's offsets as a delta-coded Mono_Uint_Vec.
+	// Pre-encode each color's offsets so file_size knows the section bytes.
 	Mono_Uint_Vec::Encoded mono_enc[COLOR_NB];
 	for (const Color i : table_colors)
 	{
@@ -474,7 +463,7 @@ void save_egtb_table(
 		if (t.is_singular())
 			continue;
 
-		file_size += mono_section_bytes(mono_enc[i].on_disk_bytes);
+		file_size += MONO_SECTION_WIDTH_BYTES + mono_enc[i].on_disk_bytes;
 	}
 
 	file_size = ceil_to_multiple(file_size, (size_t)64);
@@ -523,9 +512,6 @@ void save_egtb_table(
 		}
 	}
 
-	writer.zero_align(8);
-
-	// Per-color delta-coded offset section: widths + align(8) + mono blob + align(8).
 	for (const Color i : table_colors)
 	{
 		const Compressed_EGTB& t = save_info[i];
@@ -536,10 +522,8 @@ void save_egtb_table(
 		writer.write<uint8_t>(m.log2_bu);
 		writer.write<uint8_t>(m.sample_width);
 		writer.write<uint8_t>(m.offset_width);
-		writer.write<uint8_t>(0);  // usz_width: DTC/DTM have none
-		writer.zero_align(8);
+		writer.write<uint8_t>(0);  // usz_width
 		writer.write(Const_Span<uint8_t>(m.blob.data(), m.on_disk_bytes));
-		writer.zero_align(8);
 	}
 
 	writer.zero_align(64);
@@ -656,7 +640,6 @@ void load_wdl_table(
 		{
 			lp_dict[i] = reader.caret();
 			reader.advance(dict_size[i]);
-			reader.align(2);
 		}
 	}
 
@@ -669,12 +652,10 @@ void load_wdl_table(
 		mono_params[i][0] = reader.read<uint8_t>();
 		mono_params[i][1] = reader.read<uint8_t>();
 		mono_params[i][2] = reader.read<uint8_t>();
-		reader.advance(1);  // usz_width: 0 for WDL
-		reader.align(8);
+		reader.advance(1);  // usz_width
 		offset_tb[i] = reader.caret();
 		reader.advance(Mono_Uint_Vec::on_disk_bytes(
 			block_cnt[i] + 1, mono_params[i][0], mono_params[i][1], mono_params[i][2]));
-		reader.align(8);
 	}
 
 	for (const Color i : table_colors)
@@ -776,8 +757,6 @@ void load_dtm_table(
 		}
 	}
 
-	reader.align(8);
-
 	for (const Color i : table_colors)
 	{
 		if (dtm->m_is_singular[i]) continue;
@@ -785,13 +764,11 @@ void load_dtm_table(
 		const uint8_t log2_bu      = reader.read<uint8_t>();
 		const uint8_t sample_width = reader.read<uint8_t>();
 		const uint8_t offset_width = reader.read<uint8_t>();
-		reader.advance(1);  // usz_width: 0 for DTM
-		reader.align(8);
+		reader.advance(1);  // usz_width
 		const uint8_t* mono_ptr = reader.caret();
 		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
 			pc.block_cnt + 1, log2_bu, sample_width, offset_width);
 		reader.advance(mono_bytes);
-		reader.align(8);
 		pc.offsets = Mono_Uint_Vec(mono_ptr, pc.block_cnt + 1,
 		                           log2_bu, sample_width, offset_width);
 	}
@@ -896,8 +873,6 @@ void load_dtm_sub_flat(
 		}
 	}
 
-	reader.align(8);
-
 	Mono_Uint_Vec offsets[COLOR_NB];
 	for (const Color i : table_colors)
 	{
@@ -905,13 +880,11 @@ void load_dtm_sub_flat(
 		const uint8_t log2_bu      = reader.read<uint8_t>();
 		const uint8_t sample_width = reader.read<uint8_t>();
 		const uint8_t offset_width = reader.read<uint8_t>();
-		reader.advance(1);  // usz_width: 0 for DTM
-		reader.align(8);
+		reader.advance(1);  // usz_width
 		const uint8_t* mono_ptr = reader.caret();
 		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
 			block_cnt[i] + 1, log2_bu, sample_width, offset_width);
 		reader.advance(mono_bytes);
-		reader.align(8);
 		offsets[i] = Mono_Uint_Vec(mono_ptr, block_cnt[i] + 1,
 		                           log2_bu, sample_width, offset_width);
 	}
@@ -1090,8 +1063,6 @@ void load_dtm50_sub_flat(
 		}
 	}
 
-	reader.align(8);
-
 	Mono_Uint_Vec offsets[COLOR_NB];
 	Min0_Uint_Vec usizes[COLOR_NB];
 	for (const Color i : table_colors)
@@ -1101,16 +1072,13 @@ void load_dtm50_sub_flat(
 		const uint8_t sample_width = reader.read<uint8_t>();
 		const uint8_t offset_width = reader.read<uint8_t>();
 		const uint8_t usz_width    = reader.read<uint8_t>();
-		reader.align(8);
 		const uint8_t* mono_ptr = reader.caret();
 		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
 			block_cnt[i] + 1, log2_bu, sample_width, offset_width);
 		reader.advance(mono_bytes);
-		reader.align(8);
 		const uint8_t* usz_ptr = reader.caret();
 		const size_t usz_bytes = Min0_Uint_Vec::on_disk_bytes(block_cnt[i], usz_width);
 		reader.advance(usz_bytes);
-		reader.align(8);
 		offsets[i] = Mono_Uint_Vec(mono_ptr, block_cnt[i] + 1,
 		                           log2_bu, sample_width, offset_width);
 		usizes[i] = Min0_Uint_Vec(usz_ptr, block_cnt[i], usz_width);
@@ -1178,7 +1146,7 @@ void load_dtm50_sub_flat(
 					(bidx == blocks - 1 && tail_positions[i] != 0) ? tail_positions[i] : ppb;
 				const size_t base_pos = bidx * ppb;
 
-				// Skip sentinel (comp_size==0): all-don't-care span, DRAW-fill.
+				// Skip sentinel: all-don't-care span, DRAW-fill.
 				if (dsz == 0)
 				{
 					std::memset(out + base_pos, 0,

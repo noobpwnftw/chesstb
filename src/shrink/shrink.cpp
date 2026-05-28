@@ -146,8 +146,6 @@ NODISCARD bool parse_rank_encoded(const Const_Span<uint8_t>& bytes,
 		}
 	}
 
-	r.align(8);
-
 	for (Color c : *out_table_colors)
 	{
 		if (!info[c].present) continue;
@@ -156,11 +154,9 @@ NODISCARD bool parse_rank_encoded(const Const_Span<uint8_t>& bytes,
 		const uint8_t log2_bu      = r.read<uint8_t>();
 		const uint8_t sample_width = r.read<uint8_t>();
 		const uint8_t offset_width = r.read<uint8_t>();
-		r.advance(1);  // usz_width: 0 for DTC/DTM
-		r.align(8);
+		r.advance(1);  // usz_width
 		r.advance(Mono_Uint_Vec::on_disk_bytes(
 			info[c].block_cnt + 1, log2_bu, sample_width, offset_width));
-		r.align(8);
 		info[c].offset_tb_ptr = sec_start;
 		info[c].off_section_bytes = static_cast<size_t>(r.caret() - sec_start);
 	}
@@ -232,7 +228,6 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 	size_t out_size = 8;
 	for (Color c : table_colors)
 		out_size += rank_color_header_bytes(shrunk[c]);
-	out_size = ceil_to_multiple(out_size, (size_t)8);
 	for (Color c : table_colors)
 		if (shrunk[c].present && flag_is_normal(shrunk[c].flag))
 			out_size += shrunk[c].off_section_bytes;
@@ -293,8 +288,6 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 		}
 	}
 
-	w.zero_align(8);
-
 	for (Color c : table_colors)
 	{
 		const Rank_Color_Info& ci = shrunk[c];
@@ -344,7 +337,7 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 
 // =============================================================================
 // DTM50 shrinker. Separate from shrink_rank_encoded because the .lzdtm50 pack
-// uses block-stride-in-positions and 16-byte (dso, usz) offset entries.
+// uses block-stride-in-positions and carries a per-block usz alongside offsets.
 // =============================================================================
 struct Dtm50_Color_Info
 {
@@ -403,8 +396,6 @@ NODISCARD bool parse_dtm50(const Const_Span<uint8_t>& bytes,
 		}
 	}
 
-	r.align(8);
-
 	for (Color c : *out_table_colors)
 	{
 		if (!info[c].present) continue;
@@ -414,12 +405,9 @@ NODISCARD bool parse_dtm50(const Const_Span<uint8_t>& bytes,
 		const uint8_t sample_width = r.read<uint8_t>();
 		const uint8_t offset_width = r.read<uint8_t>();
 		const uint8_t usz_width    = r.read<uint8_t>();
-		r.align(8);
 		r.advance(Mono_Uint_Vec::on_disk_bytes(
 			info[c].block_cnt + 1, log2_bu, sample_width, offset_width));
-		r.align(8);
 		r.advance(Min0_Uint_Vec::on_disk_bytes(info[c].block_cnt, usz_width));
-		r.align(8);
 		info[c].offset_tb_ptr = sec_start;
 		info[c].off_section_bytes = static_cast<size_t>(r.caret() - sec_start);
 	}
@@ -490,10 +478,9 @@ bool shrink_dtm50(const std::filesystem::path& path)
 	size_t out_size = 8;  // magic + key_and_table_num
 	for (Color c : table_colors)
 		out_size += dtm50_color_header_bytes(shrunk[c]);
-	out_size = ceil_to_multiple(out_size, (size_t)8);
 	for (Color c : table_colors)
 		if (shrunk[c].present && flag_is_normal(shrunk[c].flag))
-			out_size += shrunk[c].off_section_bytes;  // 16 bytes per block (dso + usz)
+			out_size += shrunk[c].off_section_bytes;
 	out_size = ceil_to_multiple(out_size, (size_t)64);
 	for (Color c : table_colors)
 	{
@@ -550,8 +537,6 @@ bool shrink_dtm50(const std::filesystem::path& path)
 				w.write(Const_Span<uint8_t>(ci.rank_table_ptr, ci.num_ranks * 2));
 		}
 	}
-
-	w.zero_align(8);
 
 	for (Color c : table_colors)
 	{
@@ -616,8 +601,6 @@ struct Wdl_Color_Info
 	const uint8_t* offset_tb_ptr = nullptr;  // start of delta-coded offset section
 	size_t  off_section_bytes = 0;           // verbatim copy length
 	const uint8_t* data_ptr = nullptr;
-	// Non-empty dictionaries are 2-byte aligned.
-	bool dict_pad_byte = false;
 };
 
 NODISCARD bool parse_wdl(const Const_Span<uint8_t>& bytes,
@@ -665,8 +648,6 @@ NODISCARD bool parse_wdl(const Const_Span<uint8_t>& bytes,
 		{
 			info[c].dict_ptr = r.caret();
 			r.advance(info[c].dict_size);
-			info[c].dict_pad_byte = ((r.num_bytes_read() & 1) != 0);
-			if (info[c].dict_pad_byte) r.advance(1);
 		}
 	}
 
@@ -678,11 +659,9 @@ NODISCARD bool parse_wdl(const Const_Span<uint8_t>& bytes,
 		const uint8_t log2_bu      = r.read<uint8_t>();
 		const uint8_t sample_width = r.read<uint8_t>();
 		const uint8_t offset_width = r.read<uint8_t>();
-		r.advance(1);  // usz_width: 0 for WDL
-		r.align(8);
+		r.advance(1);  // usz_width
 		r.advance(Mono_Uint_Vec::on_disk_bytes(
 			info[c].block_cnt + 1, log2_bu, sample_width, offset_width));
-		r.align(8);
 		info[c].offset_tb_ptr = sec_start;
 		info[c].off_section_bytes = static_cast<size_t>(r.caret() - sec_start);
 	}
@@ -743,7 +722,6 @@ bool shrink_wdl(const std::filesystem::path& path)
 	shrunk[drop].flag = DROPPED_FLAG;
 	shrunk[drop].dict_size = 0;
 	shrunk[drop].dict_ptr = nullptr;
-	shrunk[drop].dict_pad_byte = false;
 	shrunk[drop].offset_tb_ptr = nullptr;
 	shrunk[drop].data_ptr = nullptr;
 	shrunk[drop].data_size = 0;
@@ -752,7 +730,7 @@ bool shrink_wdl(const std::filesystem::path& path)
 	// Match save_wdl_table layout:
 	//   8B file header
 	//   per-color: header bytes (23/2/1)
-	//   per-color normal: 2B dict_size + dict bytes (+ 1B align if odd)
+	//   per-color normal: 2B dict_size + dict bytes
 	//   per-color normal: delta-coded offset section (off_section_bytes)
 	//   ceil64
 	//   per-color normal: data_size bytes, each ceil64 after
@@ -764,7 +742,6 @@ bool shrink_wdl(const std::filesystem::path& path)
 		const Wdl_Color_Info& ci = shrunk[c];
 		if (!ci.present || !flag_is_normal(ci.flag)) continue;
 		out_size += 2 + ci.dict_size;
-		if (ci.dict_size && (out_size & 1)) out_size += 1;
 	}
 	for (Color c : table_colors)
 	{
@@ -826,18 +803,13 @@ bool shrink_wdl(const std::filesystem::path& path)
 		}
 	}
 
-	// Empty dictionaries are uint16(0) with no padding. The probe parser only
-	// consumes alignment padding after non-empty dictionaries.
 	for (Color c : table_colors)
 	{
 		const Wdl_Color_Info& ci = shrunk[c];
 		if (!ci.present || !flag_is_normal(ci.flag)) continue;
 		w.write<uint16_t>(ci.dict_size);
 		if (ci.dict_size)
-		{
 			w.write(Const_Span<uint8_t>(ci.dict_ptr, ci.dict_size));
-			w.zero_align(2);
-		}
 	}
 
 	for (Color c : table_colors)

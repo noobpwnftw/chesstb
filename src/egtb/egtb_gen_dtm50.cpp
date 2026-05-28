@@ -625,10 +625,9 @@ namespace {
 //       uint16 rank_to_value[num_ranks]    W/L storage values, frequency-sorted
 //   per-color offset section (non-singular): delta-coded succinct index
 //     [u8 log2_bu, sample_width, offset_width, usz_width]
-//     align(8); Mono_Uint_Vec blob over (block_cnt+1) cumulative offsets
-//     align(8); Min0_Uint_Vec blob over block_cnt usz values
-//     align(8)
-//     skip-block sentinel: get2(i)[0]==get2(i)[1] (comp_size == 0).
+//     Mono_Uint_Vec blob over (block_cnt+1) cumulative offsets
+//     Min0_Uint_Vec blob over block_cnt usz values
+//     skip-block sentinel: get2(i)[0] == get2(i)[1].
 //   align 64
 //   per-color compressed data (non-singular), ceil64-aligned tail
 //   end-checksum (8 bytes, xxhash with EGTB_CHECKSUM_INIT_VALUE)
@@ -1130,7 +1129,7 @@ void save_dtm50_table(
 	const std::filesystem::path& file_path,
 	Fixed_Vector<Color, 2> colors)
 {
-	// Pre-encode each color's offsets (mono) and per-block usz (min0).
+	// Pre-encode offsets + usz so file_size knows the section bytes.
 	Mono_Uint_Vec::Encoded mono_enc[COLOR_NB];
 	Min0_Uint_Vec::Encoded min0_enc[COLOR_NB];
 	for (Color c : colors)
@@ -1167,8 +1166,9 @@ void save_dtm50_table(
 	}
 	for (Color c : colors)
 		if (!color_out[c].is_singular)
-			file_size += mono_section_bytes(mono_enc[c].on_disk_bytes,
-			                                min0_enc[c].on_disk_bytes);
+			file_size += MONO_SECTION_WIDTH_BYTES
+			           + mono_enc[c].on_disk_bytes
+			           + min0_enc[c].on_disk_bytes;
 	file_size = ceil_to_multiple(file_size, size_t{ 64 });
 	for (Color c : colors)
 	{
@@ -1207,9 +1207,6 @@ void save_dtm50_table(
 			for (uint16_t v : co.ranks.rank_to_value) w.write<uint16_t>(v);
 		}
 	}
-	w.zero_align(8);
-	// Per-color delta-coded offset section: widths + align(8) + mono + align(8)
-	// + min0(usz) + align(8).
 	for (Color c : colors)
 	{
 		const DTM50_Compressed_Color& co = color_out[c];
@@ -1220,11 +1217,8 @@ void save_dtm50_table(
 		w.write<uint8_t>(m.sample_width);
 		w.write<uint8_t>(m.offset_width);
 		w.write<uint8_t>(u.width);
-		w.zero_align(8);
 		w.write(Const_Span<uint8_t>(m.blob.data(), m.on_disk_bytes));
-		w.zero_align(8);
 		w.write(Const_Span<uint8_t>(u.blob.data(), u.on_disk_bytes));
-		w.zero_align(8);
 	}
 	w.zero_align(64);
 	for (Color c : colors)

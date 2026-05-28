@@ -13,9 +13,9 @@
 //                    (DTM50's per-block usz, which is not monotonic).
 //
 // Bit I/O is unaligned and reads up to two 8-byte words, so every packed region
-// MUST be followed by >= 8 bytes of slack (the on-disk layout aligns
-// each region to 8 and is always followed by more data or the file checksum;
-// the in-memory builders pad explicitly).
+// MUST be followed by >= 8 bytes of readable memory. On disk that's covered by
+// whatever follows each section (more sections, the compressed-data region, or
+// the end checksum); the in-memory builders pad with 8 trailing zero bytes.
 
 #include "util/defines.h"
 #include "util/math.h"
@@ -79,7 +79,7 @@ INLINE void mono_write_bits(uint8_t* base, size_t bitpos, uint64_t val, unsigned
 
 // ---------------------------------------------------------------------------
 // Mono_Uint_Vec: monotonic delta-coded sequence.
-// On-disk/in-memory blob layout: [sample_bits | pad to 8][delta_bits].
+// On-disk/in-memory blob layout: [sample_bits][delta_bits].
 // The 3 width/param bytes live in the caller's section header, not the blob.
 // ---------------------------------------------------------------------------
 struct Mono_Uint_Vec
@@ -102,8 +102,7 @@ struct Mono_Uint_Vec
 		  m_sample_width(sample_width), m_offset_width(offset_width)
 	{
 		const size_t num_samples = ceil_div(num_values, size_t{ 1 } << log2_bu);
-		const size_t sample_bytes = ceil_div(num_samples * sample_width, size_t{ 8 });
-		m_delta = blob + ceil_to_multiple(sample_bytes, size_t{ 8 });
+		m_delta = blob + ceil_div(num_samples * sample_width, size_t{ 8 });
 	}
 
 	NODISCARD INLINE uint64_t get(size_t i) const
@@ -130,7 +129,7 @@ struct Mono_Uint_Vec
 	// --- builder ---
 	struct Encoded
 	{
-		std::vector<uint8_t> blob;  // [sample | pad8][delta], + 8 bytes slack
+		std::vector<uint8_t> blob;  // [sample][delta], + 8 bytes read slack
 		uint8_t log2_bu = 0;
 		uint8_t sample_width = 0;
 		uint8_t offset_width = 0;
@@ -158,9 +157,8 @@ struct Mono_Uint_Vec
 		const uint8_t offset_width = mono_bit_width(max_delta);
 
 		const size_t sample_bytes = ceil_div(num_samples * sample_width, size_t{ 8 });
-		const size_t sample_aligned = ceil_to_multiple(sample_bytes, size_t{ 8 });
 		const size_t delta_bytes = ceil_div(n * offset_width, size_t{ 8 });
-		const size_t on_disk = sample_aligned + delta_bytes;
+		const size_t on_disk = sample_bytes + delta_bytes;
 
 		Encoded out;
 		out.log2_bu = log2_bu;
@@ -170,7 +168,7 @@ struct Mono_Uint_Vec
 		out.blob.assign(on_disk + 8, 0);  // +8 read slack
 
 		uint8_t* sample = out.blob.data();
-		uint8_t* delta = out.blob.data() + sample_aligned;
+		uint8_t* delta = out.blob.data() + sample_bytes;
 		for (size_t s = 0; s < num_samples; ++s)
 			mono_write_bits(sample, s * sample_width, values[s << log2_bu], sample_width);
 		for (size_t i = 0; i < n; ++i)
@@ -186,9 +184,8 @@ struct Mono_Uint_Vec
 	                            uint8_t sample_width, uint8_t offset_width)
 	{
 		const size_t num_samples = ceil_div(num_values, size_t{ 1 } << log2_bu);
-		const size_t sample_aligned =
-			ceil_to_multiple(ceil_div(num_samples * sample_width, size_t{ 8 }), size_t{ 8 });
-		return sample_aligned + ceil_div(num_values * offset_width, size_t{ 8 });
+		return ceil_div(num_samples * sample_width, size_t{ 8 })
+		     + ceil_div(num_values * offset_width, size_t{ 8 });
 	}
 };
 
@@ -242,19 +239,10 @@ struct Min0_Uint_Vec
 
 // Per-color offset section layout used by all EGTB formats:
 //   [u8 log2_bu][u8 sample_width][u8 offset_width][u8 usz_width]
-//   align(8); mono blob   (mono_bytes)
-//   align(8); min0 blob   (min0_bytes; 0 for non-DTM50)
-//   align(8)              -- so next color or align(64) starts 8-aligned
-NODISCARD INLINE constexpr size_t mono_section_bytes(size_t mono_bytes, size_t min0_bytes = 0)
-{
-	size_t s = 4;
-	s = ceil_to_multiple(s, size_t{ 8 });
-	s += mono_bytes;
-	if (min0_bytes)
-	{
-		s = ceil_to_multiple(s, size_t{ 8 });
-		s += min0_bytes;
-	}
-	s = ceil_to_multiple(s, size_t{ 8 });
-	return s;
-}
+//   mono blob  (Mono_Uint_Vec::on_disk_bytes bytes)
+//   min0 blob  (Min0_Uint_Vec::on_disk_bytes bytes; DTM50 only)
+// No padding: all reads are memcpy-based (alignment-tolerant); the trailing
+// 8-byte read-slack required by mono_read_bits is provided by whatever follows
+// the section in the file (further sections, the compressed-data region, or
+// the end checksum).
+constexpr size_t MONO_SECTION_WIDTH_BYTES = 4;

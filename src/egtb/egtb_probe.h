@@ -301,9 +301,8 @@ struct WDL_File_For_Probe
 		const size_t block_id = packed_byte / pc.block_size;
 		const size_t in_block = packed_byte % pc.block_size;
 
-		// Skip sentinel (comp_size == 0): get2 returns an equal pair. The
-		// save side emits no payload bytes for such blocks (see save_wdl_table);
-		// feeding a zero-byte span to LZ4 would throw.
+		// Equal-offsets sentinel marks an all-ILLEGAL block: save_wdl_table
+		// emits no payload bytes, so we must short-circuit before LZ4.
 		const auto pair_skip = pc.offsets.get2(block_id);
 		if (pair_skip[0] == pair_skip[1])
 			return WDL_Entry::ILLEGAL;
@@ -479,7 +478,6 @@ struct DTM_File_For_Probe
 		const size_t block_id    = static_cast<size_t>(pos) / positions_per_block;
 		const size_t in_block_pos = static_cast<size_t>(pos) % positions_per_block;
 
-		// Skip-block sentinel (comp_size == 0): equal consecutive offsets.
 		const auto pair_skip = pc.offsets.get2(block_id);
 		if (pair_skip[0] == pair_skip[1])
 			return DTM_Final_Entry::make_illegal();
