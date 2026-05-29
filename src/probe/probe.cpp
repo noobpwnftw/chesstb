@@ -211,6 +211,18 @@ NODISCARD bool prefer_new(WDL_Entry new_wdl, uint16_t new_dtc,
 	return false;
 }
 
+NODISCARD bool wdl_is_cursed_class(WDL_Entry w)
+{
+	return w == WDL_Entry::CURSED_WIN || w == WDL_Entry::BLESSED_LOSS;
+}
+
+NODISCARD uint16_t zeroing_dtc_from_child(WDL_Entry child_wdl)
+{
+	return wdl_is_cursed_class(child_wdl)
+		? static_cast<uint16_t>(DTC_MAX_NON_CURSED_DTZ + 1)
+		: uint16_t{1};
+}
+
 bool is_symmetric_material(const Piece_Config& ps)
 {
 	const auto [mat_key, mir_key] = ps.material_keys();
@@ -573,7 +585,7 @@ std::optional<uint16_t> Probe_Tables::Impl::derive_dtc(const Piece_Config& ps, c
 
 		WDL_Entry my_wdl = invert_wdl(cw);
 		const uint16_t my_dtc = c.is_zeroing
-			? uint16_t{1}
+			? zeroing_dtc_from_child(cw)
 			: static_cast<uint16_t>(1u + cd);
 		if (my_dtc > DTC_MAX_NON_CURSED_DTZ)
 		{
@@ -873,7 +885,7 @@ Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
 
 		if (best.has_dtc && cr.has_dtc)
 		{
-			const uint16_t my_dtc = 1;
+			const uint16_t my_dtc = zeroing_dtc_from_child(cr.wdl);
 			if (prefer_new(my_wdl, my_dtc, best_dtc_wdl, best_dtc))
 			{
 				best_dtc_wdl = my_wdl;
@@ -1203,6 +1215,8 @@ std::vector<Root_Move> Probe_Tables::probe_root_dtz(
 		else
 		{
 			cr = m_impl->probe_impl(c.ps, c.pos, SKIP_DTM50, 0);
+			if (move_is_pawn_double_push(probe_pos, m))
+				cr = m_impl->apply_ep_overlay(c.pos, cr, ep_square_after_double_push(m), 0);
 		}
 		if (cr.status != Probe_Result::Status::OK || cr.wdl == WDL_Entry::ILLEGAL)
 			return {};
@@ -1294,6 +1308,8 @@ std::vector<Root_Move> Probe_Tables::probe_root_wdl(
 		else
 		{
 			cr = m_impl->probe_impl(c.ps, c.pos, SKIP_DTM50, 0);
+			if (move_is_pawn_double_push(probe_pos, m))
+				cr = m_impl->apply_ep_overlay(c.pos, cr, ep_square_after_double_push(m), 0);
 		}
 		if (cr.status != Probe_Result::Status::OK || cr.wdl == WDL_Entry::ILLEGAL)
 			return {};
@@ -1343,6 +1359,8 @@ std::vector<Root_Move> Probe_Tables::probe_root_dtm50(
 		else
 		{
 			cr = m_impl->probe_impl(c.ps, c.pos, child_rule50, 0);
+			if (move_is_pawn_double_push(probe_pos, m))
+				cr = m_impl->apply_ep_overlay(c.pos, cr, ep_square_after_double_push(m), 0);
 		}
 		// DTM50 must resolve for every child or the ranking would be unsound.
 		if (cr.status != Probe_Result::Status::OK || !cr.has_dtm50
