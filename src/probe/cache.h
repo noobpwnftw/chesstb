@@ -15,11 +15,54 @@ inline uint64_t next_epoch()
 	return ctr.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
+// Worker ids index per-cache `decomps` vectors. Ids are recycled via a free
+// list so the id space is bounded by *peak concurrent* workers, not by the
+// total number of threads ever created — otherwise a process that spawns many
+// short-lived probing threads would grow every cache's vector without bound.
+inline std::mutex& worker_id_mu()
+{
+	static std::mutex m;
+	return m;
+}
+
+inline std::vector<size_t>& worker_id_free()
+{
+	static std::vector<size_t> f;
+	return f;
+}
+
+inline size_t alloc_worker_id()
+{
+	std::lock_guard<std::mutex> lk(worker_id_mu());
+	std::vector<size_t>& free = worker_id_free();
+	if (!free.empty())
+	{
+		const size_t id = free.back();
+		free.pop_back();
+		return id;
+	}
+	static size_t ctr = 0;
+	return ctr++;
+}
+
+inline void free_worker_id(size_t id)
+{
+	std::lock_guard<std::mutex> lk(worker_id_mu());
+	worker_id_free().push_back(id);
+}
+
 inline size_t worker_index()
 {
-	static std::atomic<size_t> ctr{0};
-	thread_local const size_t id = ctr.fetch_add(1, std::memory_order_relaxed);
-	return id;
+	// The thread_local's destructor returns the id to the free list on thread
+	// exit. A reused id inherits the prior owner's decompressor slots, which is
+	// safe: at any instant only one live thread holds a given id.
+	struct Guard
+	{
+		size_t id = alloc_worker_id();
+		~Guard() { free_worker_id(id); }
+	};
+	thread_local Guard g;
+	return g.id;
 }
 
 using Block_Ptr = std::shared_ptr<const std::vector<uint8_t>>;
