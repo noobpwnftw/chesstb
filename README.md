@@ -249,7 +249,7 @@ to exhaustive:
 
 ```sh
 ./shrink wdl dtc dtm dtm50
-./shrink dtc/KQK.lzdtc dtm/KQK.lzdtm
+./shrink wdl/KQK.lzw dtc/KQK.lzdtc dtm/KQK.lzdtm
 ./shrink --dry-run dtc/*
 ```
 
