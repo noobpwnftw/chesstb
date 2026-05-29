@@ -95,6 +95,35 @@ struct TL_Block_FIFO
 	size_t next = 0;
 };
 
+template <typename T, typename K = uint32_t>
+struct TL_Cache
+{
+	static constexpr size_t N = 4;
+	uint64_t epoch[N] = {};
+	K key[N] = {};
+	T* val[N] = {};
+	size_t rr = 0;
+
+	bool lookup(uint64_t impl_epoch, K k, T*& out) const
+	{
+		for (size_t i = 0; i < N; ++i)
+			if (epoch[i] == impl_epoch && key[i] == k)
+				{ out = val[i]; return true; }
+		return false;
+	}
+
+	void insert(uint64_t impl_epoch, K k, T* v)
+	{
+		for (size_t i = 0; i < N; ++i)
+			if (epoch[i] == impl_epoch && key[i] == k)
+				{ val[i] = v; return; }
+		const size_t i = (rr++) & (N - 1);
+		epoch[i] = impl_epoch;
+		key[i] = k;
+		val[i] = v;
+	}
+};
+
 // Shared per-color block cache: a few decompressed blocks plus one decompressor
 // per worker (LZ4 for WDL, LZMA otherwise). Decompressors aren't thread-safe —
 // each writes its own internal buffer — so per-worker copies let decode run
@@ -119,10 +148,17 @@ struct Block_Cache
 	Decompressor& decomp_for(Make&& make)
 	{
 		const size_t w = worker_index();
+		thread_local TL_Cache<Decompressor, size_t> tl_decomps;
+		Decompressor* dc = nullptr;
+		if (tl_decomps.lookup(epoch, w, dc))
+			return *dc;
+
 		std::lock_guard<std::mutex> lk(decomp_mu);
 		if (decomps.size() <= w) decomps.resize(w + 1);
 		if (!decomps[w]) decomps[w] = make();
-		return *decomps[w];
+		dc = decomps[w].get();
+		tl_decomps.insert(epoch, w, dc);
+		return *dc;
 	}
 };
 
@@ -167,32 +203,3 @@ inline const uint8_t* fetch_block_cached(Cache& cache, size_t block_id, Build&& 
 	tl.bytes[s]    = blk;
 	return blk->data();
 }
-
-template <typename T, typename K = uint32_t>
-struct TL_Cache
-{
-	static constexpr size_t N = 4;
-	uint64_t epoch[N] = {};
-	K key[N] = {};
-	T* val[N] = {};
-	size_t rr = 0;
-
-	bool lookup(uint64_t impl_epoch, K k, T*& out) const
-	{
-		for (size_t i = 0; i < N; ++i)
-			if (epoch[i] == impl_epoch && key[i] == k)
-				{ out = val[i]; return true; }
-		return false;
-	}
-
-	void insert(uint64_t impl_epoch, K k, T* v)
-	{
-		for (size_t i = 0; i < N; ++i)
-			if (epoch[i] == impl_epoch && key[i] == k)
-				{ val[i] = v; return; }
-		const size_t i = (rr++) & (N - 1);
-		epoch[i] = impl_epoch;
-		key[i] = k;
-		val[i] = v;
-	}
-};
