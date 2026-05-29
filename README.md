@@ -248,7 +248,7 @@ to exhaustive:
 ## Shrink
 
 ```sh
-./shrink dtc dtm dtm50
+./shrink wdl dtc dtm dtm50
 ./shrink dtc/KQK.lzdtc dtm/KQK.lzdtm
 ./shrink --dry-run dtc/*
 ```
@@ -257,12 +257,20 @@ to exhaustive:
 color when it can be reconstructed at probe time. The probe code detects
 dropped colors and rebuilds them by one-ply minimax against the kept
 color and sub-TBs (DTM50 threads each child's hmc through the recursion
-so per-layer semantics are preserved).
+so per-layer semantics are preserved). WDL, DTC, DTM, and DTM50 all
+dispatch through `shrink` by magic; DTC/DTM share the rank-encoded wire
+layout, while DTM50 uses its own rs-pack header (16-byte offset entries:
+`dso` + uncompressed payload size).
 
-Only DTC, DTM, and DTM50 are shrinkable; they dispatch through `shrink`
-by magic. DTC/DTM share the rank-encoded wire layout, while DTM50 uses
-its own rs-pack header (16-byte offset entries: `dso` + uncompressed
-payload size).
+WDL stays self-contained -- it never reads another table. Rebuilding a
+dropped WDL frame is a strict one-ply minimax over children: a quiet move
+keeps the child in the kept opposite-STM frame of the same material, read
+directly. The only WIN-vs-CURSED_WIN ambiguity at one ply is a child
+sitting at exactly the last in-rule ply (`dtz == 100`), since the parent
+then tips one ply past the 50-move edge. The WDL format reserves two
+spare 4-bit codes (`BOUNDARY_WIN`, `BOUNDARY_LOSS`) to mark those edge
+positions; every other reader folds them to WIN/LOSE via `wdl_from_storage()`.
+Zeroing moves reset the clock, so they cross no edge and need no marker.
 
 Arguments may be individual table files or generated table directories.
 Mixed shell globs are safe: non-table files such as `.info` metadata are

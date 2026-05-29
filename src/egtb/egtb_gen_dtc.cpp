@@ -1126,7 +1126,7 @@ static Block_Source make_wdl_block_source(
 					const size_t cur_raw = raw + (i - in_slice_start);
 					const size_t packed_byte = cur_raw / WDL_ENTRY_PACK_RATIO - byte_off;
 					const size_t in_packed   = cur_raw % WDL_ENTRY_PACK_RATIO;
-					set_wdl_entry(packed[packed_byte], in_packed, w);
+					set_wdl_entry(packed[packed_byte], in_packed, wdl_for_storage(e));
 
 					const uint64_t ow = epsi.orbit_weight(didx);
 					switch (w)

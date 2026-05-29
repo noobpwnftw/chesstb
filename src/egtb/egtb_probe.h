@@ -313,7 +313,7 @@ struct WDL_File_For_Probe
 
 		Packed_WDL_Entries entry;
 		std::memcpy(&entry, decompressed_block + in_block, sizeof(Packed_WDL_Entries));
-		return get_wdl_value(entry, static_cast<size_t>(pos) % WDL_ENTRY_PACK_RATIO);
+		return wdl_from_storage(get_wdl_value(entry, static_cast<size_t>(pos) % WDL_ENTRY_PACK_RATIO));
 	}
 
 	bool m_is_singular[COLOR_NB];

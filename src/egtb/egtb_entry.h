@@ -23,18 +23,23 @@ enum struct EGTB_Magic : uint64_t
 	DTM50_SLICE_MAGIC = 0xd1cef11e51ce2050ULL,
 };
 
-// 4 bits per entry. Syzygy-style ordering: higher = better for mover (`w > best` maxes).
-// ILLEGAL = 7 sits off-scale so it can't masquerade as a real outcome.
-//   CURSED_WIN:   normal-rules win, not reachable within 50mr (FIDE: draw).
-//   BLESSED_LOSS: loss not forceable within 50mr.
+// 4 bits per entry, numbered worst-to-best: the generator picks outcomes by
+// value (e.g. effective_opp_wdl_after_dp), so the base-class order is
+// load-bearing. CURSED_WIN is a normal-rules win unreachable within 50mr (FIDE
+// draw); BLESSED_LOSS a loss not forceable within 50mr. BOUNDARY_LOSS/
+// BOUNDARY_WIN decorate LOSE/WIN at the 50mr edge (dtz == MAX_NON_CURSED_DTZ) and
+// sit beside their base class so wdl_from_storage() folds cleanly; only the
+// dropped-frame derive reads them. ILLEGAL = 7 is off-scale.
 enum struct WDL_Entry : uint8_t
 {
-	LOSE         = 0,
-	BLESSED_LOSS = 1,
-	DRAW         = 2,
-	CURSED_WIN   = 3,
-	WIN          = 4,
-	ILLEGAL      = 7,
+	LOSE          = 0,
+	BOUNDARY_LOSS = 1,
+	BLESSED_LOSS  = 2,
+	DRAW          = 3,
+	CURSED_WIN    = 4,
+	BOUNDARY_WIN  = 5,
+	WIN           = 6,
+	ILLEGAL       = 7,
 };
 
 enum Packed_WDL_Entries : uint8_t {};
@@ -281,6 +286,24 @@ private:
 	constexpr explicit DTC_Final_Entry(uint16_t bits) : DTC_Entry_Base{bits} {}
 };
 static_assert(sizeof(DTC_Final_Entry) == 2);
+
+NODISCARD constexpr WDL_Entry wdl_from_storage(WDL_Entry w)
+{
+	if (w == WDL_Entry::BOUNDARY_WIN)  return WDL_Entry::WIN;
+	if (w == WDL_Entry::BOUNDARY_LOSS) return WDL_Entry::LOSE;
+	return w;
+}
+
+NODISCARD constexpr WDL_Entry wdl_for_storage(DTC_Final_Entry e)
+{
+	const WDL_Entry w = e.wdl();
+	if (static_cast<uint16_t>(e.value()) == DTC_Final_Entry::MAX_NON_CURSED_DTZ)
+	{
+		if (w == WDL_Entry::WIN)  return WDL_Entry::BOUNDARY_WIN;
+		if (w == WDL_Entry::LOSE) return WDL_Entry::BOUNDARY_LOSS;
+	}
+	return w;
+}
 
 // 1-byte tier halves cursed values (round up so decode stays > MAX_NON_CURSED_DTZ);
 // 2-byte tier writes raw values.

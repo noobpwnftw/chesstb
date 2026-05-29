@@ -16,15 +16,28 @@ enum struct EGTB_Magic : uint64_t
 	DTM50_MAGIC = 0xab57c150,
 };
 
+// Listed worst-to-best. BOUNDARY_LOSS/BOUNDARY_WIN decorate LOSE/WIN at the 50mr
+// edge (dtz == DTC_MAX_NON_CURSED_DTZ); only the dropped-frame derive reads them,
+// every other consumer folds via wdl_from_storage().
 enum struct WDL_Entry : uint8_t
 {
-	LOSE         = 0,
-	BLESSED_LOSS = 1,
-	DRAW         = 2,
-	CURSED_WIN   = 3,
-	WIN          = 4,
-	ILLEGAL      = 7,
+	LOSE          = 0,
+	BOUNDARY_LOSS = 1,
+	BLESSED_LOSS  = 2,
+	DRAW          = 3,
+	CURSED_WIN    = 4,
+	BOUNDARY_WIN  = 5,
+	WIN           = 6,
+	ILLEGAL       = 7,
 };
+
+// Boundary markers report as their base class everywhere except the derive.
+NODISCARD constexpr WDL_Entry wdl_from_storage(WDL_Entry w)
+{
+	if (w == WDL_Entry::BOUNDARY_WIN)  return WDL_Entry::WIN;
+	if (w == WDL_Entry::BOUNDARY_LOSS) return WDL_Entry::LOSE;
+	return w;
+}
 
 enum Packed_WDL_Entries : uint8_t {};
 
