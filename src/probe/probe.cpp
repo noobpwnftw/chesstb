@@ -173,6 +173,14 @@ NODISCARD bool move_is_zeroing(const Position& pos, Move m)
 	    || m.is_ep_capture();
 }
 
+NODISCARD Square ep_square_after_double_push(Move m)
+{
+	ASSERT(is_pawn_double_push(m));
+	const int from_rank = static_cast<int>(sq_rank(m.from()));
+	const int to_rank = static_cast<int>(sq_rank(m.to()));
+	return sq_make(static_cast<Rank>((from_rank + to_rank) / 2), sq_file(m.from()));
+}
+
 NODISCARD int wdl_rank(WDL_Entry w)
 {
 	switch (w) {
@@ -372,7 +380,7 @@ struct Probe_Tables::Impl
 	NODISCARD DTM50_Result derive_dtm50(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
 
 	Probe_Result apply_ep_overlay(const Position& root, const Probe_Result& no_ep, Square ep_square);
-	WDL_Entry apply_ep_wdl_overlay(const Position& root, WDL_Entry no_ep, Square ep_square);
+	WDL_Entry apply_ep_wdl_overlay(const Position& root, WDL_Entry no_ep, Square ep_square, int depth);
 
 	void scan_paths();
 };
@@ -489,7 +497,9 @@ WDL_Entry Probe_Tables::Impl::derive_wdl(const Piece_Config& ps, const Position&
 		}
 		else if (c.is_zeroing)
 		{
-			const WDL_Entry cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
+			WDL_Entry cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
+			if (piece_type(pos.piece_at(m.from())) == PAWN && is_pawn_double_push(m))
+				cw = apply_ep_wdl_overlay(c.pos, cw, ep_square_after_double_push(m), depth + 1);
 			if (cw == WDL_Entry::ILLEGAL) continue;
 			mw = invert_wdl(cw);
 		}
@@ -864,7 +874,7 @@ Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
 }
 
 WDL_Entry Probe_Tables::Impl::apply_ep_wdl_overlay(
-	const Position& root, WDL_Entry no_ep, Square ep_square)
+	const Position& root, WDL_Entry no_ep, Square ep_square, int depth)
 {
 	if (no_ep == WDL_Entry::ILLEGAL || ep_square == SQ_END)
 		return no_ep;
@@ -880,7 +890,7 @@ WDL_Entry Probe_Tables::Impl::apply_ep_wdl_overlay(
 		Child_Pos child = make_child(root, eps[i]);
 		const WDL_Entry cw = child.is_kk
 			? WDL_Entry::DRAW
-			: probe_wdl_impl(child.ps, child.pos, 1);
+			: probe_wdl_impl(child.ps, child.pos, depth + 1);
 		if (cw == WDL_Entry::ILLEGAL) continue;
 
 		const WDL_Entry mine = invert_wdl(cw);
@@ -1040,7 +1050,7 @@ WDL_Entry Probe_Tables::probe_wdl(const Position& pos, Square ep_square, unsigne
 	if (rule50 != 0) return WDL_Entry::ILLEGAL;
 	const Canonical_Root root = canonical_root_from_position(pos, ep_square);
 	const WDL_Entry base = m_impl->probe_wdl_impl(root.ps, root.pos, 0);
-	return m_impl->apply_ep_wdl_overlay(root.pos, base, root.ep_square);
+	return m_impl->apply_ep_wdl_overlay(root.pos, base, root.ep_square, 0);
 }
 
 WDL_Entry Probe_Tables::probe_wdl(
@@ -1050,7 +1060,7 @@ WDL_Entry Probe_Tables::probe_wdl(
 	const std::optional<Canonical_Root> root = canonical_root_from_config(ps, pos, ep_square);
 	if (!root) return WDL_Entry::ILLEGAL;
 	const WDL_Entry base = m_impl->probe_wdl_impl(root->ps, root->pos, 0);
-	return m_impl->apply_ep_wdl_overlay(root->pos, base, root->ep_square);
+	return m_impl->apply_ep_wdl_overlay(root->pos, base, root->ep_square, 0);
 }
 
 namespace {
