@@ -80,6 +80,7 @@ struct Probe_Tables
 
 	// Search-time WDL probe. Fathom semantics reject nonzero rule50.
 	NODISCARD WDL_Entry probe_wdl(const Position& pos, Square ep_square, unsigned rule50);
+	NODISCARD WDL_Entry probe_wdl(const Piece_Config& ps, const Position& pos, Square ep_square, unsigned rule50);
 
 	// Root rankers using Fathom tbRank/tbScore ordering. Empty on partial failure.
 	NODISCARD std::vector<Root_Move> probe_root_dtz(

@@ -359,6 +359,7 @@ struct Probe_Tables::Impl
 	NODISCARD DTM50_File* open_dtm50(const Piece_Config& ps) { return open_table(dtm50_mu, dtm50_cache, dtm50_dirs, DTM50_EXT, ps); }
 
 	NODISCARD Probe_Result probe_impl(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
+	NODISCARD WDL_Entry probe_wdl_impl(const Piece_Config& ps, const Position& pos, int depth);
 	NODISCARD WDL_Entry probe_wdl_internal(const Piece_Config& ps, const Position& pos, int depth);
 	NODISCARD WDL_Stored read_wdl_stored(const Piece_Config& ps, const Position& pos);
 	NODISCARD std::optional<uint16_t> probe_dtc_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth);
@@ -371,6 +372,7 @@ struct Probe_Tables::Impl
 	NODISCARD DTM50_Result derive_dtm50(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
 
 	Probe_Result apply_ep_overlay(const Position& root, const Probe_Result& no_ep, Square ep_square);
+	WDL_Entry apply_ep_wdl_overlay(const Position& root, WDL_Entry no_ep, Square ep_square);
 
 	void scan_paths();
 };
@@ -754,6 +756,23 @@ Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Positi
 	return r;
 }
 
+WDL_Entry Probe_Tables::Impl::probe_wdl_impl(const Piece_Config& ps, const Position& pos, int depth)
+{
+	if (pos.turn() == BLACK && is_symmetric_material(ps))
+		return probe_wdl_impl(ps, mirror_symmetric_black_stm(pos), depth);
+
+	WDL_File* w = open_wdl(ps);
+	if (!w) return WDL_Entry::ILLEGAL;
+
+	const Position_Index_Config& epsi = get_epsi(ps);
+	if (board_index_of_position(epsi, pos) == BOARD_INDEX_NONE)
+		return WDL_Entry::ILLEGAL;
+	if (!pos.is_legal())
+		return WDL_Entry::ILLEGAL;
+
+	return probe_wdl_internal(ps, pos, depth);
+}
+
 Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
                                                    const Probe_Result& no_ep,
                                                    Square ep_square)
@@ -840,6 +859,33 @@ Probe_Result Probe_Tables::Impl::apply_ep_overlay(const Position& root,
 					: 0;
 			}
 		}
+	}
+	return best;
+}
+
+WDL_Entry Probe_Tables::Impl::apply_ep_wdl_overlay(
+	const Position& root, WDL_Entry no_ep, Square ep_square)
+{
+	if (no_ep == WDL_Entry::ILLEGAL || ep_square == SQ_END)
+		return no_ep;
+
+	Move_List eps;
+	add_ep_moves(root, ep_square, eps);
+	if (eps.empty()) return no_ep;
+
+	WDL_Entry best = no_ep;
+	for (size_t i = 0; i < eps.size(); ++i)
+	{
+		if (!root.is_pseudo_legal_move_legal(eps[i])) continue;
+		Child_Pos child = make_child(root, eps[i]);
+		const WDL_Entry cw = child.is_kk
+			? WDL_Entry::DRAW
+			: probe_wdl_impl(child.ps, child.pos, 1);
+		if (cw == WDL_Entry::ILLEGAL) continue;
+
+		const WDL_Entry mine = invert_wdl(cw);
+		if (wdl_rank(mine) > wdl_rank(best))
+			best = mine;
 	}
 	return best;
 }
@@ -992,8 +1038,19 @@ Probe_Result Probe_Tables::probe(const Piece_Config& ps, const Position& pos, Sq
 WDL_Entry Probe_Tables::probe_wdl(const Position& pos, Square ep_square, unsigned rule50)
 {
 	if (rule50 != 0) return WDL_Entry::ILLEGAL;
-	const Probe_Result r = probe(pos, ep_square);
-	return r.status == Probe_Result::Status::OK ? r.wdl : WDL_Entry::ILLEGAL;
+	const Canonical_Root root = canonical_root_from_position(pos, ep_square);
+	const WDL_Entry base = m_impl->probe_wdl_impl(root.ps, root.pos, 0);
+	return m_impl->apply_ep_wdl_overlay(root.pos, base, root.ep_square);
+}
+
+WDL_Entry Probe_Tables::probe_wdl(
+	const Piece_Config& ps, const Position& pos, Square ep_square, unsigned rule50)
+{
+	if (rule50 != 0) return WDL_Entry::ILLEGAL;
+	const std::optional<Canonical_Root> root = canonical_root_from_config(ps, pos, ep_square);
+	if (!root) return WDL_Entry::ILLEGAL;
+	const WDL_Entry base = m_impl->probe_wdl_impl(root->ps, root->pos, 0);
+	return m_impl->apply_ep_wdl_overlay(root->pos, base, root->ep_square);
 }
 
 namespace {

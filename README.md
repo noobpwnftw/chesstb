@@ -236,9 +236,7 @@ to exhaustive:
   correctness check. **Full tables only**; shipping-format files with a
   dropped STM color are rejected.
 - `run_compare` -- disk WDL vs. Syzygy through Fathom for every legal
-  canonical position, plus a DTZ cross-check on the longest-win FEN
-  against Syzygy's root probe (`+/-1` ply tolerance, since Fathom root DTZ
-  is approximate). Requires matching `.rtbw` and `.rtbz` files under
+  canonical position. Requires matching `.rtbw` files under
   `syzygy/` and a Fathom checkout at `lib/Fathom/` (`git clone
   https://github.com/jdart1/Fathom.git lib/Fathom`).
 

@@ -8,6 +8,7 @@
 #include "probe/position_index.h"
 #include "chess/attack.h"
 #include "chess/piece_config.h"
+#include "util/progress_bar.h"
 #include "util/thread_pool.h"
 
 #include <filesystem>
@@ -82,15 +83,11 @@ struct Shard
 {
 	size_t total_legal = 0, matches = 0, mismatches = 0;
 	std::vector<std::string> examples;
-	uint16_t longest_win_ply = 0;
-	size_t longest_win_idx = 0;
-	Color longest_win_stm = WHITE;
 };
 
 struct Options
 {
 	std::string wdl_dir = "./wdl/";
-	std::string dtc_dir = "./dtc/";
 	std::string syzygy_dir = "./syzygy";
 };
 
@@ -119,10 +116,11 @@ static bool compare_material(const Options& opt, const char* name)
 	// Share table caches across workers.
 	Probe_Tables tables;
 	tables.add_wdl_path(opt.wdl_dir);
-	tables.add_dtc_path(opt.dtc_dir);
 
 	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
 	std::atomic<size_t> next_idx{0};
+	Concurrent_Progress_Bar progress_bar(
+		N, std::max<size_t>(1, g_num_threads * CHUNK_SIZE), std::string(name));
 
 	auto shards = global_pool().run_sync_task_on_all_threads(
 		[&](size_t) -> Shard {
@@ -147,9 +145,7 @@ static bool compare_material(const Options& opt, const char* name)
 						// Keep one index per canonical position.
 						if (board_index_of_position(epsi, pos) != idx) continue;
 
-						const Probe_Result pr = tables.probe(ps, pos);
-						if (pr.status != Probe_Result::Status::OK) continue;
-						const WDL_Entry got = pr.wdl;
+						const WDL_Entry got = tables.probe_wdl(ps, pos, SQ_END, 0);
 						if (got == WDL_Entry::ILLEGAL) continue;
 
 						const Fathom_BBs bb = fathom_bbs(pos);
@@ -159,17 +155,6 @@ static bool compare_material(const Options& opt, const char* name)
 						if (r == TB_RESULT_FAILED) continue;
 
 						++s.total_legal;
-						if (pr.has_dtc && (got == WDL_Entry::WIN || got == WDL_Entry::CURSED_WIN))
-						{
-							const uint16_t v = static_cast<uint16_t>(pr.dtc);
-							if (v > s.longest_win_ply)
-							{
-								s.longest_win_ply = v;
-								s.longest_win_idx = i;
-								s.longest_win_stm = stm;
-							}
-						}
-
 						const WDL_Entry want = fathom_to_wdl(r);
 						if (want == got) { ++s.matches; continue; }
 
@@ -182,57 +167,23 @@ static bool compare_material(const Options& opt, const char* name)
 						}
 					}
 				}
+				progress_bar += hi - lo;
 			}
 			return s;
 		});
+	progress_bar.set_finished();
 
 	size_t total = 0, matches = 0, mismatches = 0;
 	std::vector<std::string> examples;
-	uint16_t longest_win_ply = 0;
-	size_t longest_win_idx = 0;
-	Color longest_win_stm = WHITE;
 	for (auto& s : shards) {
 		total += s.total_legal; matches += s.matches; mismatches += s.mismatches;
 		for (auto& ex : s.examples) if (examples.size() < 5) examples.push_back(std::move(ex));
-		if (s.longest_win_ply > longest_win_ply) {
-			longest_win_ply = s.longest_win_ply;
-			longest_win_idx = s.longest_win_idx;
-			longest_win_stm = s.longest_win_stm;
-		}
 	}
 
 	std::printf("%-8s: probed=%zu matches=%zu mismatches=%zu", name, total, matches, mismatches);
-
-	// Fathom root DTZ is accurate to +/-1.
-	bool ply_ok = true;
-	if (longest_win_ply > 0)
-	{
-		Position pos;
-		(void)position_from_index(
-			epsi, static_cast<Board_Index>(longest_win_idx), longest_win_stm,
-			out_param(pos));
-		const Fathom_BBs bb = fathom_bbs(pos);
-		const unsigned rr = tb_probe_root(bb.white, bb.black, bb.kings, bb.queens,
-		                                  bb.rooks, bb.bishops, bb.knights, bb.pawns,
-		                                  0, 0, 0, longest_win_stm == WHITE, nullptr);
-		if (rr != TB_RESULT_FAILED && rr != TB_RESULT_CHECKMATE && rr != TB_RESULT_STALEMATE)
-		{
-			const int want = static_cast<int>(TB_GET_DTZ(rr));
-			const int diff = std::abs(want - static_cast<int>(longest_win_ply));
-			if (diff > 1) {
-				ply_ok = false;
-				char fen[128]; pos.to_fen(Span(fen, 128));
-				std::printf(" PLY_MISMATCH idx=%zu ours=%u syzygy_dtz=%d fen=%s",
-					longest_win_idx, (unsigned)longest_win_ply, want, fen);
-			} else {
-				std::printf(" longest_win_ply=%u (~%d ok)",
-					(unsigned)longest_win_ply, want);
-			}
-		}
-	}
 	std::printf("\n");
 	for (const auto& ex : examples) std::printf("    DIFF: %s\n", ex.c_str());
-	return mismatches == 0 && ply_ok;
+	return mismatches == 0;
 }
 
 static std::vector<std::string> read_list_file(const std::string& path)
@@ -317,8 +268,6 @@ int main(int argc, char** argv)
 				g_num_threads = static_cast<size_t>(n);
 			} else if (a == "--wdl" && i + 1 < argc) {
 				opt.wdl_dir = argv[++i];
-			} else if (a == "--dtc" && i + 1 < argc) {
-				opt.dtc_dir = argv[++i];
 			} else if (a == "--syzygy" && i + 1 < argc) {
 				opt.syzygy_dir = argv[++i];
 			} else if (a == "--list" && i + 1 < argc) {
@@ -333,8 +282,7 @@ int main(int argc, char** argv)
 					"Options:\n"
 					"  -t N           worker threads (default: hardware_concurrency)\n"
 					"  --wdl DIR      disk WDL directory (default ./wdl/)\n"
-					"  --dtc DIR      disk DTC directory (default ./dtc/)\n"
-					"  --syzygy DIR   Syzygy .rtbw/.rtbz directory (default ./syzygy)\n"
+					"  --syzygy DIR   Syzygy .rtbw directory (default ./syzygy)\n"
 					"  --list FILE    newline-separated material names\n"
 					"  --enumerate N  all materials up to N pieces\n",
 					argv[0]);

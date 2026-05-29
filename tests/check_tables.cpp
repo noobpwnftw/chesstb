@@ -17,6 +17,7 @@
 #include "chess/move.h"
 #include "chess/piece_config.h"
 #include "chess/position.h"
+#include "util/progress_bar.h"
 #include "util/thread_pool.h"
 
 #include <cstdio>
@@ -167,6 +168,8 @@ bool check_material(const Options& opt, const std::string& name)
 
 	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
 	std::atomic<size_t> next_idx{0};
+	Concurrent_Progress_Bar progress_bar(
+		N, std::max<size_t>(1, g_num_threads * CHUNK_SIZE), ps.name());
 
 	auto shards = global_pool().run_sync_task_on_all_threads(
 		[&](size_t) -> Shard
@@ -288,9 +291,11 @@ bool check_material(const Options& opt, const std::string& name)
 				}
 			}
 			}
+			progress_bar += hi - lo;
 		}
 		return s;
 	});
+	progress_bar.set_finished();
 
 	Shard t;
 	for (const auto& sh : shards) {
