@@ -4,6 +4,7 @@
 #include "egtb/piece_config_for_gen.h"
 
 #include "chess/chess.h"
+#include "chess/index_permutation.h"
 #include "chess/piece_config.h"
 
 #include "util/compress.h"
@@ -38,9 +39,10 @@ NODISCARD inline bool tb_file_is_full_format(const std::filesystem::path& path, 
 
 	const uint32_t key_and_table_num = r.read<uint32_t>();
 	const Fixed_Vector<Color, 2> colors = egtb_table_colors(key_and_table_num & 3);
-	// DTC, DTM, and DTM50 share a 27-byte normal-flag color header plus inline
-	// rank table (field names differ but byte counts match); WDL uses the older
-	// flat header.
+	// Per-color normal headers start with the serialized index permutation
+	// (a 4-byte uint32). DTC, DTM, and DTM50 then share a 27-byte payload header
+	// plus inline rank table (field names differ but byte counts match); WDL has
+	// a 22-byte payload header.
 	const bool egtb_table = expected_magic == EGTB_Magic::DTC_MAGIC
 	                     || expected_magic == EGTB_Magic::DTM_MAGIC
 	                     || expected_magic == EGTB_Magic::DTM50_MAGIC;
@@ -57,16 +59,16 @@ NODISCARD inline bool tb_file_is_full_format(const std::filesystem::path& path, 
 		}
 		else if (egtb_table)
 		{
-			if (static_cast<size_t>(s.end() - r.caret()) < 27) return false;
-			r.advance(25);
+			if (static_cast<size_t>(s.end() - r.caret()) < 31) return false;
+			r.advance(29);
 			const uint16_t num_ranks = r.read<uint16_t>();
 			if (static_cast<size_t>(s.end() - r.caret()) < num_ranks * 2u) return false;
 			r.advance(num_ranks * 2);
 		}
 		else
 		{
-			if (static_cast<size_t>(s.end() - r.caret()) < 22) return false;
-			r.advance(22);
+			if (static_cast<size_t>(s.end() - r.caret()) < 26) return false;
+			r.advance(26);
 		}
 	}
 	return true;
@@ -226,6 +228,7 @@ struct WDL_File_For_Probe
 {
 	struct Per_Color
 	{
+		Index_Permutation_Plan plan;
 		size_t block_size = 0;
 		size_t tail_size = 0;
 		size_t block_cnt = 0;
@@ -295,8 +298,9 @@ struct WDL_File_For_Probe
 	NODISCARD WDL_Entry read(Color color, Board_Index pos, size_t thread_id) const
 	{
 		if (m_is_singular[color]) return m_single_val[color];
-		const size_t packed_byte = static_cast<size_t>(pos) / WDL_ENTRY_PACK_RATIO;
 		const auto& pc = m_per_color[color];
+		const size_t storage_pos = logical_index_to_storage_index(pc.plan, static_cast<size_t>(pos));
+		const size_t packed_byte = storage_pos / WDL_ENTRY_PACK_RATIO;
 		ASSERT(pc.block_size > 0);
 		const size_t block_id = packed_byte / pc.block_size;
 		const size_t in_block = packed_byte % pc.block_size;
@@ -313,7 +317,7 @@ struct WDL_File_For_Probe
 
 		Packed_WDL_Entries entry;
 		std::memcpy(&entry, decompressed_block + in_block, sizeof(Packed_WDL_Entries));
-		return wdl_from_storage(get_wdl_value(entry, static_cast<size_t>(pos) % WDL_ENTRY_PACK_RATIO));
+		return wdl_from_storage(get_wdl_value(entry, storage_pos % WDL_ENTRY_PACK_RATIO));
 	}
 
 	bool m_is_singular[COLOR_NB];
@@ -382,6 +386,7 @@ struct DTM_File_For_Probe
 {
 	struct Per_Color
 	{
+		Index_Permutation_Plan plan;
 		size_t entry_bytes = 0;            // on-disk rank-index width: 1 or 2 bytes (storage is parity-halved in both)
 		size_t block_size = 0;             // on-disk rank bytes per full block
 		size_t tail_size = 0;
@@ -474,9 +479,10 @@ struct DTM_File_For_Probe
 			return DTM_Final_Entry::make_illegal();
 
 		const Per_Color& pc = m_per_color[color];
+		const size_t storage_pos = logical_index_to_storage_index(pc.plan, static_cast<size_t>(pos));
 		const size_t positions_per_block = pc.block_size / pc.entry_bytes;
-		const size_t block_id    = static_cast<size_t>(pos) / positions_per_block;
-		const size_t in_block_pos = static_cast<size_t>(pos) % positions_per_block;
+		const size_t block_id    = storage_pos / positions_per_block;
+		const size_t in_block_pos = storage_pos % positions_per_block;
 
 		const auto pair_skip = pc.offsets.get2(block_id);
 		if (pair_skip[0] == pair_skip[1])
@@ -579,6 +585,12 @@ void load_dtm_sub_flat(
 
 struct DTM_Sub_File_Flat
 {
+	struct Per_Color
+	{
+		Memory_Mapped_File file;
+		Index_Permutation_Plan plan;
+	};
+
 	DTM_Sub_File_Flat() = default;
 
 	DTM_Sub_File_Flat(const EGTB_Paths& egtb_files, const Piece_Config& ps,
@@ -602,7 +614,7 @@ struct DTM_Sub_File_Flat
 	void close()
 	{
 		for (Color c : { WHITE, BLACK })
-			m_files[c].close();
+			m_per_color[c].file.close();
 		m_tmp_files.clear();
 	}
 
@@ -610,14 +622,16 @@ struct DTM_Sub_File_Flat
 	// DTM_File_For_Probe::read at the call site — swap the type, keep the call.
 	NODISCARD DTM_Final_Entry read(Color color, Board_Index pos, size_t /*thread_id*/ = 0) const
 	{
+		const auto& pc = m_per_color[color];
+		const size_t storage_pos = logical_index_to_storage_index(pc.plan, static_cast<size_t>(pos));
 		DTM_Final_Entry e;
 		std::memcpy(&e,
-		            m_files[color].data() + static_cast<size_t>(pos) * sizeof(DTM_Final_Entry),
+		            pc.file.data() + storage_pos * sizeof(DTM_Final_Entry),
 		            sizeof(DTM_Final_Entry));
 		return e;
 	}
 
-	Memory_Mapped_File m_files[COLOR_NB];
+	Per_Color m_per_color[COLOR_NB];
 	Temporary_File_Tracker m_tmp_files;
 };
 
@@ -642,6 +656,7 @@ struct DTM50_File_For_Probe
 
 	struct Per_Color
 	{
+		Index_Permutation_Plan plan;
 		size_t entry_bytes = 0;       // rank-index width: 1 or 2 bytes
 		size_t block_positions = 0;   // positions per full rs-pack block
 		size_t tail_positions = 0;
@@ -733,8 +748,9 @@ struct DTM50_File_For_Probe
 			return DTM_Final_Entry::make_illegal();
 
 		const Per_Color& pc = m_per_color[color];
-		const size_t block_id = static_cast<size_t>(pos) / pc.block_positions;
-		const size_t pos_in_block = static_cast<size_t>(pos) % pc.block_positions;
+		const size_t storage_pos = logical_index_to_storage_index(pc.plan, static_cast<size_t>(pos));
+		const size_t block_id = storage_pos / pc.block_positions;
+		const size_t pos_in_block = storage_pos % pc.block_positions;
 
 		const auto pair_skip = pc.offsets.get2(block_id);
 		if (pair_skip[0] == pair_skip[1])
@@ -912,6 +928,12 @@ void load_dtm50_sub_flat(
 
 struct DTM50_Sub_File_Flat
 {
+	struct Per_Color
+	{
+		Memory_Mapped_File file;
+		Index_Permutation_Plan plan;
+	};
+
 	DTM50_Sub_File_Flat() = default;
 
 	DTM50_Sub_File_Flat(const EGTB_Paths& egtb_files, const Piece_Config& ps,
@@ -935,20 +957,22 @@ struct DTM50_Sub_File_Flat
 	void close()
 	{
 		for (Color c : { WHITE, BLACK })
-			m_files[c].close();
+			m_per_color[c].file.close();
 		m_tmp_files.clear();
 	}
 
 	NODISCARD DTM_Final_Entry read(Color color, Board_Index pos, size_t /*thread_id*/ = 0) const
 	{
+		const auto& pc = m_per_color[color];
+		const size_t storage_pos = logical_index_to_storage_index(pc.plan, static_cast<size_t>(pos));
 		DTM_Final_Entry e;
 		std::memcpy(&e,
-		            m_files[color].data() + static_cast<size_t>(pos) * sizeof(DTM_Final_Entry),
+		            pc.file.data() + storage_pos * sizeof(DTM_Final_Entry),
 		            sizeof(DTM_Final_Entry));
 		return e;
 	}
 
-	Memory_Mapped_File m_files[COLOR_NB];
+	Per_Color m_per_color[COLOR_NB];
 	Temporary_File_Tracker m_tmp_files;
 };
 

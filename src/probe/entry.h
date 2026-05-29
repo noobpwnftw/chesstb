@@ -10,10 +10,10 @@
 // Magic values used by probe-visible table files.
 enum struct EGTB_Magic : uint64_t
 {
-	WDL_MAGIC   = 0x9bd1e3a4,
-	DTC_MAGIC   = 0x2ec8b15f,
-	DTM_MAGIC   = 0xab57c132,
-	DTM50_MAGIC = 0xab57c150,
+	WDL_MAGIC   = 0x9bd1e3a6,
+	DTC_MAGIC   = 0x2ec8b161,
+	DTM_MAGIC   = 0xab57c134,
+	DTM50_MAGIC = 0xab57c152,
 };
 
 // Semantic 5-class outcome. (For the cursed/blessed meaning see egtb_entry.h.)

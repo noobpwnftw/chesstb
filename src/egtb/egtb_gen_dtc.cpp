@@ -5,6 +5,7 @@
 #include "egtb/pawn_slice_manager.h"
 
 #include "chess/chess.h"
+#include "chess/index_permutation.h"
 #include "chess/position.h"
 #include "chess/piece_config.h"
 
@@ -1074,16 +1075,19 @@ static Block_Source make_wdl_block_source(
 	Color color,
 	DTC_Save_Cache& cache,
 	size_t num_positions,
-	Gather_Sink& sink)
+	Gather_Sink& sink,
+	uint32_t index_perm,
+	bool gather)
 {
 	ASSERT(sink.color == color);
 	auto& src = table.m_dtc[color];
 	const size_t within = src.within_slice_size();
 	const size_t spg = src.slices_per_group();
 	const size_t total_packed_bytes = ceil_div(num_positions, WDL_ENTRY_PACK_RATIO);
+	const auto perm_plan = make_index_permutation_plan(epsi, index_perm);
 	return Block_Source{
 		total_packed_bytes,
-		[&epsi, &src, &cache, &sink, within, spg, num_positions, total_packed_bytes](
+		[&epsi, &src, &cache, &sink, within, spg, num_positions, total_packed_bytes, perm_plan, gather](
 			size_t block_id, Span<uint8_t> scratch) -> Const_Span<uint8_t>
 		{
 			const size_t byte_off = block_id * WDL_BLOCK_SIZE;
@@ -1093,12 +1097,12 @@ static Block_Source make_wdl_block_source(
 			std::memset(scratch.data(), 0, byte_sz);
 			auto* packed = reinterpret_cast<Packed_WDL_Entries*>(scratch.data());
 
-			const size_t first_raw = byte_off * WDL_ENTRY_PACK_RATIO;
-			const size_t end_raw   = std::min(first_raw + byte_sz * WDL_ENTRY_PACK_RATIO, num_positions);
+			const size_t first_storage = byte_off * WDL_ENTRY_PACK_RATIO;
+			const size_t end_storage   = std::min(first_storage + byte_sz * WDL_ENTRY_PACK_RATIO, num_positions);
 
-			const size_t first_g = (first_raw / within) / spg;
-			const size_t last_g  = (end_raw == first_raw ? first_g
-			                                             : ((end_raw - 1) / within) / spg);
+			const size_t first_g = (first_storage / within) / spg;
+			const size_t last_g  = (end_storage == first_storage ? first_g
+			                                               : ((end_storage - 1) / within) / spg);
 			DTC_Pinned_Range pin(cache, sink.color, first_g, last_g);
 
 			thread_local std::vector<uint32_t> hist1_local;
@@ -1109,27 +1113,20 @@ static Block_Source make_wdl_block_source(
 			uint16_t longest_value = 0;
 			uint64_t longest_idx   = 0;
 
-			Decomposed_Board_Index didx{};
-			epsi.decompose_board_index(static_cast<Board_Index>(first_raw), out_param(didx));
-			size_t raw = first_raw;
-			while (raw < end_raw)
+			for (size_t storage = first_storage; storage < end_storage; ++storage)
 			{
-				const size_t s = raw / within;
-				const size_t in_slice_start = raw - s * within;
-				const size_t in_slice_end   = std::min(within, in_slice_start + (end_raw - raw));
+				const size_t logical = storage_index_to_logical_index(perm_plan, storage);
+				const auto& e = src.template view_at<DTC_Final_Entry>(static_cast<Board_Index>(logical));
+				const size_t packed_byte = storage / WDL_ENTRY_PACK_RATIO - byte_off;
+				const size_t in_packed   = storage % WDL_ENTRY_PACK_RATIO;
+				set_wdl_entry(packed[packed_byte], in_packed, wdl_for_storage(e));
 
-				for (size_t i = in_slice_start; i < in_slice_end; ++i)
+				if (gather)
 				{
-					const Board_Index idx = static_cast<Board_Index>(s * within + i);
-					const auto& e = src.template view_at<DTC_Final_Entry>(idx);
-					const WDL_Entry w = e.wdl();
-					const size_t cur_raw = raw + (i - in_slice_start);
-					const size_t packed_byte = cur_raw / WDL_ENTRY_PACK_RATIO - byte_off;
-					const size_t in_packed   = cur_raw % WDL_ENTRY_PACK_RATIO;
-					set_wdl_entry(packed[packed_byte], in_packed, wdl_for_storage(e));
-
+					Decomposed_Board_Index didx{};
+					epsi.decompose_board_index(static_cast<Board_Index>(logical), out_param(didx));
 					const uint64_t ow = epsi.orbit_weight(didx);
-					switch (w)
+					switch (e.wdl())
 					{
 						case WDL_Entry::DRAW:         draw_cnt    += ow; break;
 						case WDL_Entry::LOSE:
@@ -1141,7 +1138,7 @@ static Block_Source make_wdl_block_source(
 					if (e.is_win())
 					{
 						const uint16_t v = static_cast<uint16_t>(e.value());
-						if (v > longest_value) { longest_value = v; longest_idx = cur_raw; }
+						if (v > longest_value) { longest_value = v; longest_idx = logical; }
 					}
 					// DRAW/ILLEGAL: WDL companion authoritative — exclude so
 					// rank table spends short codes on W/L values.
@@ -1150,12 +1147,10 @@ static Block_Source make_wdl_block_source(
 						++hist1_local[static_cast<size_t>(dtc_value_for_storage(e))];
 						++hist2_local[static_cast<size_t>(static_cast<uint16_t>(e.value()))];
 					}
-					epsi.step_to_next(inout_param(didx));
 				}
-
-				raw += (in_slice_end - in_slice_start);
 			}
 
+			if (gather)
 			{
 				std::lock_guard<std::mutex> lk(sink.mu);
 				if (!sink.merged[block_id])
@@ -1271,6 +1266,14 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 	Compressed_EGTB wdl_save[COLOR_NB];
 	Compressed_EGTB dtc_save[COLOR_NB];
 	Value_Histogram dtc_hist[COLOR_NB];
+	uint32_t wdl_index_perm[COLOR_NB] = {
+		default_index_permutation_config(m_epsi),
+		default_index_permutation_config(m_epsi)
+	};
+	uint32_t dtc_index_perm[COLOR_NB] = {
+		default_index_permutation_config(m_epsi),
+		default_index_permutation_config(m_epsi)
+	};
 
 	DTC_Save_Cache cache(&m_table->m_dtc[WHITE], &m_table->m_dtc[BLACK], cap_groups);
 
@@ -1299,9 +1302,26 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 			const size_t num_positions = m_epsi.num_positions();
 			const size_t total_packed_bytes = ceil_div(num_positions, WDL_ENTRY_PACK_RATIO);
 			const size_t num_blocks = ceil_div(total_packed_bytes, WDL_BLOCK_SIZE);
+
+			EGTB_Info trial_info{};
+			Value_Histogram trial_hist{};
+			Gather_Sink trial_sink{me, &trial_info, &trial_hist, {}, std::vector<uint8_t>(num_blocks, 0)};
+			wdl_index_perm[me] = choose_storage_permutation_config(
+				thread_pool,
+				m_epsi,
+				[&](uint32_t perm) {
+					return make_wdl_block_source(
+						m_epsi, *m_table, me, cache, num_positions, trial_sink,
+						perm, /*gather=*/false);
+				},
+				WDL_BLOCK_SIZE,
+				std::make_unique<LZ4_Compress_Helper>(nullptr),
+				"choose_wdl_storage");
+
 			Gather_Sink sink{me, &m_info, &dtc_hist[me], {}, std::vector<uint8_t>(num_blocks, 0)};
 			Block_Source src = make_wdl_block_source(
-				m_epsi, *m_table, me, cache, num_positions, sink);
+				m_epsi, *m_table, me, cache, num_positions, sink,
+				wdl_index_perm[me], /*gather=*/true);
 			wdl_save[me] = save_compress_wdl(
 				thread_pool, src, me, max_workers);
 		}
@@ -1313,7 +1333,7 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 		}
 	}
 
-	save_wdl_table(m_epsi, wdl_save, paths.wdl_save_path(m_epsi), colors, EGTB_Magic::WDL_MAGIC);
+	save_wdl_table(m_epsi, wdl_index_perm, wdl_save, paths.wdl_save_path(m_epsi), colors, EGTB_Magic::WDL_MAGIC);
 
 	for (Color me : colors) wdl_save[me] = {};
 
@@ -1330,8 +1350,26 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 	for (Color me : colors)
 	{
 		Value_Rank_Table& chosen = (dtc_entry_bytes[me] == 1) ? dtc_rank_1b[me] : dtc_rank_2b[me];
+		if (m_info.win_cnt[me] + m_info.lose_cnt[me] != 0)
+		{
+			dtc_index_perm[me] = choose_storage_permutation_config(
+				thread_pool,
+				m_epsi,
+				[&](uint32_t perm) {
+					return make_entry_block_source(
+						m_table->m_dtc[me], cache, me,
+						make_index_permutation_plan(m_epsi, perm),
+						DTC_BLOCK_SIZE, dtc_entry_bytes[me]);
+				},
+				DTC_BLOCK_SIZE,
+				std::make_unique<LZMA_Rank_Compress_Helper>(
+					chosen, dtc_entry_bytes[me], &dtc_storage_fn),
+				"choose_dtc_storage");
+		}
 		Block_Source src = make_entry_block_source(
-			m_table->m_dtc[me], cache, me, DTC_BLOCK_SIZE, dtc_entry_bytes[me]);
+			m_table->m_dtc[me], cache, me,
+			make_index_permutation_plan(m_epsi, dtc_index_perm[me]),
+			DTC_BLOCK_SIZE, dtc_entry_bytes[me]);
 		dtc_save[me] = save_compress_egtb(
 			thread_pool, src, me, m_info, dtc_entry_bytes[me], DTC_BLOCK_SIZE, max_workers,
 			chosen);
@@ -1340,7 +1378,7 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 		m_table->m_dtc[me].close();
 	}
 
-	save_egtb_table(m_epsi, dtc_save, paths.dtc_save_path(m_epsi), colors, EGTB_Magic::DTC_MAGIC);
+	save_egtb_table(m_epsi, dtc_index_perm, dtc_save, paths.dtc_save_path(m_epsi), colors, EGTB_Magic::DTC_MAGIC);
 
 	std::ofstream fp(paths.dtc_info_save_path(m_epsi), std::ios::binary | std::ios::trunc);
 	fp.write(reinterpret_cast<const char*>(&m_info), sizeof(EGTB_Info));

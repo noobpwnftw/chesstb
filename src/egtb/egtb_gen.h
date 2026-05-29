@@ -813,6 +813,7 @@ NODISCARD Block_Source make_entry_block_source(
 	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& src,
 	Save_Group_Cache<EntryT, OtherEntryTs...>& cache,
 	Color color,
+	Index_Permutation_Plan perm_plan,
 	size_t block_size,
 	size_t entry_bytes);
 

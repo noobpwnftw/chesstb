@@ -460,16 +460,16 @@ bool require_full_file(const std::filesystem::path& path, EGTB_Magic magic, cons
 			}
 			else if (egtb_table)
 			{
-				if (static_cast<size_t>(s.end() - r.caret()) < 23) return false;
-				r.advance(21);
+				if (static_cast<size_t>(s.end() - r.caret()) < 31) return false;
+				r.advance(29);
 				const uint16_t num_ranks = r.read<uint16_t>();
 				if (static_cast<size_t>(s.end() - r.caret()) < num_ranks * 2u) return false;
 				r.advance(num_ranks * 2);
 			}
 			else
 			{
-				if (static_cast<size_t>(s.end() - r.caret()) < 19) return false;
-				r.advance(19);
+				if (static_cast<size_t>(s.end() - r.caret()) < 26) return false;
+				r.advance(26);
 			}
 		}
 		return true;
@@ -509,8 +509,9 @@ std::array<size_t, COLOR_NB> dtc_entry_bytes_by_color(const std::filesystem::pat
 		if (flag & DROPPED_FLAG)
 			continue;
 
+		r.advance(4);  // index permutation config
 		out[c] = r.read<uint8_t>();
-		r.advance(4 + 4 + 4 + 8);
+		r.advance(4 + 4 + 8 + 8);
 		const uint16_t num_ranks = r.read<uint16_t>();
 		r.advance(static_cast<size_t>(num_ranks) * 2);
 	}

@@ -14,12 +14,12 @@
 // Magic values used for marking the EGTB files.
 enum struct EGTB_Magic : uint64_t
 {
-	WDL_MAGIC         = 0x9bd1e3a4,
-	DTC_MAGIC         = 0x2ec8b15f,
+	WDL_MAGIC         = 0x9bd1e3a6,
+	DTC_MAGIC         = 0x2ec8b161,
 	DTC_SLICE_MAGIC   = 0xd1cef11e51ce2001ULL,
-	DTM_MAGIC         = 0xab57c132,
+	DTM_MAGIC         = 0xab57c134,
 	DTM_SLICE_MAGIC   = 0xd1cef11e51ce2002ULL,
-	DTM50_MAGIC       = 0xab57c150,
+	DTM50_MAGIC       = 0xab57c152,
 	DTM50_SLICE_MAGIC = 0xd1cef11e51ce2050ULL,
 };
 

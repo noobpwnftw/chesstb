@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstring>
+#include <functional>
 #include <vector>
 #include <optional>
 
@@ -230,6 +231,15 @@ NODISCARD std::optional<LZ4_Dict> make_dict_for_wdl(
 	size_t block_size
 );
 
+NODISCARD uint32_t choose_storage_permutation_config(
+	In_Out_Param<Thread_Pool> thread_pool,
+	const Piece_Config_For_Gen& epsi,
+	const std::function<Block_Source(uint32_t)>& make_source,
+	size_t block_size,
+	std::unique_ptr<Compress_Helper> compressor,
+	const char* task_name
+);
+
 // Caller handles WDL singularity via pre-probe; this compresses unconditionally.
 // max_workers caps pool fan-out (0 = unlimited).
 NODISCARD Compressed_EGTB save_compress_wdl(
@@ -256,6 +266,7 @@ NODISCARD Compressed_EGTB save_compress_egtb(
 
 void save_wdl_table(
 	const Piece_Config& ps,
+	const uint32_t index_perm[COLOR_NB],
 	const Compressed_EGTB save_info[COLOR_NB],
 	std::filesystem::path file_path,
 	const Fixed_Vector<Color, 2> table_colors,
@@ -264,6 +275,7 @@ void save_wdl_table(
 
 void save_egtb_table(
 	const Piece_Config& ps,
+	const uint32_t index_perm[COLOR_NB],
 	const Compressed_EGTB save_info[COLOR_NB],
 	std::filesystem::path file_path,
 	const Fixed_Vector<Color, 2> table_colors,

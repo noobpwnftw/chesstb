@@ -1119,6 +1119,10 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 	static constexpr size_t DTM_BLOCK_SIZE = 1024 * 1024;
 	Compressed_EGTB dtm_save[COLOR_NB];
 	Value_Histogram dtm_hist[COLOR_NB];
+	uint32_t dtm_index_perm[COLOR_NB] = {
+		default_index_permutation_config(m_epsi),
+		default_index_permutation_config(m_epsi)
+	};
 
 	DTM_Save_Cache cache(&m_table->m_dtm[WHITE], &m_table->m_dtm[BLACK], cap_groups);
 
@@ -1159,7 +1163,26 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 	{
 		if (!dtm_save[me].is_singular())
 		{
-			Block_Source src = make_entry_block_source(m_table->m_dtm[me], cache, me, DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
+			if (m_info.win_cnt[me] + m_info.lose_cnt[me] != 0)
+			{
+				dtm_index_perm[me] = choose_storage_permutation_config(
+					thread_pool,
+					m_epsi,
+					[&](uint32_t perm) {
+						return make_entry_block_source(
+							m_table->m_dtm[me], cache, me,
+							make_index_permutation_plan(m_epsi, perm),
+							DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
+					},
+					DTM_BLOCK_SIZE,
+					std::make_unique<LZMA_Rank_Compress_Helper>(
+						dtm_rank[me], dtm_entry_bytes[me], &dtm_storage_fn),
+					"choose_dtm_storage");
+			}
+			Block_Source src = make_entry_block_source(
+				m_table->m_dtm[me], cache, me,
+				make_index_permutation_plan(m_epsi, dtm_index_perm[me]),
+				DTM_BLOCK_SIZE, dtm_entry_bytes[me]);
 			dtm_save[me] = save_compress_egtb(
 				thread_pool, src, me, m_info, dtm_entry_bytes[me], DTM_BLOCK_SIZE, max_workers,
 				dtm_rank[me], &dtm_storage_fn);
@@ -1169,7 +1192,7 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 		m_table->m_dtm[me].close();
 	}
 
-	save_egtb_table(m_epsi, dtm_save, paths.dtm_save_path(m_epsi), colors, EGTB_Magic::DTM_MAGIC);
+	save_egtb_table(m_epsi, dtm_index_perm, dtm_save, paths.dtm_save_path(m_epsi), colors, EGTB_Magic::DTM_MAGIC);
 
 	std::ofstream fp(paths.dtm_info_save_path(m_epsi), std::ios::binary | std::ios::trunc);
 	fp.write(reinterpret_cast<const char*>(&m_info), sizeof(EGTB_Info));

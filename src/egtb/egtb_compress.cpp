@@ -2,6 +2,7 @@
 #include "egtb/egtb_entry.h"
 #include "egtb/egtb_probe.h"
 
+#include "chess/index_permutation.h"
 #include "chess/piece_config.h"
 
 #include "util/allocation.h"
@@ -9,6 +10,8 @@
 #include "util/filesystem.h"
 #include "util/memory.h"
 #include "util/mono_uint_vec.h"
+
+#include <atomic>
 
 namespace {
 // Run-stitch ILLEGAL spans with a neighboring value so the don't-care cells
@@ -154,6 +157,79 @@ std::optional<LZ4_Dict> make_dict_for_wdl(
 	);
 }
 
+uint32_t choose_storage_permutation_config(
+	In_Out_Param<Thread_Pool> thread_pool,
+	const Piece_Config_For_Gen& epsi,
+	const std::function<Block_Source(uint32_t)>& make_source,
+	size_t block_size,
+	std::unique_ptr<Compress_Helper> compressor,
+	const char* task_name)
+{
+	const size_t n = epsi.num_populated_classes();
+	if (n <= 1)
+		return default_index_permutation_config(epsi);
+
+	const uint32_t candidates = FACTORIAL[n];
+	const size_t source_block_size = compressor->source_bytes_per_block(block_size);
+	const size_t bound_size = compressor->compress_bound(source_block_size);
+
+	uint32_t best = default_index_permutation_config(epsi);
+	uint32_t best_ix = candidates;
+	uint64_t best_score = std::numeric_limits<uint64_t>::max();
+
+	for (uint32_t ix = 0; ix < candidates; ++ix)
+	{
+		const uint32_t perm = ix;
+		const Block_Source src = make_source(perm);
+		const size_t num_blocks = ceil_div(src.total_size, block_size);
+		if (num_blocks == 0)
+			continue;
+
+		const size_t stride = 32;
+		const size_t sample_cnt = ceil_div(num_blocks, stride);
+		std::atomic<size_t> next_sample{0};
+		const size_t workers = std::min<size_t>(thread_pool->num_workers(), sample_cnt);
+
+		const auto partial = thread_pool->run_sync_task_on_multiple_threads(workers, [&](size_t) -> uint64_t {
+			auto scratch = cpp20::make_unique_for_overwrite<uint8_t[]>(source_block_size);
+			auto out = cpp20::make_unique_for_overwrite<uint8_t[]>(bound_size);
+			auto helper = compressor->clone();
+
+			uint64_t score = 0;
+			for (;;)
+			{
+				const size_t sample_id = next_sample.fetch_add(1, std::memory_order_relaxed);
+				if (sample_id >= sample_cnt) return score;
+				const size_t block_id = sample_id * stride;
+				const Const_Span<uint8_t> block = src.get(
+					block_id, Span<uint8_t>(scratch.get(), source_block_size));
+				if (block.size() == 0) continue;
+				score += helper->compress(Span<uint8_t>(out.get(), bound_size), block);
+			}
+		});
+
+		uint64_t score = 0;
+		for (const uint64_t s : partial)
+			score += s;
+
+		if (score < best_score || (score == best_score && ix < best_ix))
+		{
+			best_score = score;
+			best_ix = ix;
+			best = perm;
+		}
+	}
+
+	if (best_ix == candidates)
+		best_score = 0;
+
+	if (task_name != nullptr)
+	{
+		std::printf("%s: storage_perm=%u\n", task_name, best);
+	}
+	return best;
+}
+
 Compressed_EGTB save_compress_wdl(
 	In_Out_Param<Thread_Pool> thread_pool,
 	const Block_Source& src,
@@ -266,6 +342,7 @@ Compressed_EGTB save_compress_egtb(
 
 void save_wdl_table(
 	const Piece_Config& ps,
+	const uint32_t index_perm[COLOR_NB],
 	const Compressed_EGTB save_info[COLOR_NB],
 	std::filesystem::path file_path,
 	const Fixed_Vector<Color, 2> table_colors,
@@ -292,7 +369,7 @@ void save_wdl_table(
 		mono_enc[i] = Mono_Uint_Vec::encode(Const_Span<uint64_t>(off.data(), off.size()));
 	}
 
-	size_t file_size = 8;  // header
+	size_t file_size = 8;  // magic/key
 
 	for (const Color i : table_colors)
 	{
@@ -300,8 +377,8 @@ void save_wdl_table(
 		if (t.is_singular())
 			file_size += 2;
 		else
-			// flag(1) + tail(2) + block_size(4) + block_cnt(8) + total(8)
-			file_size += 23;
+			// flag(1) + index permutation config(4) + tail(2) + block_size(4) + block_cnt(8) + total(8)
+			file_size += 27;
 	}
 
 	for (const Color i : table_colors)
@@ -355,6 +432,7 @@ void save_wdl_table(
 		else
 		{
 			writer.write<uint8_t>(0);
+			writer.write<uint32_t>(index_perm[i]);
 
 			writer.write<uint16_t>(narrowing_static_cast<uint16_t>(t.tail_size()));
 			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.block_size()));
@@ -416,6 +494,7 @@ void save_wdl_table(
 
 void save_egtb_table(
 	const Piece_Config& ps,
+	const uint32_t index_perm[COLOR_NB],
 	const Compressed_EGTB save_info[COLOR_NB],
 	std::filesystem::path file_path,
 	const Fixed_Vector<Color, 2> table_colors,
@@ -442,7 +521,7 @@ void save_egtb_table(
 		mono_enc[i] = Mono_Uint_Vec::encode(Const_Span<uint64_t>(off.data(), off.size()));
 	}
 
-	size_t file_size = 8;  // header
+	size_t file_size = 8;  // magic/key
 
 	for (const Color i : table_colors)
 	{
@@ -452,8 +531,8 @@ void save_egtb_table(
 		}
 		else
 		{
-			// flag(1)+entry_bytes(1)+tail(4)+block_size(4)+block_cnt(8)+total(8) = 26
-			file_size += 26 + 2 + save_info[i].rank_table().ranks.size() * 2;
+			// flag(1)+index permutation config(4)+entry_bytes(1)+tail(4)+block_size(4)+block_cnt(8)+total(8)
+			file_size += 30 + 2 + save_info[i].rank_table().ranks.size() * 2;
 		}
 	}
 
@@ -497,6 +576,7 @@ void save_egtb_table(
 		else
 		{
 			writer.write<uint8_t>(0);
+			writer.write<uint32_t>(index_perm[i]);
 			writer.write<uint8_t>(narrowing_static_cast<uint8_t>(t.entry_bytes()));
 
 			writer.write<uint32_t>(narrowing_static_cast<uint32_t>(t.tail_size()));
@@ -611,6 +691,7 @@ void load_wdl_table(
 
 	const size_t table_num = key_and_table_num & 3;
 	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+	const Piece_Config_For_Gen epsi(ps);
 
 	for (const Color i : table_colors)
 	{
@@ -622,6 +703,10 @@ void load_wdl_table(
 		else
 		{
 			wdl->m_is_singular[i] = false;
+			const uint32_t perm = reader.read<uint32_t>();
+			if (!index_permutation_config_is_valid(epsi, perm))
+				throw std::runtime_error("Invalid WDL index permutation for " + sub_wdl.string());
+			wdl->m_per_color[i].plan = make_index_permutation_plan(epsi, perm);
 
 			tail_size[i] = reader.read<uint16_t>();
 			block_size[i] = reader.read<uint32_t>();
@@ -681,7 +766,7 @@ void load_wdl_table(
 			? block_cnt[i] - 1
 			: block_cnt[i];
 		const size_t file_sz = block_size[i] * num_full_sized_blocks + tail_size[i];
-		if (file_sz != ceil_div(Piece_Config_For_Gen(ps).num_positions(), WDL_ENTRY_PACK_RATIO))
+		if (file_sz != ceil_div(epsi.num_positions(), WDL_ENTRY_PACK_RATIO))
 			throw std::runtime_error("Invalid decompressed size of WDL table from " + sub_wdl.string());
 
 		auto& pc = wdl->m_per_color[i];
@@ -727,6 +812,7 @@ void load_dtm_table(
 
 	const size_t table_num = key_and_table_num & 3;
 	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+	const Piece_Config_For_Gen epsi(ps);
 
 	size_t data_size[COLOR_NB]{ 0, 0 };
 
@@ -741,6 +827,10 @@ void load_dtm_table(
 		else
 		{
 			dtm->m_is_singular[i] = false;
+			const uint32_t perm = reader.read<uint32_t>();
+			if (!index_permutation_config_is_valid(epsi, perm))
+				throw std::runtime_error("Invalid DTM index permutation for " + sub_dtm.string());
+			dtm->m_per_color[i].plan = make_index_permutation_plan(epsi, perm);
 			auto& pc = dtm->m_per_color[i];
 			pc.entry_bytes = reader.read<uint8_t>();
 			if (pc.entry_bytes != sizeof(DTM_Final_Entry) && pc.entry_bytes != 1)
@@ -781,7 +871,7 @@ void load_dtm_table(
 		reader.advance(data_size[i]);
 	}
 
-	const size_t num_positions = Piece_Config_For_Gen(ps).num_positions();
+	const size_t num_positions = epsi.num_positions();
 	for (const Color i : table_colors)
 	{
 		if (dtm->m_is_singular[i]) continue;
@@ -822,6 +912,7 @@ void load_dtm50_table(
 
 	const size_t table_num = key_and_table_num & 3;
 	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+	const Piece_Config_For_Gen epsi(ps);
 
 	size_t data_size[COLOR_NB]{ 0, 0 };
 
@@ -838,6 +929,10 @@ void load_dtm50_table(
 		else
 		{
 			dtm50->m_is_singular[i] = false;
+			const uint32_t perm = reader.read<uint32_t>();
+			if (!index_permutation_config_is_valid(epsi, perm))
+				throw std::runtime_error("Invalid DTM50 index permutation for " + sub_dtm50.string());
+			dtm50->m_per_color[i].plan = make_index_permutation_plan(epsi, perm);
 			auto& pc = dtm50->m_per_color[i];
 			pc.entry_bytes = reader.read<uint8_t>();
 			if (pc.entry_bytes != 1 && pc.entry_bytes != 2)
@@ -928,6 +1023,7 @@ void load_dtm_sub_flat(
 
 	const size_t table_num = key_and_table_num & 3;
 	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+	const Piece_Config_For_Gen epsi(ps);
 
 	size_t entry_bytes[COLOR_NB]{ 0, 0 };
 	size_t tail_size[COLOR_NB]{ 0, 0 };
@@ -948,6 +1044,10 @@ void load_dtm_sub_flat(
 		}
 		else
 		{
+			const uint32_t perm = reader.read<uint32_t>();
+			if (!index_permutation_config_is_valid(epsi, perm))
+				throw std::runtime_error("Invalid flat DTM index permutation for " + dtm_path.string());
+			flat->m_per_color[i].plan = make_index_permutation_plan(epsi, perm);
 			entry_bytes[i] = reader.read<uint8_t>();
 			if (entry_bytes[i] != sizeof(DTM_Final_Entry) && entry_bytes[i] != 1)
 				throw std::runtime_error("Bad DTM entry_bytes in " + dtm_path.string());
@@ -987,7 +1087,7 @@ void load_dtm_sub_flat(
 		reader.advance(data_size[i]);
 	}
 
-	const size_t num_positions = Piece_Config_For_Gen(ps).num_positions();
+	const size_t num_positions = epsi.num_positions();
 	const size_t file_bytes = num_positions * sizeof(DTM_Final_Entry);
 
 	for (const Color i : table_colors)
@@ -1019,6 +1119,8 @@ void load_dtm_sub_flat(
 			const size_t blocks = block_cnt[i];
 			const size_t positions_per_block = block_size[i] / entry_bytes[i];
 			std::atomic<size_t> next_block(0);
+
+			const auto& perm_plan = flat->m_per_color[i].plan;
 
 			thread_pool->run_sync_task_on_all_threads([&](size_t thread_id) {
 				LZMA_Decompress_Helper dc_helper(block_size[i]);
@@ -1053,7 +1155,8 @@ void load_dtm_sub_flat(
 						for (size_t k = 0; k < positions; ++k)
 						{
 							const uint16_t stored = r2v[raw[k]];
-							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
+							const size_t logical = storage_index_to_logical_index(perm_plan, pos + k);
+							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(logical), thread_id);
 							out[pos + k] = dtm_entry_from_storage(stored, w);
 						}
 					}
@@ -1063,7 +1166,8 @@ void load_dtm_sub_flat(
 						for (size_t k = 0; k < positions; ++k)
 						{
 							const uint16_t stored = r2v[in[k]];
-							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(pos + k), thread_id);
+							const size_t logical = storage_index_to_logical_index(perm_plan, pos + k);
+							const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(logical), thread_id);
 							out[pos + k] = dtm_entry_from_storage(stored, w);
 						}
 					}
@@ -1071,7 +1175,7 @@ void load_dtm_sub_flat(
 			});
 		}
 
-		flat->m_files[i] = std::move(out_map);
+		flat->m_per_color[i].file = std::move(out_map);
 	}
 }
 
@@ -1118,6 +1222,7 @@ void load_dtm50_sub_flat(
 
 	const size_t table_num = key_and_table_num & 3;
 	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+	const Piece_Config_For_Gen epsi(ps);
 
 	size_t entry_bytes[COLOR_NB]{ 0, 0 };
 	size_t block_positions[COLOR_NB]{ 0, 0 };
@@ -1138,6 +1243,10 @@ void load_dtm50_sub_flat(
 		}
 		else
 		{
+			const uint32_t perm = reader.read<uint32_t>();
+			if (!index_permutation_config_is_valid(epsi, perm))
+				throw std::runtime_error("Invalid flat DTM50 index permutation for " + dtm_path.string());
+			flat->m_per_color[i].plan = make_index_permutation_plan(epsi, perm);
 			entry_bytes[i] = reader.read<uint8_t>();
 			if (entry_bytes[i] != 1 && entry_bytes[i] != 2)
 				throw std::runtime_error("Bad DTM50 entry_bytes in " + dtm_path.string());
@@ -1181,7 +1290,7 @@ void load_dtm50_sub_flat(
 		reader.advance(data_size[i]);
 	}
 
-	const size_t num_positions = Piece_Config_For_Gen(ps).num_positions();
+	const size_t num_positions = epsi.num_positions();
 	const size_t file_bytes = num_positions * sizeof(DTM_Final_Entry);
 
 	for (const Color i : table_colors)
@@ -1198,7 +1307,7 @@ void load_dtm50_sub_flat(
 		{
 			// DRAW everywhere; see load_dtm_sub_flat singular arm.
 			std::memset(out, 0, file_bytes);
-			flat->m_files[i] = std::move(out_map);
+			flat->m_per_color[i].file = std::move(out_map);
 			continue;
 		}
 
@@ -1207,6 +1316,8 @@ void load_dtm50_sub_flat(
 		const size_t ppb = block_positions[i];
 		const size_t eb = entry_bytes[i];
 		std::atomic<size_t> next_block(0);
+
+		const auto& perm_plan = flat->m_per_color[i].plan;
 
 		// Strict upper bound: sums the worst case for each state region (they're
 		// mutually exclusive per position, so this overestimates).
@@ -1327,8 +1438,8 @@ void load_dtm50_sub_flat(
 						}
 					}
 					const uint16_t stored = r2v[rank];
-					const WDL_Entry w = wdl.read(i,
-						static_cast<Board_Index>(base_pos + k), thread_id);
+					const size_t logical = storage_index_to_logical_index(perm_plan, base_pos + k);
+					const WDL_Entry w = wdl.read(i, static_cast<Board_Index>(logical), thread_id);
 					out[base_pos + k] = dtm50_entry_from_storage(stored, w);
 				}
 				ASSERT(const_idx == num_const && single_idx == num_single
@@ -1336,6 +1447,6 @@ void load_dtm50_sub_flat(
 			}
 		});
 
-		flat->m_files[i] = std::move(out_map);
+		flat->m_per_color[i].file = std::move(out_map);
 	}
 }

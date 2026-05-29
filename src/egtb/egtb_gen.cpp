@@ -5,6 +5,7 @@
 #include "egtb/pawn_slice_manager.h"
 
 #include "chess/chess.h"
+#include "chess/index_permutation.h"
 #include "chess/position.h"
 
 #include "util/defines.h"
@@ -682,6 +683,7 @@ Block_Source make_entry_block_source(
 	Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& src,
 	Save_Group_Cache<EntryT, OtherEntryTs...>& cache,
 	Color color,
+	Index_Permutation_Plan perm_plan,
 	size_t block_size,
 	size_t entry_bytes)
 {
@@ -695,31 +697,27 @@ Block_Source make_entry_block_source(
 	const size_t output_total_bytes = total_entries * entry_bytes;
 	return Block_Source{
 		output_total_bytes,
-		[&src, &cache, color, within, spg, source_block_bytes, source_total_bytes](size_t block_id, Span<uint8_t> scratch) -> Const_Span<uint8_t> {
+		[&src, &cache, color, within, spg, source_block_bytes, source_total_bytes, perm_plan](size_t block_id, Span<uint8_t> scratch) -> Const_Span<uint8_t> {
 			const size_t block_off = block_id * source_block_bytes;
 			const size_t this_block = std::min(source_block_bytes, source_total_bytes - block_off);
 			ASSERT(scratch.size() >= this_block);
 			ASSERT(block_off % kEntry == 0);
 			ASSERT(this_block % kEntry == 0);
 
-			const size_t entry_off = block_off / kEntry;
+			const size_t storage_entry_off = block_off / kEntry;
 			const size_t entry_cnt = this_block / kEntry;
 
-			const size_t first_g = (entry_off / within) / spg;
+			const size_t first_g = (storage_entry_off / within) / spg;
 			const size_t last_g  = (entry_cnt == 0 ? first_g
-			                                       : ((entry_off + entry_cnt - 1) / within) / spg);
+			                                       : ((storage_entry_off + entry_cnt - 1) / within) / spg);
 			Pinned_Group_Range<EntryT, OtherEntryTs...> pin(cache, color, first_g, last_g);
 
-			size_t done = 0;
-			while (done < entry_cnt)
+			for (size_t done = 0; done < entry_cnt; ++done)
 			{
-				const size_t cur = entry_off + done;
-				const size_t s = cur / within;
-				const size_t in_slice = cur - s * within;
-				const size_t take = std::min(entry_cnt - done, within - in_slice);
-				const auto* const raw = src.slice_data(s) + in_slice;
-				std::memcpy(scratch.data() + done * kEntry, raw, take * kEntry);
-				done += take;
+				const size_t storage_idx = storage_entry_off + done;
+				const size_t logical_idx = storage_index_to_logical_index(perm_plan, storage_idx);
+				const auto e = src.template view_at<EntryT>(static_cast<Board_Index>(logical_idx));
+				std::memcpy(scratch.data() + done * kEntry, &e, kEntry);
 			}
 
 			return Const_Span<uint8_t>(scratch.data(), this_block);
@@ -741,6 +739,6 @@ template void EGTB_Generator::apply_working_set<DTC_Final_Entry, DTC_Intermediat
 template void EGTB_Generator::apply_working_set<DTM_Final_Entry, DTM_Intermediate_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>*, Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
 template void EGTB_Generator::apply_working_set<DTM_Final_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTM_Final_Entry>*, Sliced_EGTB_File_For_Gen<DTM_Final_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
 
-template Block_Source make_entry_block_source<DTC_Final_Entry, DTC_Intermediate_Entry>(Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>&, Save_Group_Cache<DTC_Final_Entry, DTC_Intermediate_Entry>&, Color, size_t, size_t);
-template Block_Source make_entry_block_source<DTM_Final_Entry, DTM_Intermediate_Entry>(Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&, Save_Group_Cache<DTM_Final_Entry, DTM_Intermediate_Entry>&, Color, size_t, size_t);
-template Block_Source make_entry_block_source<DTM_Final_Entry>(Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&, Save_Group_Cache<DTM_Final_Entry>&, Color, size_t, size_t);
+template Block_Source make_entry_block_source<DTC_Final_Entry, DTC_Intermediate_Entry>(Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>&, Save_Group_Cache<DTC_Final_Entry, DTC_Intermediate_Entry>&, Color, Index_Permutation_Plan, size_t, size_t);
+template Block_Source make_entry_block_source<DTM_Final_Entry, DTM_Intermediate_Entry>(Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&, Save_Group_Cache<DTM_Final_Entry, DTM_Intermediate_Entry>&, Color, Index_Permutation_Plan, size_t, size_t);
+template Block_Source make_entry_block_source<DTM_Final_Entry>(Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&, Save_Group_Cache<DTM_Final_Entry>&, Color, Index_Permutation_Plan, size_t, size_t);

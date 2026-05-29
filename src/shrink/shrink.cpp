@@ -17,6 +17,7 @@
 #include "egtb/egtb_entry.h"
 
 #include "chess/chess.h"
+#include "chess/index_permutation.h"
 #include "chess/piece_config.h"
 
 #include "util/defines.h"
@@ -95,6 +96,7 @@ struct Rank_Color_Info
 	uint8_t flag = 0;
 	uint8_t single_val = 0;
 	// Present when flag_is_normal(flag).
+	uint32_t index_perm = 0;
 	uint8_t entry_bytes = 0;
 	uint32_t tail_size = 0;
 	uint32_t block_size = 0;
@@ -136,6 +138,7 @@ NODISCARD bool parse_rank_encoded(const Const_Span<uint8_t>& bytes,
 		}
 		else
 		{
+			info[c].index_perm = r.read<uint32_t>();
 			info[c].entry_bytes = r.read<uint8_t>();
 			info[c].tail_size   = r.read<uint32_t>();
 			info[c].block_size  = r.read<uint32_t>();
@@ -178,8 +181,9 @@ NODISCARD size_t rank_color_header_bytes(const Rank_Color_Info& ci)
 {
 	if (ci.flag & SINGULAR_FLAG) return 2;
 	if (ci.flag & DROPPED_FLAG)  return 1;
-	// flag(1)+entry_bytes(1)+tail(4)+block_size(4)+block_cnt(8)+data_size(8) = 26
-	return 26 + 2 + ci.num_ranks * 2;
+	// flag(1)+index_perm(4)+entry_bytes(1)+tail(4)+block_size(4)
+	// + block_cnt(8)+data_size(8)+num_ranks(2) = 32
+	return 32 + ci.num_ranks * 2;
 }
 
 bool shrink_rank_encoded(const std::filesystem::path& path,
@@ -278,6 +282,7 @@ bool shrink_rank_encoded(const std::filesystem::path& path,
 		else
 		{
 			w.write<uint8_t>(0);
+			w.write<uint32_t>(ci.index_perm);
 			w.write<uint8_t>(ci.entry_bytes);
 			w.write<uint32_t>(ci.tail_size);
 			w.write<uint32_t>(ci.block_size);
@@ -346,6 +351,7 @@ struct Dtm50_Color_Info
 	uint8_t flag = 0;
 	uint8_t single_val = 0;
 	// Fields below are populated only when flag_is_normal(flag).
+	uint32_t index_perm = 0;
 	uint8_t entry_bytes = 0;
 	uint32_t block_positions = 0;
 	uint64_t block_cnt = 0;
@@ -386,6 +392,7 @@ NODISCARD bool parse_dtm50(const Const_Span<uint8_t>& bytes,
 		}
 		else
 		{
+			info[c].index_perm = r.read<uint32_t>();
 			info[c].entry_bytes     = r.read<uint8_t>();
 			info[c].block_positions = r.read<uint32_t>();
 			info[c].block_cnt       = r.read<uint64_t>();
@@ -429,9 +436,9 @@ NODISCARD size_t dtm50_color_header_bytes(const Dtm50_Color_Info& ci)
 {
 	if (ci.flag & SINGULAR_FLAG) return 2;
 	if (ci.flag & DROPPED_FLAG)  return 1;
-	// 1 flag + 1 eb + 4 block_positions + 8 block_cnt + 4 tail_positions
-	// + 8 data_size + 2 num_ranks + ranks.
-	return 28 + ci.num_ranks * 2;
+	// 1 flag + 4 index_perm + 1 eb + 4 block_positions + 8 block_cnt
+	// + 4 tail_positions + 8 data_size + 2 num_ranks + ranks.
+	return 32 + ci.num_ranks * 2;
 }
 
 bool shrink_dtm50(const std::filesystem::path& path)
@@ -529,6 +536,7 @@ bool shrink_dtm50(const std::filesystem::path& path)
 		else
 		{
 			w.write<uint8_t>(0);
+			w.write<uint32_t>(ci.index_perm);
 			w.write<uint8_t>(ci.entry_bytes);
 			w.write<uint32_t>(ci.block_positions);
 			w.write<uint64_t>(ci.block_cnt);
@@ -594,6 +602,7 @@ struct Wdl_Color_Info
 	uint8_t flag = 0;
 	uint8_t single_val = 0;
 	// Present when flag_is_normal(flag).
+	uint32_t index_perm = 0;
 	uint16_t tail_size = 0;
 	uint32_t block_size = 0;
 	uint64_t block_cnt = 0;
@@ -633,6 +642,7 @@ NODISCARD bool parse_wdl(const Const_Span<uint8_t>& bytes,
 		}
 		else
 		{
+			info[c].index_perm = r.read<uint32_t>();
 			info[c].tail_size   = r.read<uint16_t>();
 			info[c].block_size  = r.read<uint32_t>();
 			info[c].block_cnt   = r.read<uint64_t>();
@@ -684,8 +694,8 @@ NODISCARD size_t wdl_color_header_bytes(const Wdl_Color_Info& ci)
 {
 	if (ci.flag & SINGULAR_FLAG) return 2;
 	if (ci.flag & DROPPED_FLAG)  return 1;
-	// flag(1)+tail(2)+block_size(4)+block_cnt(8)+data_size(8) = 23
-	return 23;
+	// flag(1)+index_perm(4)+tail(2)+block_size(4)+block_cnt(8)+data_size(8) = 27
+	return 27;
 }
 
 bool shrink_wdl(const std::filesystem::path& path)
@@ -792,6 +802,7 @@ bool shrink_wdl(const std::filesystem::path& path)
 		else
 		{
 			w.write<uint8_t>(0);
+			w.write<uint32_t>(ci.index_perm);
 			w.write<uint16_t>(ci.tail_size);
 			w.write<uint32_t>(ci.block_size);
 			w.write<uint64_t>(ci.block_cnt);

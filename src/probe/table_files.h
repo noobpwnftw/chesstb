@@ -5,6 +5,7 @@
 #include "probe/position_index.h"
 
 #include "chess/chess.h"
+#include "chess/index_permutation.h"
 #include "chess/piece_config.h"
 
 #include "util/compress.h"
@@ -31,6 +32,7 @@ constexpr uint64_t TABLE_CHECKSUM_INIT = 0xf0f0f0f0f0f0;
 
 struct WDL_Per_Color : Block_Cache<LZ4_Decompress_Helper>
 {
+	Index_Permutation_Plan plan;
 	size_t block_size = 0;
 	size_t tail_size = 0;
 	size_t block_cnt = 0;
@@ -47,6 +49,7 @@ struct WDL_Per_Color : Block_Cache<LZ4_Decompress_Helper>
 
 struct Lzma_Rank_Per_Color : Block_Cache<LZMA_Decompress_Helper>
 {
+	Index_Permutation_Plan plan;
 	size_t entry_bytes = 0;
 	size_t block_size = 0;
 	size_t tail_size = 0;
@@ -60,6 +63,7 @@ struct Lzma_Rank_Per_Color : Block_Cache<LZMA_Decompress_Helper>
 
 struct DTM50_Per_Color : Block_Cache<LZMA_Decompress_Helper>
 {
+	Index_Permutation_Plan plan;
 	size_t entry_bytes = 0;
 	size_t block_positions = 0;
 	size_t tail_positions = 0;
@@ -81,6 +85,7 @@ struct Table_File
 	bool is_dropped[COLOR_NB]  = { false, false };
 	Per_Color per_color[COLOR_NB];
 	Memory_Mapped_File mapped;
+	std::unique_ptr<Position_Index_Config> index_cfg;
 
 	void load(const Piece_Config& ps, const std::filesystem::path& path);
 
@@ -90,7 +95,8 @@ struct Table_File
 	auto read(Color c, Board_Index pos, Args... args)
 	{
 		ASSERT(!is_dropped[c]);
-		return Traits::read(per_color[c], is_singular[c], pos, args...);
+		const size_t storage_pos = logical_index_to_storage_index(per_color[c].plan, static_cast<size_t>(pos));
+		return Traits::read(per_color[c], is_singular[c], static_cast<Board_Index>(storage_pos), args...);
 	}
 };
 
@@ -116,6 +122,7 @@ void Table_File<Traits>::load(const Piece_Config& ps, const std::filesystem::pat
 	const Material_Key key = static_cast<Material_Key>(key_and_table_num >> 2u);
 	if (key != ps.min_material_key())
 		throw std::runtime_error(std::string("Wrong material key in ") + Traits::NAME + " " + path.string());
+	index_cfg = std::make_unique<Position_Index_Config>(ps);
 
 	const size_t table_num = key_and_table_num & 3;
 	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
@@ -134,7 +141,7 @@ void Table_File<Traits>::load(const Piece_Config& ps, const std::filesystem::pat
 		}
 		else
 		{
-			Traits::parse_header(reader, per_color[i], path);
+			Traits::parse_header(reader, per_color[i], *index_cfg, path);
 		}
 	}
 
@@ -149,6 +156,7 @@ struct WDL_Traits
 
 	static void on_singular(Serial_Memory_Reader& reader, Per_Color& pc);
 	static void parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
+	                         const Position_Index_Config& index_cfg,
 	                         const std::filesystem::path& path);
 	static void finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)[COLOR_NB],
 	                     const bool (&is_singular)[COLOR_NB], const bool (&is_dropped)[COLOR_NB],
@@ -165,6 +173,7 @@ struct DTC_Traits
 
 	static void on_singular(Serial_Memory_Reader& reader, Per_Color& pc);
 	static void parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
+	                         const Position_Index_Config& index_cfg,
 	                         const std::filesystem::path& path);
 	static void finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)[COLOR_NB],
 	                     const bool (&is_singular)[COLOR_NB], const bool (&is_dropped)[COLOR_NB],
@@ -181,6 +190,7 @@ struct DTM_Traits
 
 	static void on_singular(Serial_Memory_Reader& reader, Per_Color& pc);
 	static void parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
+	                         const Position_Index_Config& index_cfg,
 	                         const std::filesystem::path& path);
 	static void finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)[COLOR_NB],
 	                     const bool (&is_singular)[COLOR_NB], const bool (&is_dropped)[COLOR_NB],
@@ -197,6 +207,7 @@ struct DTM50_Traits
 
 	static void on_singular(Serial_Memory_Reader& reader, Per_Color& pc);
 	static void parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
+	                         const Position_Index_Config& index_cfg,
 	                         const std::filesystem::path& path);
 	static void finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)[COLOR_NB],
 	                     const bool (&is_singular)[COLOR_NB], const bool (&is_dropped)[COLOR_NB],

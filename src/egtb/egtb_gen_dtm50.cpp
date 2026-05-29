@@ -5,6 +5,7 @@
 #include "egtb/pawn_slice_manager.h"
 
 #include "chess/chess.h"
+#include "chess/index_permutation.h"
 #include "chess/position.h"
 #include "chess/piece_config.h"
 
@@ -622,6 +623,7 @@ namespace {
 //     uint8  flag (SINGULAR bit set ⇒ singular-WDL color)
 //     if SINGULAR: uint8 singular_wdl
 //     else:
+//       uint32 index_perm   (populated-class storage-order permutation index)
 //       uint8  entry_bytes  (1 or 2)
 //       uint32 block_positions
 //       uint64 block_cnt
@@ -935,6 +937,66 @@ INLINE size_t dtm50_table_idx_of(Color c, int h)
 		+ static_cast<size_t>(h);
 }
 
+NODISCARD Value_Rank_Table make_trial_rank_table(const DTM50_Rank_Table& ranks)
+{
+	Value_Rank_Table out;
+	out.ranks = ranks.rank_to_value;
+	out.value_to_rank.assign(DTM50_Rank_Table::LUT_SIZE, Value_Rank_Table::NO_RANK);
+	for (size_t i = 0; i < out.ranks.size(); ++i)
+		out.value_to_rank[out.ranks[i]] = static_cast<uint16_t>(i);
+	return out;
+}
+
+NODISCARD Block_Source make_dtm50_layer0_block_source(
+	const Piece_Config_For_Gen& epsi,
+	DTM50_Table& table,
+	DTM50_Save_Cache& cache,
+	Color color,
+	size_t num_positions,
+	uint32_t index_perm,
+	size_t entry_bytes,
+	size_t block_positions)
+{
+	auto& src = table.m_dtm[color][0];
+	const size_t bp = block_positions;
+	const size_t source_block_bytes = bp * sizeof(DTM_Final_Entry);
+	const size_t source_total_bytes = num_positions * sizeof(DTM_Final_Entry);
+	const size_t output_total_bytes = num_positions * entry_bytes;
+
+	auto group_id_of_pos = [&src](size_t p) {
+		return src.group_id_of(src.slice_id_of(p));
+	};
+
+	const auto perm_plan = make_index_permutation_plan(epsi, index_perm);
+	return Block_Source{
+		output_total_bytes,
+		[&src, &cache, color, source_block_bytes, source_total_bytes,
+		 perm_plan, group_id_of_pos](size_t block_id, Span<uint8_t> scratch) -> Const_Span<uint8_t> {
+			const size_t block_off = block_id * source_block_bytes;
+			const size_t this_block = std::min(source_block_bytes, source_total_bytes - block_off);
+			ASSERT(scratch.size() >= this_block);
+			ASSERT(block_off % sizeof(DTM_Final_Entry) == 0);
+			ASSERT(this_block % sizeof(DTM_Final_Entry) == 0);
+
+			const size_t storage_pos_off = block_off / sizeof(DTM_Final_Entry);
+			const size_t pos_cnt = this_block / sizeof(DTM_Final_Entry);
+			const size_t want_lo = group_id_of_pos(storage_pos_off);
+			const size_t want_hi = group_id_of_pos(storage_pos_off + pos_cnt - 1);
+			DTM50_Pinned_Range pin(cache, dtm50_table_idx_of(color, 0), want_lo, want_hi);
+
+			for (size_t k = 0; k < pos_cnt; ++k)
+			{
+				const size_t storage_idx = storage_pos_off + k;
+				const size_t logical_idx = storage_index_to_logical_index(perm_plan, storage_idx);
+				const DTM_Final_Entry e = src.read(static_cast<Board_Index>(logical_idx));
+				std::memcpy(scratch.data() + k * sizeof(DTM_Final_Entry), &e, sizeof(e));
+			}
+
+			return Const_Span<uint8_t>(scratch.data(), this_block);
+		}
+	};
+}
+
 // h=0 feeds EGTB_Info (the canonical reset-50MR view); other layers only
 // contribute to the rank score. Returns false iff no W/L storage values appear.
 NODISCARD bool gather_dtm50_info(
@@ -1031,8 +1093,8 @@ void save_compress_dtm50(
 	DTM50_Save_Cache& cache,
 	Color color,
 	size_t num_positions,
-	size_t positions_per_group,
 	uint32_t block_positions,
+	uint32_t index_perm,
 	size_t max_workers,
 	DTM50_Compressed_Color& out)
 {
@@ -1053,13 +1115,16 @@ void save_compress_dtm50(
 	out.compressed_blocks.resize(bcnt);
 	out.usizes.resize(bcnt);
 
-	auto group_id_of_pos = [positions_per_group](size_t p) {
-		return positions_per_group == 0 ? size_t{ 0 } : p / positions_per_group;
+	auto& src = table.m_dtm[color][0];
+	auto group_id_of_pos = [&src](size_t p) {
+		return src.group_id_of(src.slice_id_of(p));
 	};
 
 	const size_t pool_workers = thread_pool->num_workers();
 	const size_t effective_workers = (max_workers == 0)
 		? pool_workers : std::min(max_workers, pool_workers);
+
+	const auto perm_plan = make_index_permutation_plan(table.m_epsi, index_perm);
 
 	std::atomic<size_t> next_block_id(0);
 
@@ -1067,6 +1132,7 @@ void save_compress_dtm50(
 		if (thread_id >= effective_workers) return;
 
 		std::vector<uint16_t> chunk(bp * DTM50_HMC_COUNT);
+		std::vector<size_t> logical_pos(bp);
 		RS_Block_Encoder encoder;
 		encoder.ranks = &out.ranks;
 		LZMA_Compress_Helper lzma;
@@ -1082,6 +1148,8 @@ void save_compress_dtm50(
 
 			const size_t want_lo = group_id_of_pos(p_base);
 			const size_t want_hi = group_id_of_pos(p_base + this_bp - 1);
+			for (size_t k = 0; k < this_bp; ++k)
+				logical_pos[k] = storage_index_to_logical_index(perm_plan, p_base + k);
 
 			// Block-skip if no W/L cells: probe collapses DRAW/ILLEGAL to DRAW.
 			// MUST test entry class, not storage 0 — storage 0 also covers
@@ -1095,7 +1163,7 @@ void save_compress_dtm50(
 				uint16_t* row = chunk.data() + static_cast<size_t>(h) * this_bp;
 				for (size_t k = 0; k < this_bp; ++k)
 				{
-					const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(p_base + k));
+					const DTM_Final_Entry e = tbl.read(static_cast<Board_Index>(logical_pos[k]));
 					row[k] = dtm_value_for_storage(e);
 					if (e.is_win() || e.is_loss())
 						uniform_skip = false;
@@ -1131,6 +1199,7 @@ void save_compress_dtm50(
 
 void save_dtm50_table(
 	const Piece_Config& ps,
+	const uint32_t index_perm[COLOR_NB],
 	const DTM50_Compressed_Color color_out[COLOR_NB],
 	const std::filesystem::path& file_path,
 	Fixed_Vector<Color, 2> colors)
@@ -1159,14 +1228,15 @@ void save_dtm50_table(
 		min0_enc[c] = Min0_Uint_Vec::encode(Const_Span<uint64_t>(usz.data(), usz.size()));
 	}
 
-	size_t file_size = 4 + 4;
+	size_t file_size = 8;  // magic/key
+
 	for (Color c : colors)
 	{
 		file_size += 1;
 		if (color_out[c].is_singular) file_size += 1;
 		else {
-			// entry_bytes(1)+block_positions(4)+block_cnt(8)+tail_positions(4)+data_size(8)+num_ranks(2)
-			file_size += 1 + 4 + 8 + 4 + 8 + 2;
+			// index permutation config(8)+entry_bytes(1)+block_positions(4)+block_cnt(8)+tail_positions(4)+data_size(8)+num_ranks(2)
+			file_size += 4 + 1 + 4 + 8 + 4 + 8 + 2;
 			file_size += color_out[c].ranks.rank_to_value.size() * 2;
 		}
 	}
@@ -1204,6 +1274,7 @@ void save_dtm50_table(
 		else
 		{
 			w.write<uint8_t>(0);
+			w.write<uint32_t>(index_perm[c]);
 			w.write<uint8_t>(co.ranks.entry_bytes);
 			w.write<uint32_t>(co.block_positions);
 			w.write<uint64_t>(co.block_cnt);
@@ -1284,6 +1355,10 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 	DTM50_Save_Cache cache(std::move(all_tables), cap_groups);
 
 	DTM50_Compressed_Color color_out[COLOR_NB]{};
+	uint32_t index_perm[COLOR_NB] = {
+		default_index_permutation_config(m_epsi),
+		default_index_permutation_config(m_epsi)
+	};
 
 	for (Color me : colors)
 	{
@@ -1299,9 +1374,22 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 		}
 		else
 		{
+			Value_Rank_Table trial_rank = make_trial_rank_table(color_out[me].ranks);
+			index_perm[me] = choose_storage_permutation_config(
+				thread_pool,
+				m_epsi,
+				[&](uint32_t perm) {
+					return make_dtm50_layer0_block_source(
+						m_epsi, *m_table, cache, me, num_positions,
+						perm, color_out[me].ranks.entry_bytes, RS_BLOCK_POSITIONS);
+				},
+				static_cast<size_t>(RS_BLOCK_POSITIONS) * color_out[me].ranks.entry_bytes,
+				std::make_unique<LZMA_Rank_Compress_Helper>(
+					trial_rank, color_out[me].ranks.entry_bytes, &dtm_storage_fn),
+				"choose_dtm50_storage");
 			save_compress_dtm50(
-				thread_pool, *m_table, cache, me, num_positions, positions_per_group,
-				RS_BLOCK_POSITIONS, max_workers, color_out[me]);
+				thread_pool, *m_table, cache, me, num_positions,
+				RS_BLOCK_POSITIONS, index_perm[me], max_workers, color_out[me]);
 		}
 
 		for (size_t h = 0; h < DTM50_HMC_COUNT; ++h)
@@ -1314,7 +1402,7 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 
 	const auto out_path = paths.dtm50_save_path(m_epsi);
 	std::filesystem::create_directories(out_path.parent_path());
-	save_dtm50_table(m_epsi, color_out, out_path, colors);
+	save_dtm50_table(m_epsi, index_perm, color_out, out_path, colors);
 
 	for (Color me : colors)
 	{

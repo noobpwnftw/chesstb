@@ -215,6 +215,7 @@ public:
 	Position_Index_Config& operator=(Position_Index_Config&&) = default;
 
 	NODISCARD size_t num_positions() const { return m_num_positions; }
+	NODISCARD size_t within_slice_size() const { return m_within_slice_size; }
 	NODISCARD const King_Slice_Manager& slice_manager() const { return *m_king_slice_manager; }
 	NODISCARD const Pawn_Slice_Manager& pawn_slice_manager() const { return *m_pawn_slice_manager; }
 

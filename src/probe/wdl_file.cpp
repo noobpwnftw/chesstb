@@ -40,8 +40,14 @@ void WDL_Traits::on_singular(Serial_Memory_Reader& reader, Per_Color& pc)
 }
 
 void WDL_Traits::parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
+                              const Position_Index_Config& index_cfg,
                               const std::filesystem::path&)
 {
+	const uint32_t perm = reader.read<uint32_t>();
+	if (!index_permutation_config_is_valid(index_cfg, perm))
+		throw std::runtime_error("Invalid WDL index permutation config");
+	pc.plan = make_index_permutation_plan(index_cfg, perm);
+
 	pc.tail_size   = reader.read<uint16_t>();
 	pc.block_size  = reader.read<uint32_t>();
 	pc.block_cnt   = reader.read<uint64_t>();
