@@ -5,9 +5,14 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
-constexpr size_t BLOCK_CACHE_SLOTS = 128;
+constexpr size_t BLOCK_CACHE_SLOTS = 512;
+constexpr size_t TL_BLOCK_CACHE_SLOTS = 128;
+constexpr size_t TL_OBJECT_CACHE_SLOTS = 16;
+static_assert((TL_BLOCK_CACHE_SLOTS & (TL_BLOCK_CACHE_SLOTS - 1)) == 0);
+static_assert((TL_OBJECT_CACHE_SLOTS & (TL_OBJECT_CACHE_SLOTS - 1)) == 0);
 
 inline uint64_t next_epoch()
 {
@@ -67,17 +72,6 @@ inline size_t worker_index()
 
 using Block_Ptr = std::shared_ptr<const std::vector<uint8_t>>;
 
-inline Block_Ptr find_cached_block(
-	const std::array<size_t, BLOCK_CACHE_SLOTS>& block_ids,
-	const std::array<Block_Ptr, BLOCK_CACHE_SLOTS>& blocks,
-	size_t live,
-	size_t block_id)
-{
-	for (size_t i = 0; i < live; ++i)
-		if (block_ids[i] == block_id) return blocks[i];
-	return nullptr;
-}
-
 inline size_t next_cache_slot(size_t& live, size_t& next_slot)
 {
 	if (live < BLOCK_CACHE_SLOTS) return live++;
@@ -88,7 +82,7 @@ inline size_t next_cache_slot(size_t& live, size_t& next_slot)
 
 struct TL_Block_FIFO
 {
-	static constexpr size_t N = 32;
+	static constexpr size_t N = TL_BLOCK_CACHE_SLOTS;
 	uint64_t epoch[N] = {};
 	size_t block_id[N] = {};
 	Block_Ptr bytes[N];
@@ -98,7 +92,7 @@ struct TL_Block_FIFO
 template <typename T, typename K = uint32_t>
 struct TL_Cache
 {
-	static constexpr size_t N = 8;
+	static constexpr size_t N = TL_OBJECT_CACHE_SLOTS;
 	uint64_t epoch[N] = {};
 	K key[N] = {};
 	T* val[N] = {};
@@ -135,6 +129,7 @@ struct Block_Cache
 	mutable std::mutex mu;
 	std::array<size_t, BLOCK_CACHE_SLOTS> block_id{};
 	std::array<Block_Ptr, BLOCK_CACHE_SLOTS> data;
+	std::unordered_map<size_t, size_t> block_slot;
 	size_t next_slot = 0;
 	size_t live = 0;
 
@@ -142,6 +137,11 @@ struct Block_Cache
 	// across vector growth, and only its owning worker ever touches a slot.
 	mutable std::mutex decomp_mu;
 	std::vector<std::unique_ptr<Decompressor>> decomps;
+
+	Block_Cache()
+	{
+		block_slot.reserve(BLOCK_CACHE_SLOTS * 2);
+	}
 
 	// This worker's decompressor, built via `make` on first use.
 	template <typename Make>
@@ -162,6 +162,32 @@ struct Block_Cache
 	}
 };
 
+template <typename Cache>
+inline Block_Ptr find_cached_block(Cache& cache, size_t block_id)
+{
+	auto it = cache.block_slot.find(block_id);
+	if (it == cache.block_slot.end()) return nullptr;
+
+	const size_t slot = it->second;
+	if (slot < cache.live && cache.block_id[slot] == block_id)
+		return cache.data[slot];
+
+	cache.block_slot.erase(it);
+	return nullptr;
+}
+
+template <typename Cache>
+inline void insert_cached_block(Cache& cache, size_t block_id, Block_Ptr block)
+{
+	const size_t slot = next_cache_slot(cache.live, cache.next_slot);
+	if (cache.data[slot])
+		cache.block_slot.erase(cache.block_id[slot]);
+
+	cache.block_id[slot] = block_id;
+	cache.data[slot] = std::move(block);
+	cache.block_slot[block_id] = slot;
+}
+
 // Thread-local fast path in front of the per-color cache. `mu` is held only to
 // look up / insert the shared block array; `build` (decompression) runs
 // unlocked, so workers decode in parallel. Concurrent builders of the same
@@ -178,22 +204,20 @@ inline const uint8_t* fetch_block_cached(Cache& cache, size_t block_id, Build&& 
 	Block_Ptr blk;
 	{
 		std::lock_guard<std::mutex> lk(cache.mu);
-		blk = find_cached_block(cache.block_id, cache.data, cache.live, block_id);
+		blk = find_cached_block(cache, block_id);
 	}
 	if (!blk)
 	{
 		blk = build(cache, block_id);
 
 		std::lock_guard<std::mutex> lk(cache.mu);
-		if (Block_Ptr raced = find_cached_block(cache.block_id, cache.data, cache.live, block_id))
+		if (Block_Ptr raced = find_cached_block(cache, block_id))
 		{
 			blk = std::move(raced);
 		}
 		else
 		{
-			const size_t slot = next_cache_slot(cache.live, cache.next_slot);
-			cache.block_id[slot] = block_id;
-			cache.data[slot] = blk;
+			insert_cached_block(cache, block_id, blk);
 		}
 	}
 
