@@ -37,7 +37,7 @@ struct WDL_Per_Color : Block_Cache<LZ4_Decompress_Helper>
 	Mono_Uint_Vec offsets;   // (block_cnt + 1) cumulative compressed offsets
 	const uint8_t* compressed_data = nullptr;
 	LZ4_Dict dict;
-	WDL_Entry single_val = WDL_Entry::DRAW;
+	WDL_Stored single_val = WDL_Stored::DRAW;
 
 	// load scratch
 	size_t dict_size = 0;
@@ -154,7 +154,7 @@ struct WDL_Traits
 	                     const bool (&is_singular)[COLOR_NB], const bool (&is_dropped)[COLOR_NB],
 	                     const Fixed_Vector<Color, 2>& table_colors, const Piece_Config& ps,
 	                     const std::filesystem::path& path);
-	NODISCARD static WDL_Entry read(Per_Color& pc, bool is_singular, Board_Index pos);
+	NODISCARD static WDL_Stored read(Per_Color& pc, bool is_singular, Board_Index pos);
 };
 
 struct DTC_Traits

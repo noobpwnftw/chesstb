@@ -117,23 +117,36 @@ Position mirror_for_canonical(const Position& pos)
 
 constexpr int MAX_DERIVE_DEPTH = 16;
 
-// Invert a child's class to the mover's. Plain classes flip symmetrically; the
-// two boundary markers also encode the +1 quiet ply that tips a rule-edge child
-// past the 50-move boundary (BOUNDARY_LOSS -> CURSED_WIN, BOUNDARY_WIN ->
-// BLESSED_LOSS). They only ever arrive from derive_wdl's quiet branch; pass a
-// base class (wdl_from_storage) anywhere the +1 ply doesn't apply (e.g. zeroing moves).
 NODISCARD WDL_Entry invert_wdl(WDL_Entry w)
 {
 	switch (w)
 	{
-		case WDL_Entry::WIN:           return WDL_Entry::LOSE;
-		case WDL_Entry::CURSED_WIN:    return WDL_Entry::BLESSED_LOSS;
-		case WDL_Entry::DRAW:          return WDL_Entry::DRAW;
-		case WDL_Entry::BLESSED_LOSS:  return WDL_Entry::CURSED_WIN;
-		case WDL_Entry::LOSE:          return WDL_Entry::WIN;
-		case WDL_Entry::BOUNDARY_LOSS: return WDL_Entry::CURSED_WIN;
-		case WDL_Entry::BOUNDARY_WIN:  return WDL_Entry::BLESSED_LOSS;
-		case WDL_Entry::ILLEGAL:       return WDL_Entry::ILLEGAL;
+		case WDL_Entry::WIN:          return WDL_Entry::LOSE;
+		case WDL_Entry::CURSED_WIN:   return WDL_Entry::BLESSED_LOSS;
+		case WDL_Entry::DRAW:         return WDL_Entry::DRAW;
+		case WDL_Entry::BLESSED_LOSS: return WDL_Entry::CURSED_WIN;
+		case WDL_Entry::LOSE:         return WDL_Entry::WIN;
+		case WDL_Entry::ILLEGAL:      return WDL_Entry::ILLEGAL;
+	}
+	return WDL_Entry::ILLEGAL;
+}
+
+// Invert a quiet child's stored class to the mover's, across one quiet ply. A
+// rule-edge marker tips one ply past the 50mr boundary: BOUNDARY_LOSS -> we win
+// but only cursed, BOUNDARY_WIN -> we lose but only blessed. The five plain
+// codes invert like invert_wdl.
+NODISCARD WDL_Entry invert_stored(WDL_Stored s)
+{
+	switch (s)
+	{
+		case WDL_Stored::WIN:           return WDL_Entry::LOSE;
+		case WDL_Stored::CURSED_WIN:    return WDL_Entry::BLESSED_LOSS;
+		case WDL_Stored::DRAW:          return WDL_Entry::DRAW;
+		case WDL_Stored::BLESSED_LOSS:  return WDL_Entry::CURSED_WIN;
+		case WDL_Stored::LOSE:          return WDL_Entry::WIN;
+		case WDL_Stored::BOUNDARY_LOSS: return WDL_Entry::CURSED_WIN;
+		case WDL_Stored::BOUNDARY_WIN:  return WDL_Entry::BLESSED_LOSS;
+		case WDL_Stored::ILLEGAL:       return WDL_Entry::ILLEGAL;
 	}
 	return WDL_Entry::ILLEGAL;
 }
@@ -347,6 +360,7 @@ struct Probe_Tables::Impl
 
 	NODISCARD Probe_Result probe_impl(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
 	NODISCARD WDL_Entry probe_wdl_internal(const Piece_Config& ps, const Position& pos, int depth);
+	NODISCARD WDL_Stored read_wdl_stored(const Piece_Config& ps, const Position& pos);
 	NODISCARD std::optional<uint16_t> probe_dtc_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth);
 	NODISCARD std::optional<uint16_t> probe_dtm_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth);
 	NODISCARD DTM50_Result probe_dtm50_internal(const Piece_Config& ps, const Position& pos,
@@ -361,8 +375,21 @@ struct Probe_Tables::Impl
 	void scan_paths();
 };
 
-// Returns the raw on-disk class, boundary markers intact; callers fold with
-// wdl_from_storage() unless they want the marker.
+// Raw on-disk code, markers intact. derive_wdl reads quiet children this way —
+// they always land in the kept opposite-stm frame of the same material.
+WDL_Stored Probe_Tables::Impl::read_wdl_stored(const Piece_Config& ps, const Position& pos)
+{
+	WDL_File* w = open_wdl(ps);
+	if (!w) return WDL_Stored::ILLEGAL;
+
+	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
+	if (idx == BOARD_INDEX_NONE) return WDL_Stored::ILLEGAL;
+
+	return w->read(pos.turn(), idx);
+}
+
+// Semantic WDL for `pos`: read from the stored frame (markers folded), or
+// reconstructed by derive_wdl when this stm's frame was dropped.
 WDL_Entry Probe_Tables::Impl::probe_wdl_internal(const Piece_Config& ps, const Position& pos, int depth)
 {
 	WDL_File* w = open_wdl(ps);
@@ -373,7 +400,7 @@ WDL_Entry Probe_Tables::Impl::probe_wdl_internal(const Piece_Config& ps, const P
 
 	const Color stm = pos.turn();
 	if (w->is_dropped[stm]) return derive_wdl(ps, pos, depth);
-	return w->read(stm, idx);
+	return wdl_from_storage(w->read(stm, idx));
 }
 
 std::optional<uint16_t> Probe_Tables::Impl::probe_dtc_internal(
@@ -430,9 +457,11 @@ DTM50_Result Probe_Tables::Impl::probe_dtm50_internal(
 	return d;
 }
 
-// Reconstruct a dropped WDL frame by one-ply minimax over children, read
-// straight from their stored frames; invert_wdl carries the rule-edge boundary
-// handling.
+// Reconstruct a dropped WDL frame by one-ply minimax over children. A quiet
+// move keeps the child in this material's kept opposite-stm frame, read raw so
+// invert_stored can tip a rule-edge marker for the +1 ply. A capture/pawn move
+// resets the 50mr clock (no edge to cross) and may cross into a sub-tablebase
+// whose frame is itself dropped, so it goes through probe_wdl_internal.
 WDL_Entry Probe_Tables::Impl::derive_wdl(const Piece_Config& ps, const Position& pos, int depth)
 {
 	if (depth >= MAX_DERIVE_DEPTH) return WDL_Entry::ILLEGAL;
@@ -456,14 +485,17 @@ WDL_Entry Probe_Tables::Impl::derive_wdl(const Piece_Config& ps, const Position&
 		{
 			mw = WDL_Entry::DRAW;
 		}
+		else if (c.is_zeroing)
+		{
+			const WDL_Entry cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
+			if (cw == WDL_Entry::ILLEGAL) continue;
+			mw = invert_wdl(cw);
+		}
 		else
 		{
-			WDL_Entry cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
-			if (cw == WDL_Entry::ILLEGAL) continue;
-			// A zeroing move resets the clock, so its boundary marker no longer
-			// applies; a quiet move keeps it for invert_wdl to tip.
-			if (c.is_zeroing) cw = wdl_from_storage(cw);
-			mw = invert_wdl(cw);
+			const WDL_Stored cs = read_wdl_stored(c.ps, c.pos);
+			if (cs == WDL_Stored::ILLEGAL) continue;
+			mw = invert_stored(cs);
 		}
 
 		if (wdl_rank(mw) > wdl_rank(best)) best = mw;
@@ -503,7 +535,7 @@ std::optional<uint16_t> Probe_Tables::Impl::derive_dtc(const Piece_Config& ps, c
 		}
 		else
 		{
-			cw = wdl_from_storage(probe_wdl_internal(c.ps, c.pos, depth + 1));
+			cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
 			if (cw == WDL_Entry::ILLEGAL) continue;
 			const auto child_dtc = probe_dtc_internal(c.ps, c.pos, cw, depth + 1);
 			if (!child_dtc) continue;
@@ -563,7 +595,7 @@ std::optional<uint16_t> Probe_Tables::Impl::derive_dtm(const Piece_Config& ps, c
 		}
 		else
 		{
-			cw = wdl_from_storage(probe_wdl_internal(c.ps, c.pos, depth + 1));
+			cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
 			if (cw == WDL_Entry::ILLEGAL) continue;
 			const auto child_dtm = probe_dtm_internal(c.ps, c.pos, cw, depth + 1);
 			if (!child_dtm) continue;
@@ -632,7 +664,7 @@ DTM50_Result Probe_Tables::Impl::derive_dtm50(
 		}
 		else
 		{
-			const WDL_Entry cw = wdl_from_storage(probe_wdl_internal(c.ps, c.pos, depth + 1));
+			const WDL_Entry cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
 			if (cw == WDL_Entry::ILLEGAL) continue;
 			cd = probe_dtm50_internal(c.ps, c.pos, cw, child_rule50, depth + 1);
 			if (cd.wdl == WDL_Entry::ILLEGAL) continue;
@@ -692,7 +724,7 @@ Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Positi
 	}
 
 	r.status = Probe_Result::Status::OK;
-	if (w) r.wdl = wdl_from_storage(probe_wdl_internal(ps, pos, depth));
+	if (w) r.wdl = probe_wdl_internal(ps, pos, depth);
 	if (d && w)
 	{
 		const auto dtc = probe_dtc_internal(ps, pos, r.wdl, depth);

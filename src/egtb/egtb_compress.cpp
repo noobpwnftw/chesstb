@@ -102,12 +102,12 @@ bool prepare_packed_wdl_entries_for_compression(Span<Packed_WDL_Entries> data)
 	if (data.size() == 0)
 		return true;
 
-	auto dst_buf = cpp20::make_unique_for_overwrite<WDL_Entry[]>(data.size() * WDL_ENTRY_PACK_RATIO);
+	auto dst_buf = cpp20::make_unique_for_overwrite<WDL_Stored[]>(data.size() * WDL_ENTRY_PACK_RATIO);
 	const Span unpacked_span(dst_buf.get(), data.size() * WDL_ENTRY_PACK_RATIO);
 
 	unpack_wdl_entries(data, unpacked_span);
 
-	if (!prepare_entries_for_compression<WDL_Entry>(unpacked_span, WDL_Entry::ILLEGAL))
+	if (!prepare_entries_for_compression<WDL_Stored>(unpacked_span, WDL_Stored::ILLEGAL))
 		return false;
 
 	pack_wdl_entries(unpacked_span, data);

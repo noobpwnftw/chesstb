@@ -16,27 +16,38 @@ enum struct EGTB_Magic : uint64_t
 	DTM50_MAGIC = 0xab57c150,
 };
 
-// Listed worst-to-best. BOUNDARY_LOSS/BOUNDARY_WIN decorate LOSE/WIN at the 50mr
-// edge (dtz == DTC_MAX_NON_CURSED_DTZ); only the dropped-frame derive reads them,
-// every other consumer folds via wdl_from_storage().
+// Semantic 5-class outcome. (For the cursed/blessed meaning see egtb_entry.h.)
 enum struct WDL_Entry : uint8_t
 {
+	LOSE         = 0,
+	BLESSED_LOSS = 1,
+	DRAW         = 2,
+	CURSED_WIN   = 3,
+	WIN          = 4,
+	ILLEGAL      = 7,
+};
+
+// On-disk 4-bit code: the five classes share WDL_Entry's values, plus two
+// markers for a WIN/LOSE at the 50mr edge. Only the dropped-frame derive reads
+// the markers; everything else turns a stored code into a class via
+// wdl_from_storage(). The distinct type keeps a marker out of semantic code.
+enum struct WDL_Stored : uint8_t
+{
 	LOSE          = 0,
-	BOUNDARY_LOSS = 1,
-	BLESSED_LOSS  = 2,
-	DRAW          = 3,
-	CURSED_WIN    = 4,
-	BOUNDARY_WIN  = 5,
-	WIN           = 6,
+	BLESSED_LOSS  = 1,
+	DRAW          = 2,
+	CURSED_WIN    = 3,
+	WIN           = 4,
+	BOUNDARY_LOSS = 5,
+	BOUNDARY_WIN  = 6,
 	ILLEGAL       = 7,
 };
 
-// Boundary markers report as their base class everywhere except the derive.
-NODISCARD constexpr WDL_Entry wdl_from_storage(WDL_Entry w)
+NODISCARD constexpr WDL_Entry wdl_from_storage(WDL_Stored s)
 {
-	if (w == WDL_Entry::BOUNDARY_WIN)  return WDL_Entry::WIN;
-	if (w == WDL_Entry::BOUNDARY_LOSS) return WDL_Entry::LOSE;
-	return w;
+	if (s == WDL_Stored::BOUNDARY_WIN)  return WDL_Entry::WIN;
+	if (s == WDL_Stored::BOUNDARY_LOSS) return WDL_Entry::LOSE;
+	return static_cast<WDL_Entry>(s);  // five classes share WDL_Entry's values
 }
 
 enum Packed_WDL_Entries : uint8_t {};
@@ -55,10 +66,10 @@ NODISCARD inline Fixed_Vector<Color, 2> egtb_table_colors(size_t table_num)
 	return r;
 }
 
-NODISCARD constexpr WDL_Entry get_wdl_value(Packed_WDL_Entries packed, size_t pos)
+NODISCARD constexpr WDL_Stored get_wdl_value(Packed_WDL_Entries packed, size_t pos)
 {
 	ASSERT(pos < WDL_ENTRY_PACK_RATIO);
-	return static_cast<WDL_Entry>((packed >> (pos * WDL_ENTRY_BITS)) & 0xF);
+	return static_cast<WDL_Stored>((packed >> (pos * WDL_ENTRY_BITS)) & 0xF);
 }
 
 NODISCARD constexpr uint16_t dtc_value_from_storage(

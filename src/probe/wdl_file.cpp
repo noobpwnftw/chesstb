@@ -36,7 +36,7 @@ Block_Ptr wdl_get_block(WDL_Per_Color& pc, size_t block_id)
 
 void WDL_Traits::on_singular(Serial_Memory_Reader& reader, Per_Color& pc)
 {
-	pc.single_val = static_cast<WDL_Entry>(reader.read<uint8_t>());
+	pc.single_val = static_cast<WDL_Stored>(reader.read<uint8_t>());
 }
 
 void WDL_Traits::parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
@@ -107,7 +107,7 @@ void WDL_Traits::finalize(Serial_Memory_Reader& reader, Per_Color (&per_color)[C
 	}
 }
 
-WDL_Entry WDL_Traits::read(Per_Color& pc, bool is_singular, Board_Index pos)
+WDL_Stored WDL_Traits::read(Per_Color& pc, bool is_singular, Board_Index pos)
 {
 	if (is_singular) return pc.single_val;
 
@@ -117,7 +117,7 @@ WDL_Entry WDL_Traits::read(Per_Color& pc, bool is_singular, Board_Index pos)
 
 	const auto pair = pc.offsets.get2(block_id);
 	if (pair[0] == pair[1])
-		return WDL_Entry::ILLEGAL;
+		return WDL_Stored::ILLEGAL;
 
 	const uint8_t* data = fetch_block_cached(pc, block_id, wdl_get_block);
 	Packed_WDL_Entries entry;

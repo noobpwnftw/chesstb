@@ -23,56 +23,76 @@ enum struct EGTB_Magic : uint64_t
 	DTM50_SLICE_MAGIC = 0xd1cef11e51ce2050ULL,
 };
 
-// 4 bits per entry, numbered worst-to-best: the generator picks outcomes by
-// value (e.g. effective_opp_wdl_after_dp), so the base-class order is
+// Semantic 5-class outcome. Numbered worst-to-best: the generator picks
+// outcomes by value (e.g. effective_opp_wdl_after_dp), so the order is
 // load-bearing. CURSED_WIN is a normal-rules win unreachable within 50mr (FIDE
-// draw); BLESSED_LOSS a loss not forceable within 50mr. BOUNDARY_LOSS/
-// BOUNDARY_WIN decorate LOSE/WIN at the 50mr edge (dtz == MAX_NON_CURSED_DTZ) and
-// sit beside their base class so wdl_from_storage() folds cleanly; only the
-// dropped-frame derive reads them. ILLEGAL = 7 is off-scale.
+// draw); BLESSED_LOSS a loss not forceable within 50mr. ILLEGAL is off-scale.
 enum struct WDL_Entry : uint8_t
 {
+	LOSE         = 0,
+	BLESSED_LOSS = 1,
+	DRAW         = 2,
+	CURSED_WIN   = 3,
+	WIN          = 4,
+	ILLEGAL      = 7,
+};
+
+// On-disk 4-bit code. The five classes share WDL_Entry's values, plus two
+// markers for a WIN/LOSE whose conversion sits exactly at the 50mr edge
+// (dtz == MAX_NON_CURSED_DTZ). Only the dropped-frame derive inspects the
+// markers; wdl_from_storage() turns any stored code into a WDL_Entry. Keeping
+// it a distinct type stops a marker from masquerading as a semantic class.
+enum struct WDL_Stored : uint8_t
+{
 	LOSE          = 0,
-	BOUNDARY_LOSS = 1,
-	BLESSED_LOSS  = 2,
-	DRAW          = 3,
-	CURSED_WIN    = 4,
-	BOUNDARY_WIN  = 5,
-	WIN           = 6,
+	BLESSED_LOSS  = 1,
+	DRAW          = 2,
+	CURSED_WIN    = 3,
+	WIN           = 4,
+	BOUNDARY_LOSS = 5,
+	BOUNDARY_WIN  = 6,
 	ILLEGAL       = 7,
 };
+
+// Decode a stored code to its semantic class (markers fold to WIN/LOSE).
+NODISCARD constexpr WDL_Entry wdl_from_storage(WDL_Stored s)
+{
+	if (s == WDL_Stored::BOUNDARY_WIN)  return WDL_Entry::WIN;
+	if (s == WDL_Stored::BOUNDARY_LOSS) return WDL_Entry::LOSE;
+	return static_cast<WDL_Entry>(s);  // five classes share WDL_Entry's values
+}
 
 enum Packed_WDL_Entries : uint8_t {};
 
 static constexpr size_t WDL_ENTRY_PACK_RATIO = 2;
 static constexpr size_t WDL_ENTRY_BITS = 4;
 
-NODISCARD constexpr Packed_WDL_Entries pack_wdl_entries(WDL_Entry v0, WDL_Entry v1)
+NODISCARD constexpr Packed_WDL_Entries pack_wdl_entries(WDL_Stored v0, WDL_Stored v1)
 {
 	return static_cast<Packed_WDL_Entries>(
 		  (static_cast<uint8_t>(v0) << 0)
 		| (static_cast<uint8_t>(v1) << 4));
 }
 
-NODISCARD constexpr Packed_WDL_Entries pack_wdl_entries(const WDL_Entry v[2])
+NODISCARD constexpr Packed_WDL_Entries pack_wdl_entries(const WDL_Stored v[2])
 {
 	return pack_wdl_entries(v[0], v[1]);
 }
 
-inline constexpr void pack_wdl_entries(Const_Span<WDL_Entry> in, Span<Packed_WDL_Entries> out)
+inline constexpr void pack_wdl_entries(Const_Span<WDL_Stored> in, Span<Packed_WDL_Entries> out)
 {
 	ASSERT(in.size() == out.size() * WDL_ENTRY_PACK_RATIO);
 	for (size_t i = 0; i < out.size(); ++i)
 		out[i] = pack_wdl_entries(in.data() + i * WDL_ENTRY_PACK_RATIO);
 }
 
-constexpr void unpack_wdl_entries(Packed_WDL_Entries packed, WDL_Entry out[2])
+constexpr void unpack_wdl_entries(Packed_WDL_Entries packed, WDL_Stored out[2])
 {
-	out[0] = static_cast<WDL_Entry>((packed >> 0) & 0xF);
-	out[1] = static_cast<WDL_Entry>((packed >> 4) & 0xF);
+	out[0] = static_cast<WDL_Stored>((packed >> 0) & 0xF);
+	out[1] = static_cast<WDL_Stored>((packed >> 4) & 0xF);
 }
 
-inline constexpr void unpack_wdl_entries(Const_Span<Packed_WDL_Entries> in, Span<WDL_Entry> out)
+inline constexpr void unpack_wdl_entries(Const_Span<Packed_WDL_Entries> in, Span<WDL_Stored> out)
 {
 	ASSERT(in.size() * WDL_ENTRY_PACK_RATIO == out.size());
 	for (size_t i = 0; i < in.size(); ++i)
@@ -88,17 +108,17 @@ NODISCARD inline Fixed_Vector<Color, 2> egtb_table_colors(size_t table_num)
 	return r;
 }
 
-NODISCARD constexpr WDL_Entry get_wdl_value(Packed_WDL_Entries packed, size_t pos)
+NODISCARD constexpr WDL_Stored get_wdl_value(Packed_WDL_Entries packed, size_t pos)
 {
 	ASSERT(pos < WDL_ENTRY_PACK_RATIO);
-	return static_cast<WDL_Entry>((packed >> (pos * WDL_ENTRY_BITS)) & 0xF);
+	return static_cast<WDL_Stored>((packed >> (pos * WDL_ENTRY_BITS)) & 0xF);
 }
 
 static constexpr uint8_t PACKED_WDL_ENTRY_INV_MASK[2] = {
 	0b11110000, 0b00001111,
 };
 
-constexpr void set_wdl_entry(Packed_WDL_Entries& packed, size_t pos, WDL_Entry v)
+constexpr void set_wdl_entry(Packed_WDL_Entries& packed, size_t pos, WDL_Stored v)
 {
 	ASSERT(pos < WDL_ENTRY_PACK_RATIO);
 	packed = static_cast<Packed_WDL_Entries>(
@@ -287,22 +307,18 @@ private:
 };
 static_assert(sizeof(DTC_Final_Entry) == 2);
 
-NODISCARD constexpr WDL_Entry wdl_from_storage(WDL_Entry w)
-{
-	if (w == WDL_Entry::BOUNDARY_WIN)  return WDL_Entry::WIN;
-	if (w == WDL_Entry::BOUNDARY_LOSS) return WDL_Entry::LOSE;
-	return w;
-}
-
-NODISCARD constexpr WDL_Entry wdl_for_storage(DTC_Final_Entry e)
+// Encode the class to its on-disk code, tagging a WIN/LOSE at the 50mr edge so
+// a dropped frame's 1-ply derive can tip its quiet predecessor into CURSED_WIN /
+// BLESSED_LOSS. wdl_from_storage() folds the tag back everywhere else.
+NODISCARD constexpr WDL_Stored wdl_for_storage(DTC_Final_Entry e)
 {
 	const WDL_Entry w = e.wdl();
 	if (static_cast<uint16_t>(e.value()) == DTC_Final_Entry::MAX_NON_CURSED_DTZ)
 	{
-		if (w == WDL_Entry::WIN)  return WDL_Entry::BOUNDARY_WIN;
-		if (w == WDL_Entry::LOSE) return WDL_Entry::BOUNDARY_LOSS;
+		if (w == WDL_Entry::WIN)  return WDL_Stored::BOUNDARY_WIN;
+		if (w == WDL_Entry::LOSE) return WDL_Stored::BOUNDARY_LOSS;
 	}
-	return w;
+	return static_cast<WDL_Stored>(w);  // five classes share WDL_Entry's values
 }
 
 // 1-byte tier halves cursed values (round up so decode stays > MAX_NON_CURSED_DTZ);
