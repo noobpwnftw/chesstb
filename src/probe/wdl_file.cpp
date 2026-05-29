@@ -17,25 +17,19 @@ namespace {
 
 Block_Ptr wdl_get_block(WDL_Per_Color& pc, size_t block_id)
 {
-	if (Block_Ptr cached = find_cached_block(pc.block_id, pc.data, pc.live, block_id))
-		return cached;
-
-	if (!pc.decomp)
-		pc.decomp = std::make_unique<LZ4_Decompress_Helper>(pc.dict, pc.block_size);
-
 	const auto pair = pc.offsets.get2(block_id);
 	const size_t doff = pair[0];
 	const size_t dsz  = pair[1] - pair[0];
 	const size_t out_sz =
 		(block_id == pc.block_cnt - 1 && pc.tail_size != 0) ? pc.tail_size : pc.block_size;
-	const auto decompressed = pc.decomp->decompress(
+
+	LZ4_Decompress_Helper& dc = pc.decomp_for(
+		[&] { return std::make_unique<LZ4_Decompress_Helper>(pc.dict, pc.block_size); });
+	const auto decompressed = dc.decompress(
 		Const_Span<uint8_t>(pc.compressed_data + doff, dsz), out_sz);
 
-	const size_t slot = next_cache_slot(pc.live, pc.next_slot);
-	pc.block_id[slot] = block_id;
-	pc.data[slot] = std::make_shared<const std::vector<uint8_t>>(
+	return std::make_shared<const std::vector<uint8_t>>(
 		decompressed.begin(), decompressed.end());
-	return pc.data[slot];
 }
 
 }  // namespace

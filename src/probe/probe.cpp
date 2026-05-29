@@ -339,12 +339,11 @@ struct Probe_Tables::Impl
 	NODISCARD DTM50_File* open_dtm50(const Piece_Config& ps) { return open_table(dtm50_mu, dtm50_cache, dtm50_dirs, DTM50_EXT, ps); }
 
 	NODISCARD Probe_Result probe_impl(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
-	NODISCARD WDL_Entry probe_wdl_internal(const Piece_Config& ps, const Position& pos, int depth);
+	NODISCARD WDL_Entry probe_wdl_internal(const Piece_Config& ps, const Position& pos);
 	NODISCARD std::optional<uint16_t> probe_dtc_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth);
 	NODISCARD std::optional<uint16_t> probe_dtm_internal(const Piece_Config& ps, const Position& pos, WDL_Entry wdl, int depth);
 	NODISCARD DTM50_Result probe_dtm50_internal(const Piece_Config& ps, const Position& pos,
 	                                            WDL_Entry wdl, unsigned rule50, int depth);
-	NODISCARD WDL_Entry derive_wdl(const Piece_Config& ps, const Position& pos, int depth);
 	NODISCARD std::optional<uint16_t> derive_dtc(const Piece_Config& ps, const Position& pos, int depth);
 	NODISCARD std::optional<uint16_t> derive_dtm(const Piece_Config& ps, const Position& pos, int depth);
 	NODISCARD DTM50_Result derive_dtm50(const Piece_Config& ps, const Position& pos, unsigned rule50, int depth);
@@ -354,7 +353,7 @@ struct Probe_Tables::Impl
 	void scan_paths();
 };
 
-WDL_Entry Probe_Tables::Impl::probe_wdl_internal(const Piece_Config& ps, const Position& pos, int depth)
+WDL_Entry Probe_Tables::Impl::probe_wdl_internal(const Piece_Config& ps, const Position& pos)
 {
 	WDL_File* w = open_wdl(ps);
 	if (!w) return WDL_Entry::ILLEGAL;
@@ -362,10 +361,7 @@ WDL_Entry Probe_Tables::Impl::probe_wdl_internal(const Piece_Config& ps, const P
 	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
 	if (idx == BOARD_INDEX_NONE) return WDL_Entry::ILLEGAL;
 
-	const Color stm = pos.turn();
-	return w->is_dropped[stm]
-		? derive_wdl(ps, pos, depth)
-		: w->read(stm, idx);
+	return w->read(pos.turn(), idx);
 }
 
 std::optional<uint16_t> Probe_Tables::Impl::probe_dtc_internal(
@@ -422,39 +418,6 @@ DTM50_Result Probe_Tables::Impl::probe_dtm50_internal(
 	return d;
 }
 
-WDL_Entry Probe_Tables::Impl::derive_wdl(const Piece_Config& ps, const Position& pos, int depth)
-{
-	if (depth >= MAX_DERIVE_DEPTH) return WDL_Entry::ILLEGAL;
-
-	Move_List ml;
-	pos.gen_pseudo_legal_moves<Position::Move_Kind::ALL>(out_param(ml));
-
-	bool any_legal = false;
-	bool have_candidate = false;
-	WDL_Entry best = WDL_Entry::LOSE;
-
-	for (size_t i = 0; i < ml.size(); ++i)
-	{
-		const Move m = ml[i];
-		if (!pos.is_pseudo_legal_move_legal(m)) continue;
-		any_legal = true;
-
-		Child_Pos c = make_child(pos, m);
-		const WDL_Entry cw = c.is_kk
-			? WDL_Entry::DRAW
-			: probe_wdl_internal(c.ps, c.pos, depth + 1);
-		if (cw == WDL_Entry::ILLEGAL) continue;
-
-		const WDL_Entry mw = invert_wdl(cw);
-		if (wdl_rank(mw) > wdl_rank(best)) best = mw;
-		have_candidate = true;
-	}
-
-	if (!any_legal) return pos.is_in_check() ? WDL_Entry::LOSE : WDL_Entry::DRAW;
-	if (!have_candidate) return WDL_Entry::ILLEGAL;
-	return best;
-}
-
 std::optional<uint16_t> Probe_Tables::Impl::derive_dtc(const Piece_Config& ps, const Position& pos, int depth)
 {
 	if (depth >= MAX_DERIVE_DEPTH) return std::nullopt;
@@ -483,7 +446,7 @@ std::optional<uint16_t> Probe_Tables::Impl::derive_dtc(const Piece_Config& ps, c
 		}
 		else
 		{
-			cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
+			cw = probe_wdl_internal(c.ps, c.pos);
 			if (cw == WDL_Entry::ILLEGAL) continue;
 			const auto child_dtc = probe_dtc_internal(c.ps, c.pos, cw, depth + 1);
 			if (!child_dtc) continue;
@@ -543,7 +506,7 @@ std::optional<uint16_t> Probe_Tables::Impl::derive_dtm(const Piece_Config& ps, c
 		}
 		else
 		{
-			cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
+			cw = probe_wdl_internal(c.ps, c.pos);
 			if (cw == WDL_Entry::ILLEGAL) continue;
 			const auto child_dtm = probe_dtm_internal(c.ps, c.pos, cw, depth + 1);
 			if (!child_dtm) continue;
@@ -612,7 +575,7 @@ DTM50_Result Probe_Tables::Impl::derive_dtm50(
 		}
 		else
 		{
-			const WDL_Entry cw = probe_wdl_internal(c.ps, c.pos, depth + 1);
+			const WDL_Entry cw = probe_wdl_internal(c.ps, c.pos);
 			if (cw == WDL_Entry::ILLEGAL) continue;
 			cd = probe_dtm50_internal(c.ps, c.pos, cw, child_rule50, depth + 1);
 			if (cd.wdl == WDL_Entry::ILLEGAL) continue;
@@ -672,7 +635,7 @@ Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Positi
 	}
 
 	r.status = Probe_Result::Status::OK;
-	if (w) r.wdl = probe_wdl_internal(ps, pos, depth);
+	if (w) r.wdl = probe_wdl_internal(ps, pos);
 	if (d && w)
 	{
 		const auto dtc = probe_dtc_internal(ps, pos, r.wdl, depth);

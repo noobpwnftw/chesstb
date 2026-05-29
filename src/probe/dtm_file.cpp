@@ -19,9 +19,6 @@ namespace {
 
 Block_Ptr dtm_get_block(Lzma_Rank_Per_Color& pc, size_t block_id)
 {
-	if (Block_Ptr cached = find_cached_block(pc.block_id, pc.data, pc.live, block_id))
-		return cached;
-
 	const size_t decode_sz =
 		(block_id == pc.block_cnt - 1 && pc.tail_size != 0) ? pc.tail_size : pc.block_size;
 	const size_t positions = decode_sz / pc.entry_bytes;
@@ -30,15 +27,13 @@ Block_Ptr dtm_get_block(Lzma_Rank_Per_Color& pc, size_t block_id)
 	const size_t doff = pair[0];
 	const size_t dsz  = pair[1] - pair[0];
 
-	const size_t slot = next_cache_slot(pc.live, pc.next_slot);
-	pc.block_id[slot] = block_id;
 	auto buf = std::make_shared<std::vector<uint8_t>>(positions * sizeof(uint16_t), 0);
 
 	if (dsz != 0)
 	{
-		if (!pc.decomp)
-			pc.decomp = std::make_unique<LZMA_Decompress_Helper>(pc.block_size);
-		const Const_Span<uint8_t> raw = pc.decomp->decompress(
+		LZMA_Decompress_Helper& dc = pc.decomp_for(
+			[&] { return std::make_unique<LZMA_Decompress_Helper>(pc.block_size); });
+		const Const_Span<uint8_t> raw = dc.decompress(
 			Const_Span(pc.compressed_data + doff, dsz), decode_sz);
 
 		const auto& r2v = pc.rank_to_value;
@@ -56,8 +51,7 @@ Block_Ptr dtm_get_block(Lzma_Rank_Per_Color& pc, size_t block_id)
 		}
 	}
 
-	pc.data[slot] = buf;
-	return pc.data[slot];
+	return buf;
 }
 
 }  // namespace

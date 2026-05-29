@@ -157,9 +157,6 @@ NODISCARD INLINE State_Prefix state_prefix_indexed(
 // Skipped blocks are short-circuited in read() before reaching here.
 Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 {
-	if (Block_Ptr cached = find_cached_block(pc.block_id, pc.data, pc.live, block_id))
-		return cached;
-
 	const auto pair = pc.offsets.get2(block_id);
 	const size_t doff = pair[0];
 	const size_t dsz  = pair[1] - pair[0];
@@ -167,8 +164,7 @@ Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 	ASSERT(dsz != 0);  // read() short-circuits the skip sentinel before us
 	ASSERT((usz & 3) == 0);
 
-	if (!pc.decomp)
-	{
+	LZMA_Decompress_Helper& dc = pc.decomp_for([&] {
 		const size_t ppb = pc.block_positions;
 		const size_t eb = pc.entry_bytes;
 		const size_t max_payload =
@@ -179,9 +175,9 @@ Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 			+ (ppb + 7) / 8 + ppb * (2 + 3 * eb)                     // all DOUBLE
 			+ (ppb + 1) * 4 + ppb * (1 + 16 + DTM50_HMC_COUNT * eb)  // all MULTI
 			+ 3;                                                     // tail alignment
-		pc.decomp = std::make_unique<LZMA_Decompress_Helper>(max_payload);
-	}
-	const Const_Span<uint8_t> raw = pc.decomp->decompress(
+		return std::make_unique<LZMA_Decompress_Helper>(max_payload);
+	});
+	const Const_Span<uint8_t> raw = dc.decompress(
 		Const_Span(pc.compressed_data + doff, dsz), usz);
 
 	const uint8_t* payload = raw.data();
@@ -227,9 +223,6 @@ Block_Ptr dtm50_get_block(DTM50_Per_Color& pc, size_t block_id)
 	auto* prefix = reinterpret_cast<DTM50_Prefix_Entry*>(buf->data() + meta.prefix_off);
 	build_dtm50_prefix_index(state_bits, num_positions, prefix, n_strides);
 
-	const size_t slot = next_cache_slot(pc.live, pc.next_slot);
-	pc.block_id[slot] = block_id;
-	pc.data[slot] = buf;
 	return buf;
 }
 

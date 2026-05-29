@@ -248,19 +248,21 @@ to exhaustive:
 ## Shrink
 
 ```sh
-./shrink wdl dtc dtm dtm50
-./shrink wdl/KQK.lzw dtc/KQK.lzdtc dtm/KQK.lzdtm
+./shrink dtc dtm dtm50
+./shrink dtc/KQK.lzdtc dtm/KQK.lzdtm
 ./shrink --dry-run dtc/*
 ```
 
 `shrink` rewrites files in place, dropping the larger compressed STM
-color when it can be derived at probe time. The probe code detects
-dropped colors and reconstructs them by one-ply minimax against the kept
-color and sub-TBs (DTM50 derive threads each child's hmc through the
-recursion so per-layer semantics are preserved). WDL, DTC, DTM, and
-DTM50 all dispatch through `shrink` by magic; DTC/DTM share the
-rank-encoded wire layout while DTM50 uses its own rs-pack header (16-byte
-offset entries: `dso` + uncompressed payload size).
+color when it can be reconstructed at probe time. The probe code detects
+dropped colors and rebuilds them by one-ply minimax against the kept
+color and sub-TBs (DTM50 threads each child's hmc through the recursion
+so per-layer semantics are preserved).
+
+Only DTC, DTM, and DTM50 are shrinkable; they dispatch through `shrink`
+by magic. DTC/DTM share the rank-encoded wire layout, while DTM50 uses
+its own rs-pack header (16-byte offset entries: `dso` + uncompressed
+payload size).
 
 Arguments may be individual table files or generated table directories.
 Mixed shell globs are safe: non-table files such as `.info` metadata are
