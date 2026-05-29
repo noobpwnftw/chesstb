@@ -793,6 +793,96 @@ void load_dtm_table(
 	}
 }
 
+// Wire format: see save_dtm50_table.
+void load_dtm50_table(
+	Out_Param<DTM50_File_For_Probe> dtm50,
+	const Piece_Config& ps,
+	std::filesystem::path sub_dtm50
+)
+{
+	if (!dtm50->m_lzdtm50_file.open_readonly(sub_dtm50.c_str()))
+		throw std::runtime_error("Could not open DTM50 file trying to load " + sub_dtm50.string());
+
+	const Const_Span<uint8_t> input = dtm50->m_lzdtm50_file.data_span();
+	if ((input.size() & 63) != 8)
+		throw std::runtime_error("Invalid DTM50 file size trying to load " + sub_dtm50.string());
+
+	Serial_Memory_Reader reader(input);
+	if (!reader.is_end_checksum_ok(static_cast<uint64_t>(EGTB_CHECKSUM_INIT_VALUE)))
+		throw std::runtime_error("Invalid DTM50 file checksum trying to load " + sub_dtm50.string());
+
+	const uint32_t magic = reader.read<uint32_t>();
+	if (magic != narrowing_static_cast<uint32_t>(EGTB_Magic::DTM50_MAGIC))
+		throw std::runtime_error("Invalid DTM50 file magic trying to load " + sub_dtm50.string());
+
+	const uint32_t key_and_table_num = reader.read<uint32_t>();
+	const Material_Key key = static_cast<Material_Key>(key_and_table_num >> 2u);
+	if (key != ps.min_material_key())
+		throw std::runtime_error("Wrong material key in DTM50 file " + sub_dtm50.string());
+
+	const size_t table_num = key_and_table_num & 3;
+	const Fixed_Vector<Color, 2> table_colors = egtb_table_colors(table_num);
+
+	size_t data_size[COLOR_NB]{ 0, 0 };
+
+	for (const Color i : table_colors)
+	{
+		const uint8_t flag = reader.read<uint8_t>();
+		if (flag & EGTB_SINGULAR_FLAG)
+		{
+			dtm50->m_is_singular[i] = true;
+			dtm50->m_single_val[i] = static_cast<WDL_Entry>(reader.read<uint8_t>());
+			if (dtm50->m_single_val[i] != WDL_Entry::DRAW)
+				throw std::runtime_error("DTM50 singular value must be DRAW in " + sub_dtm50.string());
+		}
+		else
+		{
+			dtm50->m_is_singular[i] = false;
+			auto& pc = dtm50->m_per_color[i];
+			pc.entry_bytes = reader.read<uint8_t>();
+			if (pc.entry_bytes != 1 && pc.entry_bytes != 2)
+				throw std::runtime_error("Bad DTM50 entry_bytes in " + sub_dtm50.string());
+			pc.block_positions = reader.read<uint32_t>();
+			pc.block_cnt       = reader.read<uint64_t>();
+			pc.tail_positions  = reader.read<uint32_t>();
+			data_size[i]       = reader.read<uint64_t>();
+
+			const size_t num_ranks = reader.read<uint16_t>();
+			pc.rank_to_value.resize(num_ranks);
+			for (size_t r = 0; r < num_ranks; ++r)
+				pc.rank_to_value[r] = reader.read<uint16_t>();
+		}
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (dtm50->m_is_singular[i]) continue;
+		auto& pc = dtm50->m_per_color[i];
+		const uint8_t log2_bu      = reader.read<uint8_t>();
+		const uint8_t sample_width = reader.read<uint8_t>();
+		const uint8_t offset_width = reader.read<uint8_t>();
+		const uint8_t usz_width    = reader.read<uint8_t>();
+		const uint8_t* mono_ptr = reader.caret();
+		const size_t mono_bytes = Mono_Uint_Vec::on_disk_bytes(
+			pc.block_cnt + 1, log2_bu, sample_width, offset_width);
+		reader.advance(mono_bytes);
+		const uint8_t* usz_ptr = reader.caret();
+		const size_t usz_bytes = Min0_Uint_Vec::on_disk_bytes(pc.block_cnt, usz_width);
+		reader.advance(usz_bytes);
+		pc.offsets = Mono_Uint_Vec(mono_ptr, pc.block_cnt + 1,
+		                           log2_bu, sample_width, offset_width);
+		pc.usizes = Min0_Uint_Vec(usz_ptr, pc.block_cnt, usz_width);
+	}
+
+	for (const Color i : table_colors)
+	{
+		if (dtm50->m_is_singular[i]) continue;
+		reader.align(64);
+		dtm50->m_per_color[i].compressed_data = reader.caret();
+		reader.advance(data_size[i]);
+	}
+}
+
 // Eager-decode variant of load_dtm_table: every block decompresses up front,
 // resolves WDL class inline, and lands in a mmap'd per-color tmp file. Sub-TB
 // reads become a flat indexed memcpy; no LZMA on the read path.
