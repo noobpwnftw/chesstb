@@ -54,14 +54,6 @@ enum struct WDL_Stored : uint8_t
 	ILLEGAL       = 7,
 };
 
-// Decode a stored code to its semantic class (markers fold to WIN/LOSE).
-NODISCARD constexpr WDL_Entry wdl_from_storage(WDL_Stored s)
-{
-	if (s == WDL_Stored::BOUNDARY_WIN)  return WDL_Entry::WIN;
-	if (s == WDL_Stored::BOUNDARY_LOSS) return WDL_Entry::LOSE;
-	return static_cast<WDL_Entry>(s);  // five classes share WDL_Entry's values
-}
-
 enum Packed_WDL_Entries : uint8_t {};
 
 static constexpr size_t WDL_ENTRY_PACK_RATIO = 2;
@@ -319,6 +311,15 @@ NODISCARD constexpr WDL_Stored wdl_for_storage(DTC_Final_Entry e)
 		if (w == WDL_Entry::LOSE) return WDL_Stored::BOUNDARY_LOSS;
 	}
 	return static_cast<WDL_Stored>(w);  // five classes share WDL_Entry's values
+}
+
+// Inverse of wdl_for_storage: decode a stored code to its semantic class
+// (markers fold to WIN/LOSE).
+NODISCARD constexpr WDL_Entry wdl_from_storage(WDL_Stored s)
+{
+	if (s == WDL_Stored::BOUNDARY_WIN)  return WDL_Entry::WIN;
+	if (s == WDL_Stored::BOUNDARY_LOSS) return WDL_Entry::LOSE;
+	return static_cast<WDL_Entry>(s);  // five classes share WDL_Entry's values
 }
 
 // 1-byte tier halves cursed values (round up so decode stays > MAX_NON_CURSED_DTZ);
