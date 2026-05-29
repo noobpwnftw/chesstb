@@ -7,7 +7,7 @@
 #include <mutex>
 #include <vector>
 
-constexpr size_t BLOCK_CACHE_SLOTS = 32;
+constexpr size_t BLOCK_CACHE_SLOTS = 128;
 
 inline uint64_t next_epoch()
 {
@@ -88,7 +88,7 @@ inline size_t next_cache_slot(size_t& live, size_t& next_slot)
 
 struct TL_Block_FIFO
 {
-	static constexpr size_t N = 8;
+	static constexpr size_t N = 32;
 	uint64_t epoch[N] = {};
 	size_t block_id[N] = {};
 	Block_Ptr bytes[N];
@@ -98,7 +98,7 @@ struct TL_Block_FIFO
 template <typename T, typename K = uint32_t>
 struct TL_Cache
 {
-	static constexpr size_t N = 4;
+	static constexpr size_t N = 8;
 	uint64_t epoch[N] = {};
 	K key[N] = {};
 	T* val[N] = {};
