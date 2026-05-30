@@ -20,6 +20,7 @@
 #include "util/progress_bar.h"
 #include "util/thread_pool.h"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>

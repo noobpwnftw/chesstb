@@ -11,17 +11,16 @@
 #include "util/progress_bar.h"
 #include "util/thread_pool.h"
 
-#include <filesystem>
-
-#include <atomic>
-
 extern "C" {
 #include "tbprobe.h"
 }
 
+#include <atomic>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <set>
