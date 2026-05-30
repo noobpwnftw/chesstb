@@ -18,9 +18,9 @@ Bitboard Position::attackers_to(Square sq, Color c, Bitboard occ) const
 	res |= knight_attacks(sq)             & m_pieces[piece_make(c, KNIGHT)];
 	res |= king_attacks(sq)               & m_pieces[piece_make(c, KING)];
 	const Bitboard rq = m_pieces[piece_make(c, ROOK)]   | m_pieces[piece_make(c, QUEEN)];
+	if (rq) res |= rook_attacks(sq, occ)   & rq;
 	const Bitboard bq = m_pieces[piece_make(c, BISHOP)] | m_pieces[piece_make(c, QUEEN)];
-	res |= rook_attacks(sq, occ)   & rq;
-	res |= bishop_attacks(sq, occ) & bq;
+	if (bq) res |= bishop_attacks(sq, occ) & bq;
 	return res;
 }
 
@@ -326,16 +326,17 @@ bool Position::is_pseudo_legal_move_legal(Move m) const
 	}
 
 	const Bitboard not_captured = ~captured_mask;
-	Bitboard attackers = Bitboard::make_empty();
-	attackers |= pawn_attacks(m_turn, ksq)  & m_pieces[piece_make(opp, PAWN)]   & not_captured;
-	attackers |= knight_attacks(ksq)        & m_pieces[piece_make(opp, KNIGHT)] & not_captured;
-	attackers |= king_attacks(ksq)          & m_pieces[piece_make(opp, KING)]   & not_captured;
-	const Bitboard rq = (m_pieces[piece_make(opp, ROOK)]   | m_pieces[piece_make(opp, QUEEN)]) & not_captured;
-	const Bitboard bq = (m_pieces[piece_make(opp, BISHOP)] | m_pieces[piece_make(opp, QUEEN)]) & not_captured;
-	attackers |= rook_attacks(ksq, occ_after)   & rq;
-	attackers |= bishop_attacks(ksq, occ_after) & bq;
 
-	return attackers == Bitboard::make_empty();
+	if (pawn_attacks(m_turn, ksq) & m_pieces[piece_make(opp, PAWN)]   & not_captured) return false;
+	if (knight_attacks(ksq)       & m_pieces[piece_make(opp, KNIGHT)] & not_captured) return false;
+	if (king_attacks(ksq)         & m_pieces[piece_make(opp, KING)]   & not_captured) return false;
+
+	const Bitboard rq = (m_pieces[piece_make(opp, ROOK)]   | m_pieces[piece_make(opp, QUEEN)]) & not_captured;
+	if (rq && (rook_attacks(ksq, occ_after) & rq)) return false;
+	const Bitboard bq = (m_pieces[piece_make(opp, BISHOP)] | m_pieces[piece_make(opp, QUEEN)]) & not_captured;
+	if (bq && (bishop_attacks(ksq, occ_after) & bq)) return false;
+
+	return true;
 }
 
 bool Position::is_legal() const
