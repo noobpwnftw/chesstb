@@ -506,7 +506,8 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 	{
 		if (static_cast<int64_t>(bi) < resume_batch_idx) continue;
 		const auto& batch = batches[bi];
-		const auto fusions = compute_fusion_groups(m_table->m_dtm[WHITE][0], batch);
+		// 3 resident layers: hmc, opp[0], opp[k+1].
+		const auto fusions = compute_fusion_groups(m_table->m_dtm[WHITE][0], batch, 3, true);
 		total_fusions += fusions.size();
 		if (pawnful)
 		{
@@ -515,14 +516,14 @@ void DTM50_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Path
 				fusions.size(), fusions.size() == 1 ? "" : "s");
 			std::fflush(stdout);
 		}
-
 		for (size_t fi = 0; fi < fusions.size(); ++fi)
 		{
 			const bool is_resume_fusion =
 				static_cast<int64_t>(bi) == resume_batch_idx &&
 				static_cast<int64_t>(fi) == resume_fusion_idx;
 			if (static_cast<int64_t>(bi) == resume_batch_idx &&
-			    static_cast<int64_t>(fi) < resume_fusion_idx) continue;
+			    static_cast<int64_t>(fi) < resume_fusion_idx)
+				continue;
 
 			const auto& fusion = fusions[fi];
 

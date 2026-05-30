@@ -546,7 +546,8 @@ void EGTB_Generator::refresh_active_metadata(const Sliced_EGTB_File_For_Gen<Entr
 template <typename EntryT, typename... OtherEntryTs>
 std::vector<std::vector<int32_t>>
 EGTB_Generator::compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& tbl,
-                                      const std::vector<int32_t>& batch) const
+                                      const std::vector<int32_t>& batch,
+                                      size_t resident_layers, bool include_push) const
 {
 	if (batch.empty()) return {};
 	if (m_paging_budget_bytes == 0) return { batch };
@@ -555,17 +556,23 @@ EGTB_Generator::compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT, Oth
 	const size_t nks = m_epsi.num_king_slices();
 	const size_t spg = tbl.slices_per_group();
 	const size_t bytes_per_group =
-		spg * m_epsi.within_slice_size() * sizeof(EntryT);
+		spg * m_epsi.within_slice_size() * sizeof(EntryT) * resident_layers;
 	const size_t budget_groups =
 		std::max<size_t>(1, m_paging_budget_bytes / bytes_per_group);
 
 	auto pair_groups = [&](int32_t pair_sid) -> std::set<size_t> {
 		std::set<size_t> g;
-		for (int32_t pid : psm.pair_members(pair_sid))
-		{
+		auto add_pid_range = [&](int32_t pid) {
 			const size_t base = static_cast<size_t>(pid) * nks;
 			for (size_t k = 0; k < nks; ++k)
 				g.insert((base + k) / spg);
+		};
+		for (int32_t pid : psm.pair_members(pair_sid))
+		{
+			add_pid_range(pid);
+			if (include_push)
+				for (int32_t tpid : psm.push_target_slices(pid))
+					add_pid_range(tpid);
 		}
 		return g;
 	};
@@ -731,9 +738,9 @@ template void EGTB_Generator::refresh_active_metadata<DTC_Final_Entry, DTC_Inter
 template void EGTB_Generator::refresh_active_metadata<DTM_Final_Entry, DTM_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&);
 template void EGTB_Generator::refresh_active_metadata<DTM_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&);
 
-template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTC_Final_Entry, DTC_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>&, const std::vector<int32_t>&) const;
-template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTM_Final_Entry, DTM_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&, const std::vector<int32_t>&) const;
-template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTM_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&, const std::vector<int32_t>&) const;
+template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTC_Final_Entry, DTC_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>&, const std::vector<int32_t>&, size_t, bool) const;
+template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTM_Final_Entry, DTM_Intermediate_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>&, const std::vector<int32_t>&, size_t, bool) const;
+template std::vector<std::vector<int32_t>> EGTB_Generator::compute_fusion_groups<DTM_Final_Entry>(const Sliced_EGTB_File_For_Gen<DTM_Final_Entry>&, const std::vector<int32_t>&, size_t, bool) const;
 
 template void EGTB_Generator::apply_working_set<DTC_Final_Entry, DTC_Intermediate_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>*, Sliced_EGTB_File_For_Gen<DTC_Final_Entry, DTC_Intermediate_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);
 template void EGTB_Generator::apply_working_set<DTM_Final_Entry, DTM_Intermediate_Entry>(In_Out_Param<Thread_Pool>, Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>*, Sliced_EGTB_File_For_Gen<DTM_Final_Entry, DTM_Intermediate_Entry>*, const std::vector<uint8_t>&, const std::vector<uint8_t>&);

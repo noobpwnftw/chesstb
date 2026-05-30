@@ -973,10 +973,13 @@ protected:
 
 	// Pack a topo-batch of pair_sids into fusion groups whose unioned group-set
 	// fits m_paging_budget_bytes. Returns `{batch}` when budget is unbounded.
+	// resident_layers: concurrent layer-copies per group (3 for DTM50, else 1).
+	// include_push: count push-target pid ranges (mirrors include_push_in_iter).
 	template <typename EntryT, typename... OtherEntryTs>
 	NODISCARD std::vector<std::vector<int32_t>>
 	compute_fusion_groups(const Sliced_EGTB_File_For_Gen<EntryT, OtherEntryTs...>& tbl,
-	                      const std::vector<int32_t>& batch) const;
+	                      const std::vector<int32_t>& batch,
+	                      size_t resident_layers, bool include_push) const;
 
 	// Drive the resident-group set toward (needed_w | needed_b): load any
 	// needed nonresident group, then evict LRU non-needed groups until residency

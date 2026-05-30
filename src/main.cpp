@@ -309,7 +309,10 @@ int main(int argc, char** argv)
 					fmt_bytes(w.peak_batch_init_groups * w.bytes_per_group).c_str());
 				if (opt.build_dtm50)
 				{
-					std::printf("  dtm50                 : 3 * peaks above\n");
+					const size_t floor_groups =
+						std::max<size_t>(DTM50_HMC_COUNT, 3 * w.peak_per_group_iter_groups);
+					std::printf("  dtm50 floor           : %zu groups = %s\n",
+						floor_groups, fmt_bytes(floor_groups * w.bytes_per_group).c_str());
 				}
 				std::cout << "\n";
 			}

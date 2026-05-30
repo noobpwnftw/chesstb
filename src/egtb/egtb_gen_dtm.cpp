@@ -890,7 +890,7 @@ void DTM_Generator::gen(In_Out_Param<Thread_Pool> thread_pool, const EGTB_Paths&
 	{
 		if (static_cast<int64_t>(bi) < resume_batch_idx) continue;
 		const auto& batch = batches[bi];
-		const auto fusions = compute_fusion_groups(m_table->m_dtm[WHITE], batch);
+		const auto fusions = compute_fusion_groups(m_table->m_dtm[WHITE], batch, 1, true);
 		total_fusions += fusions.size();
 		if (pawnful)
 		{
