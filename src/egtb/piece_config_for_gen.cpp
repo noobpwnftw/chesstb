@@ -5,6 +5,7 @@
 #include "chess/chess.h"
 #include "chess/piece_config.h"
 
+#include "util/algo.h"
 #include "util/defines.h"
 
 #include <cstring>
@@ -143,28 +144,27 @@ void Piece_Config_For_Gen::prepare_orbit_weight_table()
 		}
 	}
 
+	std::vector<size_t> radices;
+	radices.reserve(m_num_populated_classes);
+	for (size_t i = 0; i < m_num_populated_classes; ++i)
+		radices.emplace_back(m_num_positions_by_group[m_populated_classes[i]]);
+
 	m_orbit_weight_within.assign(m_within_slice_size, 0);
-	Decomposed_Board_Index d{};
-	for (size_t w = 0; w < m_within_slice_size; ++w)
+	// Iteration order matters: the least significant class advances first,
+	// matching the board-index weighting held in m_weights.
+	size_t w = 0;
+	for (const auto& ixs : Mixed_Radix(Const_Span(radices)))
 	{
 		size_t w_alt = 0;
 		for (size_t i = 0; i < m_num_populated_classes; ++i)
 		{
 			const Piece_Class c = m_populated_classes[i];
-			w_alt += m_weights[c] * static_cast<size_t>(diag_image[c][d.within[c]]);
+			w_alt += m_weights[c] * static_cast<size_t>(diag_image[c][ixs[i]]);
 		}
 		m_orbit_weight_within[w] =
 			(w_alt > w) ? uint8_t{8} :
 			(w_alt == w) ? uint8_t{4} : uint8_t{0};
-
-		// Advance d.within in board-index order without touching king_slice.
-		for (size_t i = 0; i < m_num_populated_classes; ++i)
-		{
-			const Piece_Class ix = m_populated_classes[i];
-			d.within[ix] = static_cast<Piece_Group::Placement_Index>(d.within[ix] + 1);
-			if (d.within[ix] < m_num_positions_by_group[ix]) break;
-			d.within[ix] = Piece_Group::Placement_Index(0);
-		}
+		++w;
 	}
 }
 

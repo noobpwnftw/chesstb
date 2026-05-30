@@ -1,6 +1,7 @@
 #include "egtb/piece_group.h"
 
 #include "chess/chess.h"
+#include "util/algo.h"
 #include "util/defines.h"
 
 #include <algorithm>
@@ -91,6 +92,8 @@ Piece_Group::Piece_Group(Piece pc, size_t count, Const_Span<Square> legal_square
 
 			for (size_t i = 0; i < count; ++i)
 				perm[i] = i;
+			Multi_Permuter<std::array<size_t, MAX_PIECE_GROUP_SIZE>> permuter(
+				perm, { { static_cast<size_t>(0), count } });
 			do
 			{
 				int64_t nu = 0;
@@ -98,7 +101,7 @@ Piece_Group::Piece_Group(Piece pc, size_t count, Const_Span<Square> legal_square
 					nu += weights[i] * m_sq_to_pos[pl[perm[i]]];
 				ASSERT(nu >= 0 && static_cast<size_t>(nu) < non_unique_size);
 				m_non_unique_to_unique[static_cast<size_t>(nu)] = r;
-			} while (std::next_permutation(perm.begin(), perm.begin() + count));
+			} while (permuter.try_advance());
 		}
 	}
 

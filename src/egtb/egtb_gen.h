@@ -12,7 +12,6 @@
 #include "chess/move.h"
 #include "chess/piece_config.h"
 
-#include "util/algo.h"
 #include "util/allocation.h"
 #include "util/compress.h"
 #include "util/defines.h"
@@ -892,7 +891,7 @@ protected:
 	                                     Out_Param<const Piece_Config_For_Gen*> sub_epsi) const;
 
 	// Sized so per-worker windows keep adjacent Board_Index ranges local.
-	static constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
+	static constexpr size_t CHUNK_SIZE = CACHE_LINE_SIZE * CHAR_BIT * 64;
 
 	NODISCARD Shared_Board_Index_Iterator make_slice_group_iterator(
 		size_t group_id, size_t slices_per_group) const;

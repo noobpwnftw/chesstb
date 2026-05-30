@@ -119,7 +119,7 @@ static bool compare_material(const Options& opt, const char* name)
 	Probe_Tables tables;
 	tables.add_wdl_path(opt.wdl_dir);
 
-	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
+	constexpr size_t CHUNK_SIZE = CACHE_LINE_SIZE * CHAR_BIT * 64;
 	std::atomic<size_t> next_idx{0};
 	Concurrent_Progress_Bar progress_bar(
 		N, std::max<size_t>(1, g_num_threads * CHUNK_SIZE), std::string(name));

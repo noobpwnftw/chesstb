@@ -168,7 +168,7 @@ bool check_material(const Options& opt, const std::string& name)
 	tables.add_dtm_path(opt.dtm_dir);
 	tables.add_dtm50_path(opt.dtm50_dir);
 
-	constexpr size_t CHUNK_SIZE = 64 * 64 * 8;
+	constexpr size_t CHUNK_SIZE = CACHE_LINE_SIZE * CHAR_BIT * 64;
 	std::atomic<size_t> next_idx{0};
 	Concurrent_Progress_Bar progress_bar(
 		N, std::max<size_t>(1, g_num_threads * CHUNK_SIZE), ps.name());
