@@ -1355,10 +1355,7 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 	DTM50_Save_Cache cache(std::move(all_tables), cap_groups);
 
 	DTM50_Compressed_Color color_out[COLOR_NB]{};
-	uint32_t index_perm[COLOR_NB] = {
-		default_index_permutation_config(m_epsi),
-		default_index_permutation_config(m_epsi)
-	};
+	uint32_t index_perm[COLOR_NB] = { 0, 0 };
 
 	for (Color me : colors)
 	{

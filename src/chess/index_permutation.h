@@ -9,60 +9,11 @@
 #include <cstddef>
 #include <cstdint>
 
-// The index permutation config is just the compact permutation index over the
-// material's populated non-pawn classes (see populated_class_order_index). It
-// is serialized as a bare uint32; validity is checked by the FACTORIAL range
-// bound in index_permutation_config_is_valid, so no separate magic is stored.
+// Permutation index over the populated non-pawn classes, stored as a bare uint32
+// (perm 0 == native order). Validity is just the FACTORIAL range bound.
 constexpr std::array<uint32_t, 9> FACTORIAL = {
 	1u, 1u, 2u, 6u, 24u, 120u, 720u, 5040u, 40320u
 };
-
-// Preferred final-file class order. The actual file stores this as a compact
-// permutation index over the material's populated non-pawn classes.
-constexpr std::array<Piece_Class, 8> PREFERRED_STORAGE_WITHIN_CLASS_ORDER = {
-	BLACK_KNIGHTS, BLACK_BISHOPS, BLACK_ROOKS, BLACK_QUEENS,
-	WHITE_KNIGHTS, WHITE_BISHOPS, WHITE_ROOKS, WHITE_QUEENS,
-};
-
-template <typename Config>
-NODISCARD inline uint32_t populated_class_order_index(
-	const Config& cfg,
-	const std::array<Piece_Class, PIECE_CLASS_NB>& storage_order)
-{
-	const size_t n = cfg.num_populated_classes();
-	ASSERT(n <= 8);
-
-	std::array<Piece_Class, PIECE_CLASS_NB> logical{};
-	for (size_t i = 0; i < n; ++i)
-		logical[i] = cfg.populated_classes()[i];
-
-	uint32_t idx = 0;
-	for (size_t i = 0; i < n; ++i)
-	{
-		size_t pos = i;
-		while (pos < n && logical[pos] != storage_order[i])
-			++pos;
-		ASSERT(pos < n);
-		idx += static_cast<uint32_t>(pos - i) * FACTORIAL[n - 1 - i];
-		for (size_t j = pos; j > i; --j)
-			logical[j] = logical[j - 1];
-		logical[i] = storage_order[i];
-	}
-	return idx;
-}
-
-template <typename Config>
-NODISCARD inline uint32_t default_index_permutation_config(const Config& cfg)
-{
-	std::array<Piece_Class, PIECE_CLASS_NB> order{};
-	size_t n = 0;
-	for (const Piece_Class c : PREFERRED_STORAGE_WITHIN_CLASS_ORDER)
-		if (cfg.is_populated(c))
-			order[n++] = c;
-	ASSERT(n == cfg.num_populated_classes());
-
-	return populated_class_order_index(cfg, order);
-}
 
 template <typename Config>
 NODISCARD inline bool index_permutation_config_is_valid(
@@ -131,6 +82,13 @@ NODISCARD inline Index_Permutation_Plan make_index_permutation_plan(
 
 	Index_Permutation_Plan p;
 	p.n = cfg.num_populated_classes();
+
+	// perm 0 is native order: storage index == logical index, so no within-slice
+	// decomposition is needed. Leave the plan at its defaults (within == 1) so the
+	// conversions short-circuit; the order/radix/weight tables stay unused.
+	if (perm == 0)
+		return p;
+
 	p.within = cfg.within_slice_size();
 	if (p.within > 1)
 		p.within_div = Divider<uint64_t>(p.within);

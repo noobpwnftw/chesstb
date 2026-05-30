@@ -1266,14 +1266,8 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 	Compressed_EGTB wdl_save[COLOR_NB];
 	Compressed_EGTB dtc_save[COLOR_NB];
 	Value_Histogram dtc_hist[COLOR_NB];
-	uint32_t wdl_index_perm[COLOR_NB] = {
-		default_index_permutation_config(m_epsi),
-		default_index_permutation_config(m_epsi)
-	};
-	uint32_t dtc_index_perm[COLOR_NB] = {
-		default_index_permutation_config(m_epsi),
-		default_index_permutation_config(m_epsi)
-	};
+	uint32_t wdl_index_perm[COLOR_NB] = { 0, 0 };
+	uint32_t dtc_index_perm[COLOR_NB] = { 0, 0 };
 
 	DTC_Save_Cache cache(&m_table->m_dtc[WHITE], &m_table->m_dtc[BLACK], cap_groups);
 

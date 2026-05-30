@@ -168,19 +168,17 @@ uint32_t choose_storage_permutation_config(
 {
 	const size_t n = epsi.num_populated_classes();
 	if (n <= 1)
-		return default_index_permutation_config(epsi);
+		return 0;
 
 	const uint32_t candidates = FACTORIAL[n];
 	const size_t source_block_size = compressor->source_bytes_per_block(block_size);
 	const size_t bound_size = compressor->compress_bound(source_block_size);
 
-	uint32_t best = default_index_permutation_config(epsi);
-	uint32_t best_ix = candidates;
+	uint32_t best = 0;
 	uint64_t best_score = std::numeric_limits<uint64_t>::max();
 
-	for (uint32_t ix = 0; ix < candidates; ++ix)
+	for (uint32_t perm = 0; perm < candidates; ++perm)
 	{
-		const uint32_t perm = ix;
 		const Block_Source src = make_source(perm);
 		const size_t num_blocks = ceil_div(src.total_size, block_size);
 		if (num_blocks == 0)
@@ -213,10 +211,9 @@ uint32_t choose_storage_permutation_config(
 		for (const uint64_t s : partial)
 			score += s;
 
-		if (score < best_score || (score == best_score && ix < best_ix))
+		if (score < best_score)
 		{
 			best_score = score;
-			best_ix = ix;
 			best = perm;
 		}
 	}

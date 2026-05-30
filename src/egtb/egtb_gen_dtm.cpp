@@ -1119,10 +1119,7 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 	static constexpr size_t DTM_BLOCK_SIZE = 1024 * 1024;
 	Compressed_EGTB dtm_save[COLOR_NB];
 	Value_Histogram dtm_hist[COLOR_NB];
-	uint32_t dtm_index_perm[COLOR_NB] = {
-		default_index_permutation_config(m_epsi),
-		default_index_permutation_config(m_epsi)
-	};
+	uint32_t dtm_index_perm[COLOR_NB] = { 0, 0 };
 
 	DTM_Save_Cache cache(&m_table->m_dtm[WHITE], &m_table->m_dtm[BLACK], cap_groups);
 
