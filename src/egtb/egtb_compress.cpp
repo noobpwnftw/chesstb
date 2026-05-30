@@ -157,6 +157,10 @@ std::optional<LZ4_Dict> make_dict_for_wdl(
 	);
 }
 
+namespace {
+constexpr size_t CHOOSE_PERM_MAX_SAMPLES = 256;
+}  // namespace
+
 uint32_t choose_storage_permutation_config(
 	In_Out_Param<Thread_Pool> thread_pool,
 	const Piece_Config_For_Gen& epsi,
@@ -185,8 +189,7 @@ uint32_t choose_storage_permutation_config(
 		if (num_blocks == 0)
 			continue;
 
-		const size_t stride = 32;
-		const size_t sample_cnt = ceil_div(num_blocks, stride);
+		const size_t sample_cnt = std::min(num_blocks, CHOOSE_PERM_MAX_SAMPLES);
 		std::atomic<size_t> next_sample{0};
 		const size_t workers = std::min<size_t>(thread_pool->num_workers(), sample_cnt);
 
@@ -200,7 +203,8 @@ uint32_t choose_storage_permutation_config(
 			{
 				const size_t sample_id = next_sample.fetch_add(1, std::memory_order_relaxed);
 				if (sample_id >= sample_cnt) return score;
-				const size_t block_id = sample_id * stride;
+				const size_t block_id = static_cast<size_t>(
+					static_cast<uint64_t>(sample_id) * num_blocks / sample_cnt);
 				const Const_Span<uint8_t> block = src.get(
 					block_id, Span<uint8_t>(scratch.get(), source_block_size));
 				if (block.size() == 0) continue;
