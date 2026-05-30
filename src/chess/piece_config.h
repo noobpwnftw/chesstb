@@ -40,7 +40,7 @@ constexpr Piece_Class& operator++(Piece_Class& p_class)
 NODISCARD constexpr Piece_Class make_piece_class(Color color, Piece_Type_Class pt_class)
 {
 	ASSERT(pt_class < PIECE_TYPE_CLASS_NB);
-	return static_cast<Piece_Class>(pt_class + WHITE_KINGS * color);
+	return static_cast<Piece_Class>(pt_class + WHITE_KINGS * (color == WHITE));
 }
 
 NODISCARD constexpr Piece_Class opp_piece_class(Piece_Class set)
