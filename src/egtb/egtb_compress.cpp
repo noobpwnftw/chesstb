@@ -198,17 +198,17 @@ uint32_t choose_storage_permutation_config(
 			auto out = cpp20::make_unique_for_overwrite<uint8_t[]>(bound_size);
 			auto helper = compressor->clone();
 
-			uint64_t score = 0;
+			uint64_t local_score = 0;
 			for (;;)
 			{
 				const size_t sample_id = next_sample.fetch_add(1, std::memory_order_relaxed);
-				if (sample_id >= sample_cnt) return score;
+				if (sample_id >= sample_cnt) return local_score;
 				const size_t block_id = static_cast<size_t>(
 					static_cast<uint64_t>(sample_id) * num_blocks / sample_cnt);
 				const Const_Span<uint8_t> block = src.get(
 					block_id, Span<uint8_t>(scratch.get(), source_block_size));
 				if (block.size() == 0) continue;
-				score += helper->compress(Span<uint8_t>(out.get(), bound_size), block);
+				local_score += helper->compress(Span<uint8_t>(out.get(), bound_size), block);
 			}
 		});
 
@@ -223,9 +223,6 @@ uint32_t choose_storage_permutation_config(
 			best = perm;
 		}
 	}
-
-	if (best_ix == candidates)
-		best_score = 0;
 
 	if (task_name != nullptr)
 	{
