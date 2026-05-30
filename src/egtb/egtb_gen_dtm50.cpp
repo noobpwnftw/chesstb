@@ -666,8 +666,8 @@ constexpr uint32_t RS_BLOCK_POSITIONS = 1u << 19;
 
 struct DTM50_Rank_Table
 {
-	static constexpr size_t LUT_SIZE = 2048;
-	static constexpr uint16_t NO_RANK = 0xFFFFu;
+	static constexpr size_t LUT_SIZE = Value_Histogram::HIST_BINS;
+	static constexpr uint16_t NO_RANK = Value_Rank_Table::NO_RANK;
 	uint8_t entry_bytes = 1;
 	std::vector<uint16_t> rank_to_value;
 	std::array<uint16_t, LUT_SIZE> value_to_rank{};

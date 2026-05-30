@@ -1303,9 +1303,8 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 			const size_t total_packed_bytes = ceil_div(num_positions, WDL_ENTRY_PACK_RATIO);
 			const size_t num_blocks = ceil_div(total_packed_bytes, WDL_BLOCK_SIZE);
 
-			EGTB_Info trial_info{};
-			Value_Histogram trial_hist{};
-			Gather_Sink trial_sink{me, &trial_info, &trial_hist, {}, std::vector<uint8_t>(num_blocks, 0)};
+			// gather=false: only sink.color is read, so info/hist/merged stay empty.
+			Gather_Sink trial_sink{me, nullptr, nullptr, {}, {}};
 			wdl_index_perm[me] = choose_storage_permutation_config(
 				thread_pool,
 				m_epsi,
