@@ -26,8 +26,8 @@ enum Piece_Type_Class : int8_t {
 };
 
 enum Piece_Class : int8_t {
-	WHITE_KINGS, WHITE_KNIGHTS, WHITE_BISHOPS, WHITE_ROOKS, WHITE_QUEENS, WHITE_PAWNS,
 	BLACK_KINGS, BLACK_KNIGHTS, BLACK_BISHOPS, BLACK_ROOKS, BLACK_QUEENS, BLACK_PAWNS,
+	WHITE_KINGS, WHITE_KNIGHTS, WHITE_BISHOPS, WHITE_ROOKS, WHITE_QUEENS, WHITE_PAWNS,
 	PIECE_CLASS_START = 0, PIECE_CLASS_END = 12, PIECE_CLASS_NONE = -1, PIECE_CLASS_NB = 12
 };
 
@@ -40,12 +40,12 @@ constexpr Piece_Class& operator++(Piece_Class& p_class)
 NODISCARD constexpr Piece_Class make_piece_class(Color color, Piece_Type_Class pt_class)
 {
 	ASSERT(pt_class < PIECE_TYPE_CLASS_NB);
-	return static_cast<Piece_Class>(pt_class + BLACK_KINGS * color);
+	return static_cast<Piece_Class>(pt_class + WHITE_KINGS * color);
 }
 
 NODISCARD constexpr Piece_Class opp_piece_class(Piece_Class set)
 {
-	return static_cast<Piece_Class>(set < BLACK_KINGS ? set + BLACK_KINGS : set - BLACK_KINGS);
+	return static_cast<Piece_Class>(set < WHITE_KINGS ? set + WHITE_KINGS : set - WHITE_KINGS);
 }
 
 NODISCARD constexpr Piece_Class maybe_opp_piece_class(Piece_Class set, bool mirror)
@@ -55,29 +55,29 @@ NODISCARD constexpr Piece_Class maybe_opp_piece_class(Piece_Class set, bool mirr
 
 NODISCARD constexpr Color piece_class_color(Piece_Class set)
 {
-	return set >= BLACK_KINGS ? BLACK : WHITE;
+	return set >= WHITE_KINGS ? WHITE : BLACK;
 }
 
 NODISCARD constexpr Piece_Type_Class piece_class_type(Piece_Class set)
 {
-	return static_cast<Piece_Type_Class>(piece_class_color(set) == BLACK ? set - BLACK_KINGS : set);
+	return static_cast<Piece_Type_Class>(piece_class_color(set) == WHITE ? set - WHITE_KINGS : set);
 }
 
 constexpr std::array<Piece_Class, PIECE_NB> PIECE_TO_PIECE_CLASS = []() {
 	std::array<Piece_Class, PIECE_NB> arr{};
 	for (auto& v : arr) v = PIECE_CLASS_NONE;
-	arr[WHITE_KING]   = WHITE_KINGS;
-	arr[WHITE_QUEEN]  = WHITE_QUEENS;
-	arr[WHITE_ROOK]   = WHITE_ROOKS;
-	arr[WHITE_BISHOP] = WHITE_BISHOPS;
-	arr[WHITE_KNIGHT] = WHITE_KNIGHTS;
-	arr[WHITE_PAWN]   = WHITE_PAWNS;
 	arr[BLACK_KING]   = BLACK_KINGS;
 	arr[BLACK_QUEEN]  = BLACK_QUEENS;
 	arr[BLACK_ROOK]   = BLACK_ROOKS;
 	arr[BLACK_BISHOP] = BLACK_BISHOPS;
 	arr[BLACK_KNIGHT] = BLACK_KNIGHTS;
 	arr[BLACK_PAWN]   = BLACK_PAWNS;
+	arr[WHITE_KING]   = WHITE_KINGS;
+	arr[WHITE_QUEEN]  = WHITE_QUEENS;
+	arr[WHITE_ROOK]   = WHITE_ROOKS;
+	arr[WHITE_BISHOP] = WHITE_BISHOPS;
+	arr[WHITE_KNIGHT] = WHITE_KNIGHTS;
+	arr[WHITE_PAWN]   = WHITE_PAWNS;
 	return arr;
 }();
 
