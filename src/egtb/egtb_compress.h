@@ -282,12 +282,3 @@ void save_egtb_table(
 	const Fixed_Vector<Color, 2> table_colors,
 	EGTB_Magic magic
 );
-
-// Parse .lzw header → block index + per-color metadata. Blocks stay
-// compressed; decoded on demand via the per-thread cache in read().
-void load_wdl_table(
-	Out_Param<WDL_File_For_Probe> wdl,
-	const Piece_Config& ps,
-	std::filesystem::path sub_wdl,
-	EGTB_Magic wdl_magic
-);
