@@ -1,12 +1,12 @@
+#include "chess/chess.h"
+#include "chess/position.h"
+
 #include "egtb/egtb_gen.h"
 #include "egtb/egtb_entry.h"
 #include "egtb/symmetry.h"
 #include "egtb/slice_manager.h"
 #include "egtb/pawn_slice_manager.h"
-
-#include "chess/chess.h"
-#include "chess/index_permutation_plan.h"
-#include "chess/position.h"
+#include "egtb/index_permutation_plan.h"
 
 #include "util/defines.h"
 #include "util/math.h"

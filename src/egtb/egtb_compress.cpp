@@ -1,9 +1,9 @@
+#include "chess/piece_config.h"
+
 #include "egtb/egtb_compress.h"
 #include "egtb/egtb_entry.h"
 #include "egtb/egtb_probe.h"
-
-#include "chess/index_permutation_plan.h"
-#include "chess/piece_config.h"
+#include "egtb/index_permutation_plan.h"
 
 #include "util/allocation.h"
 #include "util/progress_bar.h"
