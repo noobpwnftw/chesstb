@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chess/chess.h"
+#include "chess/index_permutation.h"
 #include "chess/piece_config.h"
 #include "chess/position.h"
 
@@ -192,6 +193,31 @@ private:
 	const Piece_Group* m_black_group = nullptr;
 };
 
+struct Index_Storage_Layout
+{
+	size_t n = 0;
+	std::array<Piece_Class, PIECE_CLASS_NB> order{};
+	std::array<size_t, PIECE_CLASS_NB> radix{};
+};
+
+template <typename Config>
+NODISCARD inline Index_Storage_Layout make_index_storage_layout(
+	const Config& cfg,
+	uint32_t perm)
+{
+	ASSERT(index_permutation_config_is_valid(cfg, perm));
+
+	Index_Storage_Layout layout;
+	layout.n = cfg.num_populated_classes();
+	const auto order = storage_within_class_order(cfg, perm);
+	for (size_t i = 0; i < layout.n; ++i)
+	{
+		layout.order[i] = order[i];
+		layout.radix[i] = cfg.group(order[i]).table_size();
+	}
+	return layout;
+}
+
 struct Position_Index_Config : public Piece_Config
 {
 private:
@@ -230,13 +256,16 @@ public:
 	NODISCARD size_t num_populated_classes() const { return m_num_populated_classes; }
 	NODISCARD size_t weight(Piece_Class c) const { return m_weights[c]; }
 
-	NODISCARD Board_Index compose_board_index(const Decomposed_Board_Index& idx) const
+	NODISCARD Board_Index compose_board_index(
+		const Decomposed_Board_Index& idx,
+		const Index_Storage_Layout& layout) const
 	{
 		size_t within = 0;
-		for (size_t i = 0; i < m_num_populated_classes; ++i)
+		size_t w = 1;
+		for (size_t i = 0; i < layout.n; ++i)
 		{
-			const Piece_Class ix = m_populated_classes[i];
-			within += m_weights[ix] * static_cast<size_t>(idx.within[ix]);
+			within += w * static_cast<size_t>(idx.within[layout.order[i]]);
+			w *= layout.radix[i];
 		}
 		const size_t outer = static_cast<size_t>(idx.pawn_slice_id) * m_pawn_slice_stride
 		                   + static_cast<size_t>(idx.king_slice_id) * m_within_slice_size;
@@ -266,7 +295,9 @@ private:
 };
 
 NODISCARD Board_Index board_index_of_position(
-	const Position_Index_Config& cfg, const Position& pos);
+	const Position_Index_Config& cfg,
+	const Index_Storage_Layout& layout,
+	const Position& pos);
 
 NODISCARD bool position_from_index(
 	const Position_Index_Config& cfg, Board_Index idx, Color turn,

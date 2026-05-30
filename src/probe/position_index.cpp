@@ -190,37 +190,6 @@ placements_from_position(const Position_Index_Config& cfg, const Position& pos)
 	return out;
 }
 
-Board_Index canonical_board_index(
-	const Position_Index_Config& cfg,
-	std::array<Piece_Group::Placement, PIECE_CLASS_NB>& placements)
-{
-	canonicalize_placements(inout_param(placements), cfg);
-	const Square wk = placements[WHITE_KINGS][0];
-	const Square bk = placements[BLACK_KINGS][0];
-	const int32_t king_slice_id = cfg.slice_manager().lookup(wk, bk).slice_id;
-	if (king_slice_id == SLICE_NONE)
-		return BOARD_INDEX_NONE;
-
-	Decomposed_Board_Index dix{};
-	dix.king_slice_id = king_slice_id;
-
-	if (cfg.pawn_slice_manager().has_pawns())
-	{
-		const auto& w_pl = placements[WHITE_PAWNS];
-		const auto& b_pl = placements[BLACK_PAWNS];
-		dix.pawn_slice_id = cfg.pawn_slice_manager().lookup_from_squares(
-			Const_Span<Square>(w_pl.begin(), w_pl.size()),
-			Const_Span<Square>(b_pl.begin(), b_pl.size()));
-	}
-
-	for (size_t i = 0; i < cfg.num_populated_classes(); ++i)
-	{
-		const Piece_Class c = cfg.populated_classes()[i];
-		dix.within[c] = cfg.group(c).compound_index(placements[c]);
-	}
-	return cfg.compose_board_index(dix);
-}
-
 }  // namespace
 
 Piece_Group::Piece_Group(Piece pc, size_t count) :
@@ -652,10 +621,36 @@ bool Position_Index_Config::fill_board(
 
 Board_Index board_index_of_position(
 	const Position_Index_Config& cfg,
+	const Index_Storage_Layout& layout,
 	const Position& pos)
 {
-	auto p = placements_from_position(cfg, pos);
-	return canonical_board_index(cfg, p);
+	auto placements = placements_from_position(cfg, pos);
+	canonicalize_placements(inout_param(placements), cfg);
+
+	const Square wk = placements[WHITE_KINGS][0];
+	const Square bk = placements[BLACK_KINGS][0];
+	const int32_t king_slice_id = cfg.slice_manager().lookup(wk, bk).slice_id;
+	if (king_slice_id == SLICE_NONE)
+		return BOARD_INDEX_NONE;
+
+	Decomposed_Board_Index dix{};
+	dix.king_slice_id = king_slice_id;
+
+	if (cfg.pawn_slice_manager().has_pawns())
+	{
+		const auto& w_pl = placements[WHITE_PAWNS];
+		const auto& b_pl = placements[BLACK_PAWNS];
+		dix.pawn_slice_id = cfg.pawn_slice_manager().lookup_from_squares(
+			Const_Span<Square>(w_pl.begin(), w_pl.size()),
+			Const_Span<Square>(b_pl.begin(), b_pl.size()));
+	}
+
+	for (size_t i = 0; i < cfg.num_populated_classes(); ++i)
+	{
+		const Piece_Class c = cfg.populated_classes()[i];
+		dix.within[c] = cfg.group(c).compound_index(placements[c]);
+	}
+	return cfg.compose_board_index(dix, layout);
 }
 
 bool position_from_index(

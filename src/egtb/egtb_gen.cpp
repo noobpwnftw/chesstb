@@ -5,7 +5,7 @@
 #include "egtb/pawn_slice_manager.h"
 
 #include "chess/chess.h"
-#include "chess/index_permutation.h"
+#include "chess/index_permutation_plan.h"
 #include "chess/position.h"
 
 #include "util/defines.h"

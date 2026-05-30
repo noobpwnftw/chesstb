@@ -109,6 +109,8 @@ static bool compare_material(const Options& opt, const char* name)
 	}
 
 	Position_Index_Config epsi(ps);
+	// Native (identity-permutation) index — the inverse of position_from_index.
+	const Index_Storage_Layout native = make_index_storage_layout(epsi, 0);
 	// Symmetric materials store one color; BLACK would derive the same answers.
 	const auto [mat_key, mir_key] = ps.material_keys();
 	const bool symmetric = (mat_key == mir_key);
@@ -143,7 +145,7 @@ static bool compare_material(const Options& opt, const char* name)
 							continue;
 
 						// Keep one index per canonical position.
-						if (board_index_of_position(epsi, pos) != idx) continue;
+						if (board_index_of_position(epsi, native, pos) != idx) continue;
 
 						const WDL_Entry got = tables.probe_wdl(ps, pos, SQ_END, 0);
 						if (got == WDL_Entry::ILLEGAL) continue;

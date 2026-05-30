@@ -5,7 +5,6 @@
 #include "probe/position_index.h"
 
 #include "chess/chess.h"
-#include "chess/index_permutation.h"
 #include "chess/piece_config.h"
 
 #include "util/compress.h"
@@ -32,7 +31,7 @@ constexpr uint64_t TABLE_CHECKSUM_INIT = 0xf0f0f0f0f0f0;
 
 struct WDL_Per_Color : Block_Cache<LZ4_Decompress_Helper>
 {
-	Index_Permutation_Plan plan;
+	Index_Storage_Layout layout;
 	size_t block_size = 0;
 	size_t tail_size = 0;
 	size_t block_cnt = 0;
@@ -49,7 +48,7 @@ struct WDL_Per_Color : Block_Cache<LZ4_Decompress_Helper>
 
 struct Lzma_Rank_Per_Color : Block_Cache<LZMA_Decompress_Helper>
 {
-	Index_Permutation_Plan plan;
+	Index_Storage_Layout layout;
 	size_t entry_bytes = 0;
 	size_t block_size = 0;
 	size_t tail_size = 0;
@@ -63,7 +62,7 @@ struct Lzma_Rank_Per_Color : Block_Cache<LZMA_Decompress_Helper>
 
 struct DTM50_Per_Color : Block_Cache<LZMA_Decompress_Helper>
 {
-	Index_Permutation_Plan plan;
+	Index_Storage_Layout layout;
 	size_t entry_bytes = 0;
 	size_t block_positions = 0;
 	size_t tail_positions = 0;
@@ -92,11 +91,13 @@ struct Table_File
 	// Arity varies by type (WDL has no wdl/hmc args); the trait read() takes
 	// whatever the caller passes after the position.
 	template <typename... Args>
-	auto read(Color c, Board_Index pos, Args... args)
+	auto read(Color c, const Position& pos, Args... args)
 	{
 		ASSERT(!is_dropped[c]);
-		const size_t storage_pos = logical_index_to_storage_index(per_color[c].plan, static_cast<size_t>(pos));
-		return Traits::read(per_color[c], is_singular[c], static_cast<Board_Index>(storage_pos), args...);
+		const Board_Index storage_pos =
+			board_index_of_position(*index_cfg, per_color[c].layout, pos);
+		ASSERT(storage_pos != BOARD_INDEX_NONE);
+		return Traits::read(per_color[c], is_singular[c], storage_pos, args...);
 	}
 };
 

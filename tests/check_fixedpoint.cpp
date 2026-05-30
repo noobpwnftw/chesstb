@@ -554,6 +554,8 @@ bool check_material(const Options& opt, const std::string& name)
 		: std::array<size_t, COLOR_NB>{};
 
 	Position_Index_Config epsi(ps);
+	// Native (identity-permutation) index — the inverse of position_from_index.
+	const Index_Storage_Layout native = make_index_storage_layout(epsi, 0);
 	const auto [mat_key, mir_key] = ps.material_keys();
 	const bool symmetric = mat_key == mir_key;
 	const size_t N = epsi.num_positions();
@@ -586,7 +588,7 @@ bool check_material(const Options& opt, const std::string& name)
 						continue;
 					if (!pos.is_legal())
 						continue;
-					if (board_index_of_position(epsi, pos) != idx) continue;
+					if (board_index_of_position(epsi, native, pos) != idx) continue;
 
 					const Probe_Result pr = tables.probe(ps, pos, SKIP_DTM50);
 					if (pr.status != Probe_Result::Status::OK) continue;

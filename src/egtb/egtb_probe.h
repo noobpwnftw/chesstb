@@ -4,7 +4,7 @@
 #include "egtb/piece_config_for_gen.h"
 
 #include "chess/chess.h"
-#include "chess/index_permutation.h"
+#include "chess/index_permutation_plan.h"
 #include "chess/piece_config.h"
 
 #include "util/compress.h"

@@ -2,7 +2,7 @@
 #include "egtb/egtb_entry.h"
 #include "egtb/egtb_probe.h"
 
-#include "chess/index_permutation.h"
+#include "chess/index_permutation_plan.h"
 #include "chess/piece_config.h"
 
 #include "util/allocation.h"

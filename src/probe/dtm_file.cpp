@@ -70,7 +70,7 @@ void DTM_Traits::parse_header(Serial_Memory_Reader& reader, Per_Color& pc,
 	const uint32_t perm = reader.read<uint32_t>();
 	if (!index_permutation_config_is_valid(index_cfg, perm))
 		throw std::runtime_error("Invalid DTM index permutation config " + path.string());
-	pc.plan = make_index_permutation_plan(index_cfg, perm);
+	pc.layout = make_index_storage_layout(index_cfg, perm);
 
 	pc.entry_bytes = reader.read<uint8_t>();
 	if (pc.entry_bytes != 1 && pc.entry_bytes != sizeof(uint16_t))

@@ -409,10 +409,7 @@ WDL_Stored Probe_Tables::Impl::read_wdl_stored(const Piece_Config& ps, const Pos
 	WDL_File* w = open_wdl(ps);
 	if (!w) return WDL_Stored::ILLEGAL;
 
-	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
-	if (idx == BOARD_INDEX_NONE) return WDL_Stored::ILLEGAL;
-
-	return w->read(pos.turn(), idx);
+	return w->read(pos.turn(), pos);
 }
 
 // Semantic WDL for `pos`: read from the stored frame (markers folded), or
@@ -422,12 +419,9 @@ WDL_Entry Probe_Tables::Impl::probe_wdl_internal(const Piece_Config& ps, const P
 	WDL_File* w = open_wdl(ps);
 	if (!w) return WDL_Entry::ILLEGAL;
 
-	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
-	if (idx == BOARD_INDEX_NONE) return WDL_Entry::ILLEGAL;
-
 	const Color stm = pos.turn();
 	if (w->is_dropped[stm]) return derive_wdl(ps, pos, depth);
-	return wdl_from_storage(w->read(stm, idx));
+	return wdl_from_storage(w->read(stm, pos));
 }
 
 std::optional<uint16_t> Probe_Tables::Impl::probe_dtc_internal(
@@ -436,13 +430,10 @@ std::optional<uint16_t> Probe_Tables::Impl::probe_dtc_internal(
 	DTC_File* d = open_dtc(ps);
 	if (!d) return std::nullopt;
 
-	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
-	if (idx == BOARD_INDEX_NONE) return std::nullopt;
-
 	const Color stm = pos.turn();
 	return d->is_dropped[stm]
 		? derive_dtc(ps, pos, depth)
-		: d->read(stm, idx, wdl);
+		: d->read(stm, pos, wdl);
 }
 
 std::optional<uint16_t> Probe_Tables::Impl::probe_dtm_internal(
@@ -451,13 +442,10 @@ std::optional<uint16_t> Probe_Tables::Impl::probe_dtm_internal(
 	DTM_File* d = open_dtm(ps);
 	if (!d) return std::nullopt;
 
-	const Board_Index idx = board_index_of_position(get_epsi(ps), pos);
-	if (idx == BOARD_INDEX_NONE) return std::nullopt;
-
 	const Color stm = pos.turn();
 	return d->is_dropped[stm]
 		? derive_dtm(ps, pos, depth)
-		: d->read(stm, idx, wdl);
+		: d->read(stm, pos, wdl);
 }
 
 DTM50_Result Probe_Tables::Impl::probe_dtm50_internal(
@@ -469,14 +457,10 @@ DTM50_Result Probe_Tables::Impl::probe_dtm50_internal(
 	DTM50_File* m = open_dtm50(ps);
 	if (!m) return {};
 
-	const Position_Index_Config& epsi = get_epsi(ps);
-	const Board_Index idx = board_index_of_position(epsi, pos);
-	if (idx == BOARD_INDEX_NONE) return {};
-
 	const Color stm = pos.turn();
 	const DTM50_Result d = m->is_dropped[stm]
 		? derive_dtm50(ps, pos, rule50, depth)
-		: DTM50_Result{ fold_dtm50_wdl(wdl), m->read(stm, idx, wdl, hmc) };
+		: DTM50_Result{ fold_dtm50_wdl(wdl), m->read(stm, pos, wdl, hmc) };
 
 	// See recover_mate_at_hmc.
 	if (hmc > 0 && d.dtm == 0 && (wdl == WDL_Entry::WIN || wdl == WDL_Entry::LOSE))
@@ -774,13 +758,6 @@ Probe_Result Probe_Tables::Impl::probe_impl(const Piece_Config& ps, const Positi
 		m50 = open_dtm50(ps);
 	if (!w && !d && !m && !m50 && !rule50_drawn) return r;
 
-	const Position_Index_Config& epsi = get_epsi(ps);
-	const Board_Index idx = board_index_of_position(epsi, pos);
-	if (idx == BOARD_INDEX_NONE)
-	{
-		r.status = Probe_Result::Status::ILLEGAL_POS;
-		return r;
-	}
 	if (!pos.is_legal())
 	{
 		r.status = Probe_Result::Status::ILLEGAL_POS;
@@ -826,9 +803,6 @@ WDL_Entry Probe_Tables::Impl::probe_wdl_impl(const Piece_Config& ps, const Posit
 	WDL_File* w = open_wdl(ps);
 	if (!w) return WDL_Entry::ILLEGAL;
 
-	const Position_Index_Config& epsi = get_epsi(ps);
-	if (board_index_of_position(epsi, pos) == BOARD_INDEX_NONE)
-		return WDL_Entry::ILLEGAL;
 	if (!pos.is_legal())
 		return WDL_Entry::ILLEGAL;
 
