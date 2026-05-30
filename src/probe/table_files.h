@@ -96,7 +96,6 @@ struct Table_File
 		ASSERT(!is_dropped[c]);
 		const Board_Index storage_pos =
 			board_index_of_position(*index_cfg, per_color[c].layout, pos);
-		ASSERT(storage_pos != BOARD_INDEX_NONE);
 		return Traits::read(per_color[c], is_singular[c], storage_pos, args...);
 	}
 };

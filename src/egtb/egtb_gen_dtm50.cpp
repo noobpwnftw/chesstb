@@ -145,7 +145,6 @@ DTM_Final_Entry DTM50_Generator::read_post_move_dtm(Position_For_Gen& pos_gen, M
 	const Color mover = parent.turn();
 	const Color opp = color_opp(mover);
 	const Board_Index post_idx = next_quiet_index(pos_gen, move);
-	if (post_idx == BOARD_INDEX_NONE) return DTM_Final_Entry::make_illegal();
 
 	// Pawn push → opp[0]; non-pawn quiet → opp[k+1]; k=99 targets virtual
 	// hmc=100 (50MR draw unless mate). See header for build-order argument.
@@ -222,7 +221,6 @@ DTM_Final_Entry DTM50_Generator::effective_opp_dtm_after_dp(Position_For_Gen& po
 		if (!p_gen_for_ep)
 		{
 			const Board_Index child_idx = board_index_of_position(m_epsi, p);
-			if (child_idx == BOARD_INDEX_NONE) continue;
 			p_gen_for_ep.emplace(m_epsi, child_idx, opp);
 		}
 		// read_sub_tb returns the post-EP DTM from mover's perspective; invert

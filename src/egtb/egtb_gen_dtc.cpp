@@ -165,7 +165,6 @@ WDL_Entry DTC_Generator::effective_opp_wdl_after_dp(Position_For_Gen& pos_gen, M
 		if (!p_gen_for_ep)
 		{
 			const Board_Index child_idx = board_index_of_position(m_epsi, p);
-			if (child_idx == BOARD_INDEX_NONE) continue;
 			p_gen_for_ep.emplace(m_epsi, child_idx, opp);
 		}
 		const WDL_Entry w_after_ep = read_sub_tb(*p_gen_for_ep, ep_move, thread_id);
@@ -200,7 +199,6 @@ WDL_Entry DTC_Generator::read_post_move_wdl(Position_For_Gen& pos_gen, Move move
 
 	const Color mover = parent.turn();
 	const Board_Index post_idx = next_quiet_index(pos_gen, move);
-	if (post_idx == BOARD_INDEX_NONE) return WDL_Entry::ILLEGAL;
 	return read_dtc(post_idx, color_opp(mover)).wdl();
 }
 
@@ -561,7 +559,6 @@ DTC_Generator::Loss_Verification_Result DTC_Generator::check_loss(
 		else
 		{
 			const Board_Index child = next_quiet_index(pos_gen, m);
-			if (child == BOARD_INDEX_NONE) return r;
 			const DTC_Final_Entry ce = read_dtc(child, opp);
 			if (!ce.is_win()) return r;
 			if (is_cursed_class_entry(ce))

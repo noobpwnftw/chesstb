@@ -142,7 +142,6 @@ DTM_Final_Entry DTM_Generator::read_post_move_dtm(Position_For_Gen& pos_gen, Mov
 
 	const Color mover = parent.turn();
 	const Board_Index post_idx = next_quiet_index(pos_gen, move);
-	if (post_idx == BOARD_INDEX_NONE) return DTM_Final_Entry::make_illegal();
 	return read_dtm(post_idx, color_opp(mover));
 }
 
@@ -200,7 +199,6 @@ DTM_Final_Entry DTM_Generator::effective_opp_dtm_after_dp(Position_For_Gen& pos_
 		if (!p_gen_for_ep)
 		{
 			const Board_Index child_idx = board_index_of_position(m_epsi, p);
-			if (child_idx == BOARD_INDEX_NONE) continue;
 			p_gen_for_ep.emplace(m_epsi, child_idx, opp);
 		}
 		// Post-EP DTM is from new STM (mover) — invert class and +1 ply for opp's EP.
@@ -485,7 +483,6 @@ DTM_Generator::Loss_Verification_Result DTM_Generator::check_loss(
 		{
 			// Quiet in-material (incl. single pawn push); child is in current table.
 			const Board_Index child = next_quiet_index(pos_gen, m);
-			if (child == BOARD_INDEX_NONE) return r;
 			const DTM_Final_Entry ce = read_dtm(child, opp);
 			if (!ce.is_win()) return r;
 			if (ce.value() >= ply) return r;
