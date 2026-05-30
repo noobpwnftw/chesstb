@@ -237,6 +237,7 @@ NODISCARD uint32_t choose_storage_permutation_config(
 	const std::function<Block_Source(uint32_t)>& make_source,
 	size_t block_size,
 	std::unique_ptr<Compress_Helper> compressor,
+	size_t max_samples,
 	const char* task_name
 );
 

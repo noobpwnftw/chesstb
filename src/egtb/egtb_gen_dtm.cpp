@@ -1177,6 +1177,7 @@ void DTM_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 					DTM_BLOCK_SIZE,
 					std::make_unique<LZMA_Rank_Compress_Helper>(
 						dtm_rank[me], dtm_entry_bytes[me], &dtm_storage_fn),
+					/*max_samples=*/64,
 					"choose_dtm_storage");
 			}
 			Block_Source src = make_entry_block_source(

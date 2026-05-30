@@ -1315,6 +1315,7 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 				},
 				WDL_BLOCK_SIZE,
 				std::make_unique<LZ4_Compress_Helper>(nullptr),
+				/*max_samples=*/1024,
 				"choose_wdl_storage");
 
 			Gather_Sink sink{me, &m_info, &dtc_hist[me], {}, std::vector<uint8_t>(num_blocks, 0)};
@@ -1363,6 +1364,7 @@ void DTC_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const EG
 				DTC_BLOCK_SIZE,
 				std::make_unique<LZMA_Rank_Compress_Helper>(
 					chosen, dtc_entry_bytes[me], &dtc_storage_fn),
+				/*max_samples=*/64,
 				"choose_dtc_storage");
 		}
 		Block_Source src = make_entry_block_source(

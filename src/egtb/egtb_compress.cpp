@@ -157,16 +157,13 @@ std::optional<LZ4_Dict> make_dict_for_wdl(
 	);
 }
 
-namespace {
-constexpr size_t CHOOSE_PERM_MAX_SAMPLES = 256;
-}  // namespace
-
 uint32_t choose_storage_permutation_config(
 	In_Out_Param<Thread_Pool> thread_pool,
 	const Piece_Config_For_Gen& epsi,
 	const std::function<Block_Source(uint32_t)>& make_source,
 	size_t block_size,
 	std::unique_ptr<Compress_Helper> compressor,
+	size_t max_samples,
 	const char* task_name)
 {
 	const size_t n = epsi.num_populated_classes();
@@ -189,7 +186,7 @@ uint32_t choose_storage_permutation_config(
 		if (num_blocks == 0)
 			continue;
 
-		const size_t sample_cnt = std::min(num_blocks, CHOOSE_PERM_MAX_SAMPLES);
+		const size_t sample_cnt = std::min(num_blocks, max_samples);
 		std::atomic<size_t> next_sample{0};
 		const size_t workers = std::min<size_t>(thread_pool->num_workers(), sample_cnt);
 

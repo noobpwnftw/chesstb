@@ -1386,6 +1386,7 @@ void DTM50_Generator::save_to_disk(In_Out_Param<Thread_Pool> thread_pool, const 
 				static_cast<size_t>(RS_BLOCK_POSITIONS) * color_out[me].ranks.entry_bytes,
 				std::make_unique<LZMA_Rank_Compress_Helper>(
 					trial_rank, color_out[me].ranks.entry_bytes, &dtm_storage_fn),
+				/*max_samples=*/64,
 				"choose_dtm50_storage");
 			save_compress_dtm50(
 				thread_pool, *m_table, cache, me, num_positions,
