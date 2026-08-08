@@ -1,0 +1,14 @@
+#!/bin/bash
+# Build (incremental, via tests/Makefile) and run the disk-vs-Syzygy compare.
+# No regen; reads .lzw from ./wdl/.
+# Requires ./syzygy/ with matching .rtbw files for the materials probed.
+#
+# Usage:
+#   ./run_compare KQK KRK ...     # specific materials
+#   ./run_compare --list FILE     # newline-separated names
+#   ./run_compare --enumerate N   # everything ≤ N pieces
+set -e
+cd "$(dirname "$0")"
+
+make -s -C tests compare
+tests/compare_syzygy "$@"
