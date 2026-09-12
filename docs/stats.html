@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ChessTB – Tablebase statistics</title>
+<meta name="description" content="Win, draw and loss shares and the longest wins for every ChessTB endgame table, by metric.">
+<meta property="og:title" content="ChessTB – Tablebase statistics">
+<meta property="og:description" content="Win, draw and loss shares and the longest wins for every ChessTB endgame table, by metric.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Gloock&family=Public+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+/* Layout: a compact header, one control bar, then a single scrolling table with a sticky header row. */
+:root {
+  --paper: #F2F4F1;
+  --panel: #E7EBE6;
+  --ink: #141B18;
+  --muted: #56635D;
+  --rule: #CBD3CE;
+  --accent: #2343B8;
+  --accent-soft: #DCE2F7;
+  --win: #22744A;
+  --draw: #C9A24A;
+  --loss: #B5452A;
+  --display: "Gloock", "Georgia", "Times New Roman", serif;
+  --body: "Public Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0E1412; --panel: #18201D; --ink: #E5EBE7; --muted: #9AA9A2; --rule: #2A3531;
+    --accent: #8EA6FF; --accent-soft: #1E2847; --win: #5FBF88; --draw: #D9B25A; --loss: #D9694A;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0E1412; --panel: #18201D; --ink: #E5EBE7; --muted: #9AA9A2; --rule: #2A3531;
+  --accent: #8EA6FF; --accent-soft: #1E2847; --win: #5FBF88; --draw: #D9B25A; --loss: #D9694A;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+html { scrollbar-gutter: stable; }
+body {
+  background: var(--paper); color: var(--ink);
+  font-family: var(--body); font-size: 15px; line-height: 1.5;
+  padding-inline: 20px; padding-block: 0 48px;
+  padding-top: env(safe-area-inset-top, 0px);
+}
+[hidden] { display: none !important; }
+.wrap { max-width: 1240px; margin: 0 auto; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+.top { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding-block: 22px; border-bottom: 1px solid var(--rule); line-height: 24px; }
+.brand { font-family: var(--mono); font-weight: 700; font-size: 15px; color: var(--ink); text-decoration: none; }
+.brand span { color: var(--accent); }
+.top nav { display: flex; gap: 18px; font-size: 14px; }
+.top nav a { color: var(--muted); text-decoration: none; }
+.top nav a:hover { color: var(--ink); }
+.top nav a[aria-current="page"] { color: var(--ink); font-weight: 600; }
+/* On phones the nav takes its own row under the logo instead of wrapping or hiding. */
+@media (max-width: 520px) {
+  .top { flex-wrap: wrap; row-gap: 12px; }
+  .top nav { width: 100%; gap: 16px; font-size: 13px; }
+}
+
+.head { display: grid; gap: 10px; padding-block: 40px 24px; }
+h1 { font-family: var(--display); font-weight: 400; font-size: clamp(36px, 5vw, 56px); line-height: 1.05; margin: 0; }
+.lede { color: var(--muted); font-size: 17px; max-width: 68ch; margin: 0; }
+
+.controls { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding-block: 14px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 999px; padding: 3px; gap: 2px; background: var(--panel); flex-wrap: wrap; }
+.seg button { font: inherit; font-size: 14px; font-weight: 600; border: 0; background: transparent; color: var(--muted); padding: 6px 13px; border-radius: 999px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+.seg button:disabled { opacity: .35; cursor: default; }
+.search { font: inherit; font-size: 14px; padding: 7px 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--paper); color: var(--ink); width: 13rem; max-width: 100%; }
+.metric-note { font-size: 14px; color: var(--muted); padding-block: 12px 4px; margin: 0; }
+.summary { font-family: var(--mono); font-size: 13px; color: var(--muted); padding-block: 4px 12px; margin: 0; font-variant-numeric: tabular-nums; }
+
+.table-wrap { overflow: auto; max-height: 78vh; border: 1px solid var(--rule); border-radius: 10px; background: var(--paper); }
+table { border-collapse: separate; border-spacing: 0; width: 100%; min-width: 820px; table-layout: fixed; font-size: 14px; }
+th, td { padding: 9px 12px; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: middle; white-space: nowrap; }
+thead th { white-space: normal; position: sticky; top: 0; z-index: 1; background: var(--panel); font-family: var(--mono); font-size: 11px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+thead th button { all: unset; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
+/* Two sticky header rows: the group label row is a fixed 30px, the column row sticks just below it. */
+thead tr.group th { top: 0; height: 30px; padding-block: 7px 4px; }
+thead tr:not(.group) th { top: 30px; }
+thead th.blank { border-bottom-color: transparent; }
+thead th.grp { text-align: center; }
+thead th button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+thead th[aria-sort="ascending"] button::after { content: "▲"; font-size: 9px; }
+thead th[aria-sort="descending"] button::after { content: "▼"; font-size: 9px; }
+th.num, td.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td.mat { font-family: var(--mono); font-weight: 700; }
+tbody tr:hover td { background: var(--accent-soft); }
+.bar { display: flex; width: 100%; max-width: 120px; height: 10px; border-radius: 3px; overflow: hidden; background: var(--rule); }
+.bar i { display: block; height: 100%; }
+.bar .w { background: var(--win); }
+.bar .d { background: var(--draw); }
+.bar .l { background: var(--loss); }
+td.long a { font-weight: 700; text-decoration: none; }
+td.long a::after { content: ""; display: inline-block; vertical-align: baseline; margin-left: 4px; width: 10px; height: 10px; background: currentColor; -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='1.8 1.1 9.1 9.1'%3E%3Cpath d='M5.5 2.5H3.2a.7.7 0 0 0-.7.7v5.6a.7.7 0 0 0 .7.7h5.6a.7.7 0 0 0 .7-.7V6.5M7 1.8h3.2V5M10 2 5.6 6.4' fill='none' stroke='black' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='1.8 1.1 9.1 9.1'%3E%3Cpath d='M5.5 2.5H3.2a.7.7 0 0 0-.7.7v5.6a.7.7 0 0 0 .7.7h5.6a.7.7 0 0 0 .7-.7V6.5M7 1.8h3.2V5M10 2 5.6 6.4' fill='none' stroke='black' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat; }
+td.long a:hover { text-decoration: underline; }
+th.ctr, td.long { text-align: center; }
+/* Numbers right-align inside a 4-digit box that stays centred, so digits line up under the centred header. */
+td.long a, td.long .none { display: inline-block; min-width: calc(4ch + 14px); text-align: right; }
+td.long .none { padding-right: 14px; }
+.none { color: var(--muted); }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--muted); padding-block: 12px 0; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.foot #generated { display: block; }
+.foot { font-size: 13px; color: var(--muted); padding-block: 16px 0; max-width: 80ch; }
+
+@media (max-width: 640px) {
+  body { padding-inline: 16px; }
+  .search { width: 100%; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="./">Chess<span>TB</span></a>
+    <nav aria-label="Site">
+      <a href="./">Home</a>
+      <a href="stats.html" aria-current="page">Statistics</a>
+      <a href="https://noobpwnftw-chesstb-explorer.hf.space/">Explorer</a>
+      <a href="https://github.com/noobpwnftw/chesstb">GitHub</a>
+    </nav>
+  </header>
+
+  <section class="head" aria-labelledby="title">
+    <h1 id="title">Tablebase statistics</h1>
+    <p class="lede">Win, draw and loss shares for every material, counting both sides to move, and the longest win for each side to move. Counts cover every legal position after symmetry, and include cursed wins and blessed losses.</p>
+  </section>
+
+  <div class="controls" role="group" aria-label="Table filters">
+    <div class="seg" id="metric" role="group" aria-label="Metric">
+      <button type="button" data-metric="dtz">DTZ</button>
+      <button type="button" data-metric="dtm">DTM</button>
+      <button type="button" data-metric="dtm50">DTM50</button>
+      <button type="button" data-metric="dtc">DTC</button>
+    </div>
+    <div class="seg" id="castling" role="group" aria-label="Castling rights">
+      <button type="button" data-castling="2">Combined</button>
+      <button type="button" data-castling="0">No castling</button>
+      <button type="button" data-castling="1">Castling only</button>
+    </div>
+    <div class="seg" id="pieces" role="group" aria-label="Number of pieces">
+      <button type="button" data-n="0">All</button>
+      <button type="button" data-n="3">3</button>
+      <button type="button" data-n="4">4</button>
+      <button type="button" data-n="5">5</button>
+      <button type="button" data-n="6">6</button>
+      <button type="button" data-n="7">7</button>
+    </div>
+    <input class="search" id="q" type="search" placeholder="Search, e.g. KRPKR" aria-label="Search materials" autocomplete="off" spellcheck="false">
+  </div>
+
+  <p class="metric-note" id="note"></p>
+  <p class="summary" id="summary">Loading statistics…</p>
+
+  <div class="table-wrap">
+    <table>
+      <colgroup>
+        <col style="width: 12%"><col style="width: 15%"><col style="width: 13%">
+        <col style="width: 10%"><col style="width: 9%"><col style="width: 10%">
+        <col style="width: 15.5%"><col style="width: 15.5%">
+      </colgroup>
+      <thead>
+        <tr class="group">
+          <th colspan="6" class="blank"></th>
+          <th colspan="2" class="grp" scope="colgroup">Longest win</th>
+        </tr>
+        <tr>
+          <th data-key="mat" aria-sort="none"><button type="button">Material</button></th>
+          <th class="num" data-key="pos" aria-sort="none"><button type="button">Positions</button></th>
+          <th aria-hidden="true"></th>
+          <th class="num" data-key="w" aria-sort="none"><button type="button">White wins</button></th>
+          <th class="num" data-key="d" aria-sort="none"><button type="button">Draws</button></th>
+          <th class="num" data-key="b" aria-sort="none"><button type="button">Black wins</button></th>
+          <th class="num ctr" data-key="lw" aria-sort="none"><button type="button">White to move</button></th>
+          <th class="num ctr" data-key="lb" aria-sort="none"><button type="button">Black to move</button></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="legend" aria-hidden="true">
+    <span><i style="background: var(--win)"></i>White wins</span>
+    <span><i style="background: var(--draw)"></i>Draws</span>
+    <span><i style="background: var(--loss)"></i>Black wins</span>
+  </div>
+  <p class="foot">Longest wins are in plies. Click a number to open its position in the explorer.<span id="generated"></span></p>
+</div>
+
+<script>
+(function () {
+  var EXPLORER = "https://noobpwnftw-chesstb-explorer.hf.space/";
+  var NOTES = {
+    dtz: "Longest win: plies to the next zeroing move.",
+    dtm: "Longest win: plies to mate, ignoring the 50-move rule.",
+    dtm50: "Longest win: plies to mate within the 50-move rule, from a fresh clock.",
+    dtc: "Longest win: plies to the next zeroing move within the 50-move rule, from a fresh clock. Endgames with pawns only."
+  };
+  var state = { metric: "dtz", castling: 2, n: 0, q: "", sort: null, dir: 1 };
+  var data = null;
+
+  function readHash() {
+    var h = location.hash.replace(/^#/, "").split("-");
+    if (NOTES[h[0]]) state.metric = h[0];
+    state.castling = h[1] === "castling" ? 1 : h[1] === "nocastling" ? 0 : 2;
+  }
+  function writeHash() {
+    try { history.replaceState(null, "", "#" + state.metric + ["-nocastling", "-castling", ""][state.castling]); } catch (e) {}
+  }
+
+  function pct(x, total) {
+    if (!total) return "—";
+    var v = 100 * x / total;
+    if (x > 0 && v < 0.005) return "<0.01%";
+    if (x < total && v > 99.995) return ">99.99%";
+    return v.toFixed(2) + "%";
+  }
+  function fullFen(fen) {
+    var f = fen.trim().split(/\s+/), d = ["", "w", "-", "-", "0", "1"];
+    while (f.length < 6) f.push(d[f.length]);
+    return f.join(" ");
+  }
+  // Castling tables cover every king and rook arrangement, so a record can be a Chess960
+  // position: a right whose king or rook is off its standard square needs the 960 variant.
+  function needs960(fen) {
+    var f = fen.split(/\s+/), rights = f[2] || "-";
+    if (rights === "-") return false;
+    if (/[A-Ha-h]/.test(rights)) return true;
+    var ranks = f[0].split("/");
+    function row(r) {
+      var out = [];
+      ranks[r].split("").forEach(function (c) {
+        if (/\d/.test(c)) for (var i = 0; i < +c; i++) out.push(""); else out.push(c);
+      });
+      return out;
+    }
+    var r1 = row(7), r8 = row(0);
+    var need = { K: [r1, "K", "R", 7], Q: [r1, "K", "R", 0], k: [r8, "k", "r", 7], q: [r8, "k", "r", 0] };
+    return rights.split("").some(function (c) {
+      var n = need[c];
+      return !n || n[0][4] !== n[1] || n[0][n[3]] !== n[2];
+    });
+  }
+  function explorerLink(fen) {
+    var full = fullFen(fen);
+    return EXPLORER + "#fen=" + encodeURIComponent(full) + (needs960(full) ? "&variant=chess960" : "");
+  }
+  function esc(s) { return s.replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+
+  function derive(row) {
+    var c = row.c, tot = c[3] + c[7];
+    // White's point of view: White wins with White to move, or when Black to move loses.
+    return { w: c[0] + c[6], d: c[1] + c[5], b: c[2] + c[4], tot: tot };
+  }
+
+  function currentRows() {
+    var set = data.sets[state.castling];
+    var q = state.q.trim().toLowerCase();
+    var rows = set.rows.filter(function (r) {
+      if (!r.l[state.metric]) return false;
+      if (state.n && r.n !== state.n) return false;
+      if (q && r.m.toLowerCase().indexOf(q) < 0) return false;
+      return true;
+    });
+    if (state.sort) {
+      var k = state.sort, dir = state.dir;
+      var val = function (r) {
+        var s = derive(r);
+        switch (k) {
+          case "mat": return r.m;
+          case "pos": return s.tot;
+          case "w": return s.tot ? s.w / s.tot : 0;
+          case "d": return s.tot ? s.d / s.tot : 0;
+          case "b": return s.tot ? s.b / s.tot : 0;
+          case "lw": return r.l[state.metric][0][0];
+          case "lb": return r.l[state.metric][1][0];
+        }
+      };
+      rows = rows.map(function (r, i) { return [val(r), i, r]; }).sort(function (a, b) {
+        if (a[0] < b[0]) return -dir;
+        if (a[0] > b[0]) return dir;
+        return a[1] - b[1];
+      }).map(function (x) { return x[2]; });
+    }
+    return rows;
+  }
+
+  function longestCell(entry) {
+    if (!entry || !entry[0] || !entry[1]) return '<td class="num long"><span class="none">—</span></td>';
+    var fen = fullFen(entry[1]);
+    return '<td class="num long"><a href="' + explorerLink(fen) +
+      '" target="_blank" rel="noopener" title="' + esc(fen) + '">' + entry[0] + "</a></td>";
+  }
+
+  function render() {
+    var rows = currentRows();
+    var html = [], total = 0n;
+    rows.forEach(function (r) {
+      var s = derive(r), l = r.l[state.metric];
+      total += BigInt(s.tot);
+      var bw = s.tot ? 100 * s.w / s.tot : 0, bd = s.tot ? 100 * s.d / s.tot : 0, bb = s.tot ? 100 * s.b / s.tot : 0;
+      html.push("<tr><td class=\"mat\">" + esc(r.m) + "</td>" +
+        "<td class=\"num\">" + s.tot.toLocaleString("en-US") + "</td>" +
+        '<td><div class="bar" title="' + pct(s.w, s.tot) + " / " + pct(s.d, s.tot) + " / " + pct(s.b, s.tot) + '">' +
+          '<i class="w" style="width:' + bw + '%"></i><i class="d" style="width:' + bd + '%"></i><i class="l" style="width:' + bb + '%"></i></div></td>' +
+        '<td class="num">' + pct(s.w, s.tot) + "</td>" +
+        '<td class="num">' + pct(s.d, s.tot) + "</td>" +
+        '<td class="num">' + pct(s.b, s.tot) + "</td>" +
+        longestCell(l[0]) + longestCell(l[1]) + "</tr>");
+    });
+    document.getElementById("rows").innerHTML = html.join("") ||
+      '<tr><td colspan="8" class="none">No materials match these filters.</td></tr>';
+    document.getElementById("summary").textContent =
+      rows.length.toLocaleString("en-US") + " materials · " + total.toLocaleString("en-US") + " legal positions";
+    document.getElementById("note").textContent = NOTES[state.metric];
+    syncControls();
+  }
+
+  function syncControls() {
+    var set = data.sets[state.castling];
+    document.querySelectorAll("#metric button").forEach(function (b) {
+      b.setAttribute("aria-pressed", b.dataset.metric === state.metric ? "true" : "false");
+      b.disabled = set.metrics.indexOf(b.dataset.metric) < 0;
+    });
+    document.querySelectorAll("#castling button").forEach(function (b) {
+      b.setAttribute("aria-pressed", +b.dataset.castling === state.castling ? "true" : "false");
+    });
+    var present = {};
+    set.rows.forEach(function (r) { if (r.l[state.metric]) present[r.n] = true; });
+    document.querySelectorAll("#pieces button").forEach(function (b) {
+      var n = +b.dataset.n;
+      b.setAttribute("aria-pressed", n === state.n ? "true" : "false");
+      b.disabled = n !== 0 && !present[n];
+    });
+    document.querySelectorAll("thead th[data-key]").forEach(function (th) {
+      th.setAttribute("aria-sort", th.dataset.key === state.sort ? (state.dir > 0 ? "ascending" : "descending") : "none");
+    });
+  }
+
+  function bind() {
+    document.querySelectorAll("#metric button").forEach(function (b) {
+      b.addEventListener("click", function () { state.metric = b.dataset.metric; fixPieces(); writeHash(); render(); });
+    });
+    document.querySelectorAll("#castling button").forEach(function (b) {
+      b.addEventListener("click", function () { state.castling = +b.dataset.castling; fixPieces(); writeHash(); render(); });
+    });
+    document.querySelectorAll("#pieces button").forEach(function (b) {
+      b.addEventListener("click", function () { state.n = +b.dataset.n; render(); });
+    });
+    document.getElementById("q").addEventListener("input", function (e) { state.q = e.target.value; render(); });
+    document.querySelectorAll("thead th[data-key] button").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var k = b.parentNode.dataset.key;
+        if (state.sort === k) {
+          if (state.dir > 0) state.dir = -1; else { state.sort = null; state.dir = 1; }
+        } else {
+          state.sort = k;
+          state.dir = k === "mat" ? 1 : -1;
+        }
+        render();
+      });
+    });
+    window.addEventListener("hashchange", function () { readHash(); fixPieces(); render(); });
+  }
+
+  // Drop a piece-count filter that the chosen metric and table set do not cover.
+  function fixPieces() {
+    var set = data.sets[state.castling];
+    if (set.metrics.indexOf(state.metric) < 0) state.metric = set.metrics[0];
+    if (state.n && !set.rows.some(function (r) { return r.n === state.n && r.l[state.metric]; })) state.n = 0;
+  }
+
+  // Combined view: fold each castling table into its right-free material (KrrK -> KRRK).
+  // Positions with rights are distinct positions, so counts add; records take the longest.
+  function buildCombined(d) {
+    var byName = {};
+    var rows = d.sets[0].rows.map(function (r) {
+      var copy = { m: r.m, n: r.n, c: r.c.slice(), l: {} };
+      Object.keys(r.l).forEach(function (k) { copy.l[k] = [r.l[k][0].slice(), r.l[k][1].slice()]; });
+      byName[r.m] = copy;
+      return copy;
+    });
+    d.sets[1].rows.forEach(function (r) {
+      var t = byName[r.m.replace(/r/g, "R")];
+      if (!t) return;
+      for (var i = 0; i < 8; i++) t.c[i] += r.c[i];
+      Object.keys(r.l).forEach(function (k) {
+        if (!t.l[k]) return;
+        for (var s = 0; s < 2; s++) if (r.l[k][s][0] > t.l[k][s][0]) t.l[k][s] = r.l[k][s].slice();
+      });
+    });
+    return { castling: 2, metrics: d.sets[0].metrics, rows: rows };
+  }
+
+  readHash();
+  fetch("stats.json").then(function (r) {
+    if (!r.ok) throw new Error(r.status);
+    return r.json();
+  }).then(function (d) {
+    data = d;
+    d.sets[2] = buildCombined(d);
+    var gen = document.getElementById("generated");
+    gen.textContent = "Statistics generated ";
+    var t = document.createElement("time");
+    t.dateTime = d.generated;
+    t.textContent = d.generated + ".";
+    gen.appendChild(t);
+    bind(); fixPieces(); render();
+  }).catch(function () {
+    document.getElementById("summary").textContent = "Could not load stats.json. Reload the page to try again.";
+  });
+})();
+</script>
+</body>
+</html>
