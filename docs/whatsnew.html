@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ChessTB – What's new</title>
+<meta name="description" content="All of 8-piece Op1, castling included, with exact results at every halfmove clock. A 597-move record, a written proof and the tools for independent verification.">
+<meta property="og:title" content="ChessTB – What's new">
+<meta property="og:description" content="All of 8-piece Op1, castling included, with exact results at every halfmove clock. A 597-move record, a written proof and the tools for independent verification.">
+<meta property="og:type" content="website">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Gloock&family=Public+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="common.css">
+<style>
+:root {
+  --win: #22744A; --win-soft: #DCEEE3; --loss: #B5452A;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --win: #6FCF97; --win-soft: #163324; --loss: #C4542F;
+  }
+}
+:root[data-theme="dark"] {
+  --win: #6FCF97; --win-soft: #163324; --loss: #C4542F;
+}
+/* What's new: hero with the storage projection, then Op1, the proof and verification, and integrations.
+   Shared tokens, base, top bar, boards and controls come from common.css; boards are drawn by board.js. */
+
+body { font-size: 17px; line-height: 1.6; padding-block: 0 64px; }
+.pair { display: grid; grid-template-columns: minmax(0, 440px) minmax(0, 1fr); gap: 48px; align-items: start; }
+.pair + .pair { margin-top: 72px; }
+.story { display: grid; gap: 18px; max-width: 62ch; min-width: 0; }
+.story h3 { font-size: 30px; }
+.story .mat { font-family: var(--mono); font-size: 13px; color: var(--muted); letter-spacing: .06em; }
+.big { font-family: var(--display); font-size: clamp(26px, 3.4vw, 36px); line-height: 1.15; }
+.big em { font-style: normal; color: var(--accent); }
+.clock { display: grid; gap: 10px; padding: 18px; border: 1px solid var(--rule); border-radius: 10px; background: var(--panel); }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.btn { font: inherit; font-size: 15px; font-weight: 600; padding: 10px 16px; border-radius: 8px; border: 1px solid var(--ink); background: var(--ink); color: var(--paper); cursor: pointer; }
+.btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.moves { display: grid; gap: 14px; }
+/* option cards for DTC */
+.line { font-family: var(--mono); font-size: 14px; color: var(--muted); padding: 12px 14px; border-left: 3px solid var(--accent); background: var(--panel); border-radius: 0 8px 8px 0; overflow-wrap: anywhere; }
+/* toggle */
+.stat-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.stat-strip > div { padding: 16px 14px; display: grid; gap: 4px; }
+.stat-strip > div + div { border-left: 1px solid var(--rule); }
+.stat-strip .v { font-family: var(--mono); font-size: 22px; font-weight: 700; }
+.stat-strip .k { font-size: 13px; color: var(--muted); text-wrap: balance; }
+/* coverage */
+table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 15px; }
+th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+td.n { font-family: var(--mono); font-weight: 700; white-space: nowrap; }
+/* close */
+.link-card { display: grid; gap: 4px; min-width: 220px; flex: 1 1 220px; padding: 18px 20px; border: 1px solid var(--ink); border-radius: 10px; text-decoration: none; color: var(--ink); }
+.link-card:hover { background: var(--ink); color: var(--paper); }
+.link-card .k { font-size: 14px; opacity: .75; }
+.link-card .v { font-family: var(--display); font-size: 30px; line-height: 1.1; }
+.link-card .v::after { content: ""; display: inline-block; vertical-align: baseline; margin-left: 10px; width: 18px; height: 18px; background: currentColor; -webkit-mask: var(--ext-icon) center / contain no-repeat; mask: var(--ext-icon) center / contain no-repeat; }
+/* The record pair stacks with the page's other two-column grids; the story then centres under the board. */
+@media (max-width: 1024px) {
+  .pair { grid-template-columns: minmax(0, 1fr); gap: 32px; }
+  .pair .story { justify-self: center; width: 100%; }
+}
+@media (max-width: 480px) {
+  body { font-size: 16px; padding-inline: 16px; }
+  .stat-strip { grid-template-columns: minmax(0, 1fr); }
+  .stat-strip > div + div { border-left: 0; border-top: 1px solid var(--rule); }
+}
+/* What's new: the 8-piece space as a 1,000-cell field; the year slider lights it as storage grows. */
+:root { --lit: #9DB0EE; --lit-edge: #7F95DD; --cell: #D6D6D6; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --lit: #34477F; --lit-edge: #4A5FA0; --cell: #383838; } }
+:root[data-theme="dark"] { --lit: #34477F; --lit-edge: #4A5FA0; --cell: #383838; }
+.wn-hero { display: grid; grid-template-columns: minmax(0, 440px) minmax(0, 1fr); gap: 48px; align-items: center; padding-block: 64px 72px; }
+/* Side by side, the title keeps its full size and the card absorbs narrower windows. */
+.wn-hero h1 { font-size: 66px; letter-spacing: -.01em; }
+.wn-hero h1 em { font-style: normal; color: var(--accent); }
+.wn-hero h1 .l { display: block; }
+.wn-hero .lede { font-size: 19px; color: var(--muted); max-width: 40ch; margin-top: 22px; }
+.field-card { display: grid; gap: 14px; width: 100%; max-width: 520px; justify-self: center; padding: 16px; border: 1px solid var(--rule); border-radius: 12px; background: var(--panel); min-width: 0; }
+.proj-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.proj-head h2 { font-family: var(--display); font-size: 21px; }
+.proj-head span { font-size: 12px; color: var(--muted); font-family: var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.field { display: grid; grid-template-columns: repeat(50, minmax(0, 1fr)); gap: 2px; aspect-ratio: 50 / 20; width: 100%; }
+.field i { display: block; border-radius: 1px; background: var(--cell); transition: background-color .12s linear; }
+@media (prefers-reduced-motion: reduce) {
+  .field i { transition: none; }
+}
+.field i.op1 { background: var(--accent); }
+.field i.lit { background: var(--lit); }
+.readout { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.readout div { display: grid; gap: 2px; align-content: start; }
+.readout .v { font-family: var(--mono); font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.readout .k { font-size: 12px; color: var(--muted); text-wrap: balance; }
+.legend-row { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); }
+.legend-row span { display: inline-flex; align-items: center; gap: 6px; }
+.legend-row b { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+/* Tighter year buttons so the card's rows stay on one line at its narrowest (about 466px). */
+.assume { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.field-note { font-size: 13px; color: var(--muted); }
+.field-foot { font-size: 12px; color: var(--muted); opacity: .85; border-top: 1px solid var(--rule); padding-top: 10px; }
+.field-note strong { color: var(--ink); font-weight: 600; }
+.kicker { font-family: var(--display); font-size: clamp(30px, 4vw, 44px); color: var(--accent); line-height: 1.05; }
+.wn-sec { padding-block: 72px; border-top: 1px solid var(--rule); display: grid; gap: 28px; }
+.wn-sec h2 { font-size: clamp(28px, 3.6vw, 40px); max-width: 40ch; }
+.wn-sec > p { max-width: 64ch; color: var(--muted); font-size: 18px; }
+/* Second block of the proof section: one sentence per line, the payoff word in the accent (the kicker above is already a full accent line). */
+.wn-sec h2.cert { margin-top: 24px; }
+/* Centred as the section's closing statement. */
+.wn-sec .cert { justify-self: center; text-align: center; text-wrap: balance; }
+/* Verification diagrams: what the shipped tools check, drawn on theme colours. */
+.verify { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; width: 100%; max-width: 920px; justify-self: center; margin-top: 8px; }
+.verify figure { margin: 0; display: grid; gap: 12px; align-content: start; text-align: center; }
+.verify svg { display: block; width: 100%; height: auto; box-sizing: border-box; padding: 14px; border: 1px solid var(--rule); border-radius: 12px; background: var(--panel); }
+.verify figcaption { font-size: 14px; color: var(--muted); text-wrap: balance; }
+.verify figcaption b { display: block; margin-bottom: 2px; font-family: var(--display); font-size: 20px; font-weight: 400; color: var(--ink); }
+.vd-box { fill: var(--paper); stroke: var(--ink); stroke-width: 1.2; }
+.vd-boxbest { stroke: var(--win); stroke-width: 2; }
+.vd-lab { font-family: var(--mono); font-size: 10px; fill: var(--muted); }
+.vd-val { font-family: var(--display); font-size: 16px; fill: var(--ink); }
+.vd-val.vd-sm { font-size: 13px; }
+.vd-eq { font-family: var(--display); font-size: 28px; fill: var(--muted); }
+.vd-line { stroke: var(--muted); stroke-width: 1.2; fill: none; }
+.vd-line.vd-best, .vd-agree { stroke: var(--win); stroke-width: 2.2; fill: none; }
+.vd-ok circle { fill: var(--win-soft); stroke: var(--win); stroke-width: 1.5; }
+.vd-ok path { stroke: var(--win); stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.vd-w { fill: var(--win); }
+.vd-d { fill: var(--cell); }
+.vd-l { fill: var(--loss); }
+@media (max-width: 860px) {
+  .verify { grid-template-columns: minmax(0, 1fr); max-width: 360px; }
+}
+.wn-sec h2.cert span, .wn-sec p.cert span { display: block; }
+.wn-sec h2 em { font-style: normal; color: var(--accent); }
+.wn-sec, .wn-hero { padding-inline: max(0px, calc((100% - 1080px) / 2)); }
+.proof-grid.op1-grid { align-items: start; }
+/* The proof link as a large card like the home page's GitHub card, spanning the paragraph's width. */
+.lead-row .proof-card { flex: none; align-self: stretch; min-width: 0; max-width: 440px; }
+/* Stacked, the proof card centres on the column, on the same axis as the puzzle and the certainty block below. */
+/* The proof section stacks as soon as the jigsaw would shrink below its full 592px (content under 1080px, scrollbar included). */
+@media (max-width: 1150px) {
+  #proof .proof-grid { grid-template-columns: minmax(0, 1fr); }
+  #proof .lead-row { width: auto; }
+  #proof .lead-row .proof-card { align-self: center; width: 100%; }
+}
+/* Text columns shrink to their paragraph, so a right-aligned button sits at the paragraph's edge when stacked. */
+.lead-row { width: fit-content; max-width: 100%; }
+.op1-grid h2 { font-size: clamp(28px, 3.6vw, 40px); }
+.pack-fig { margin: 0; display: grid; gap: 12px; justify-items: center; width: 100%; max-width: 560px; justify-self: center; }
+.pack { position: relative; width: calc(100% - 4px); max-width: 556px; aspect-ratio: 1; box-sizing: content-box; border: 2px solid var(--ink); border-radius: 4px; }
+.pack-in { position: absolute; inset: 0.387%; }
+.pack .mini { position: absolute; width: 25.792%; aspect-ratio: 1; transform: translate(-50%, -50%) rotate(var(--a)) scale(.97); cursor: pointer; }
+.pack .mini .board { box-shadow: 0 0 0 1px var(--paper); border-radius: 1px; }
+.pack .mini .coord { display: none; }
+.pack .mini.rec::after { content: ""; position: absolute; inset: 0; border: 3px solid var(--accent); border-radius: 1px; z-index: 3; pointer-events: none; }
+.pack .mini:hover, .pack .mini:focus-visible, .pack .mini.sel { z-index: 2; }
+.pack .mini:hover .board, .pack .mini:focus-visible .board, .pack .mini.sel .board { outline: 2px solid var(--ink); outline-offset: 1px; }
+.pack .mini:focus-visible { outline: none; }
+.pack-read { font-size: 14px; color: var(--muted); text-align: center; min-height: 1.6em; max-width: 64ch; }
+.pack-read b { color: var(--ink); font-family: var(--mono); }
+.pack-read .plus { color: var(--accent); font-weight: 700; }
+/* Same columns as the record section above: text under the board's 440px column, puzzle across the story column. */
+.proof-grid { display: grid; grid-template-columns: minmax(0, 440px) minmax(0, 1fr); gap: 32px 48px; align-items: center; }
+.lead-row { display: flex; flex-direction: column; align-items: flex-start; gap: 20px; min-width: 0; }
+.lead-row p { max-width: 64ch; color: var(--muted); font-size: 18px; margin: 0; }
+.puzzle-fig { margin: 0; min-width: 0; width: 100%; max-width: 720px; justify-self: center; }
+.puzzle { display: block; width: 100%; height: auto; overflow: visible; }
+@media (max-width: 1024px) {
+  .proof-grid { grid-template-columns: minmax(0, 1fr); }
+  .pack-fig { justify-self: center; }
+}
+/* Same columns as the sections below (440px text, 48px gap); the card sits on the right edge. */
+@media (max-width: 1024px) {
+  .wn-hero { grid-template-columns: minmax(0, 1fr); gap: 32px; padding-block: 40px 48px; }
+  .wn-hero h1 { font-size: clamp(38px, 5.4vw, 66px); }
+  .wn-hero .lede { font-size: 18px; max-width: 64ch; }
+  .field-card { justify-self: center; }
+}
+/* Stacked, the puzzle keeps its widest side-by-side size: the 1080px column less the 440px text column and the 48px gap. */
+@media (max-width: 1150px) {
+  .puzzle-fig { max-width: calc(1080px - 440px - 48px); }
+}
+.pz-narrow { display: none; }
+.pz-wide .pz-t { font-size: 26px; }
+.pz-wide .pz-s { font-size: 16px; }
+@media (max-width: 560px) {
+  .pz-wide { display: none; }
+  .pz-narrow { display: block; max-width: 360px; margin-inline: auto; }
+}
+.kicker { text-wrap: balance; }
+.big.rec span, .big.rec em { display: block; text-wrap: balance; }
+.pz path { stroke: var(--ink); stroke-width: 1.5; stroke-linejoin: round; }
+.pz.a path { fill: var(--panel); }
+.pz.b path { fill: var(--cell); }
+.pz-t { font-family: var(--display); font-size: 20px; fill: var(--ink); }
+.pz-s { font-family: var(--body); font-size: 13px; fill: var(--muted); }
+.pz.next path { fill: none; stroke: var(--accent); stroke-dasharray: 6 5; }
+.pz.next .pz-t { fill: var(--accent); }
+.wn-sec > p code, .lead-row p code { font-family: var(--mono); font-size: .88em; color: var(--ink); background: var(--panel); border: 1px solid var(--rule); border-radius: 5px; padding: 1px 5px; }
+.prompt { display: grid; gap: 10px; min-width: 0; width: 100%; max-width: 720px; justify-self: center; padding: 18px 20px; border: 1px solid var(--rule); border-radius: 12px; background: var(--panel); }
+.prompt pre { min-width: 0; margin: 0; white-space: pre-wrap; text-wrap: balance; overflow-wrap: anywhere; font-family: var(--mono); font-size: 14px; line-height: 1.6; color: var(--ink); }
+.prompt .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.prompt .label { font-size: 13px; color: var(--muted); }
+.copy-btn { font: inherit; font-size: 13px; font-weight: 600; padding: 6px 13px; border-radius: 999px; border: 1px solid var(--rule); background: var(--paper); color: var(--ink); cursor: pointer; }
+.copy-btn:hover { background: color-mix(in srgb, var(--ink) 6%, var(--panel)); border-color: color-mix(in srgb, var(--ink) 22%, var(--rule)); }
+@media (max-width: 860px) {
+  .proof-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 480px) {
+  .readout .v { font-size: 18px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="./">Chess<span>TB</span></a>
+    <nav aria-label="Site">
+      <a href="./">Home</a>
+      <a href="whatsnew.html" aria-current="page">What's new</a>
+      <a href="stats.html">Statistics</a>
+      <a href="https://chesstb-explorer.hf.space/">Explorer</a>
+      <a href="https://github.com/noobpwnftw/chesstb">GitHub</a>
+    </nav>
+  </header>
+
+  <section class="wn-hero" aria-labelledby="hero-title">
+    <div>
+      <div class="eyebrow">What's new · 8 pieces</div>
+      <h1 id="hero-title" style="margin-top:14px"><span class="l">1.3% solved.</span> <em class="l">98.7% waiting on storage.</em></h1>
+      <p class="lede">An integrated pipeline builds and probes every supported metric up to 8 pieces, starting with the 1.3% that fits on a workstation today.</p>
+    </div>
+
+    <div class="field-card" aria-labelledby="proj-title">
+      <div class="proj-head"><h2 id="proj-title">The remaining 98.7%, projected</h2><span>Drag the year</span></div>
+      <div class="field" id="field"></div>
+      <div class="legend-row" aria-hidden="true">
+        <span><b style="background: var(--accent)"></b>Solved</span>
+        <span><b style="background: var(--lit)"></b>Feasible by then</span>
+        <span><b style="background: var(--cell)"></b>Not yet</span>
+      </div>
+      <input type="range" id="year" min="2026" max="2045" value="2026" step="1" aria-label="Year">
+      <div class="readout" aria-live="polite">
+        <div><span class="v" id="r-year">2026</span><span class="k">year</span></div>
+        <div><span class="v" id="r-budget">13 TiB</span><span class="k">storage budget</span></div>
+        <div><span class="v" id="r-share">1.3%</span><span class="k">of the <span class="nw">8-piece</span> space</span></div>
+      </div>
+      <div class="assume" role="group" aria-label="Storage doubling period">
+        Storage per dollar doubles every
+        <div class="seg">
+          <button type="button" data-t="2" aria-pressed="false">2 years</button>
+          <button type="button" data-t="3" aria-pressed="true">3 years</button>
+          <button type="button" data-t="4" aria-pressed="false">4 years</button>
+        </div>
+      </div>
+      <p class="field-note"><strong>Full <span class="nw">8-piece</span> coverage is seven doublings away.</strong></p>
+      <p class="field-foot">Sizes are projected from existing WDL and DTZ tables.</p>
+    </div>
+  </section>
+
+  <section class="wn-sec" id="op1" aria-labelledby="op1-title">
+    <div class="kicker">That is load-bearing.</div>
+    <div class="proof-grid op1-grid">
+      <div class="lead-row">
+        <h2 id="op1-title">All of 8-piece Op1, castling included.</h2>
+        <p>Every <span class="nw">8-piece</span> endgame with at least one pair of opposing pawns blocking each other on a file. This partial domain makes up a meaningful slice of the <span class="nw">8-piece</span> space, now with exact results at every halfmove clock.</p>
+        <a class="pill-btn" href="stats.html"><svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><rect x="1.5" y="8.5" width="3" height="6" rx=".6"/><rect x="6.5" y="4.5" width="3" height="10" rx=".6"/><rect x="11.5" y="1.5" width="3" height="13" rx=".6"/></svg>Tablebase statistics</a>
+      </div>
+      <figure class="pack-fig">
+        <div class="pack" id="pack"></div>
+      <figcaption class="pack-read" id="pack-read">Top 10<span class="plus">+1</span> longest wins of <span class="nw">8-piece</span> Op1</figcaption>
+        </figure>
+    </div>
+
+    <div class="pair">
+      <div class="board-col">
+        <div class="board-wrap" id="b-record"></div>
+        <div class="board-caption"><span>KRBBpKQp · White to move</span><span class="fen">R7/8/8/8/7q/2K1B2p/7P/2Bk4 w - - 0 1</span><a class="explore" href="https://chesstb-explorer.hf.space/#fen=R7%2F8%2F8%2F8%2F7q%2F2K1B2p%2F7P%2F2Bk4%20w%20-%20-%200%201" target="_blank" rel="noopener">Open in explorer</a></div>
+      </div>
+      <div class="story">
+        <div class="mat">A NEW RECORD</div>
+        <p class="big rec"><span>597 moves.</span> <em>The longest DTZ ever computed.</em></p>
+        <p>The longest <span class="nw">7-piece</span> win takes 517 moves to its first zeroing move. At eight pieces, with a pair of blocked pawns, the longest win reaches 597 moves, far beyond the 50-move limit.</p>
+        <div class="stat-strip">
+          <div><span class="v">597</span><span class="k">moves to zeroing, rule aware, new record</span></div>
+          <div><span class="v">517</span><span class="k">moves to zeroing, rule aware, <span class="nw">7-piece</span> record</span></div>
+          <div><span class="v">+80</span><span class="k">moves beyond the <span class="nw">7-piece</span> record</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="wn-sec" id="proof" aria-labelledby="proof-title">
+    <div class="kicker">You're absolutely right!</div>
+    <h2 id="proof-title">One written proof covers every layer.</h2>
+    <div class="proof-grid">
+    <div class="lead-row">
+      <p>The written proof covers the full path from generation to probing. As coverage expands, the same algorithms and correctness guarantees apply.</p>
+      <a class="link-card proof-card" href="https://github.com/noobpwnftw/chesstb/blob/master/CORRECTNESS.md" target="_blank" rel="noopener"><span class="k">Read the proof</span><span class="v">Correctness</span></a>
+    </div>
+    <figure class="puzzle-fig"><svg class="puzzle pz-wide" viewBox="0 0 712 252" aria-hidden="true"><g class="pz a"><path d="M18,2 L238,2 L238.0,34.0 C238.0,42.0 246.0,46.0 252.0,42.0 C262.0,36.0 270.0,44.0 270.0,64.0 C270.0,84.0 262.0,92.0 252.0,86.0 C246.0,82.0 238.0,86.0 238.0,94.0 L238,126 L150.0,126.0 C142.0,126.0 138.0,118.0 142.0,112.0 C148.0,102.0 140.0,94.0 120.0,94.0 C100.0,94.0 92.0,102.0 98.0,112.0 C102.0,118.0 98.0,126.0 90.0,126.0 L2,126 L2,18 A16,16 0 0 1 18,2 Z"/><text class="pz-t" x="120.0" y="71.0" text-anchor="middle">Indexing</text></g><g class="pz b"><path d="M238,2 L474,2 L474.0,34.0 C474.0,42.0 466.0,46.0 460.0,42.0 C450.0,36.0 442.0,44.0 442.0,64.0 C442.0,84.0 450.0,92.0 460.0,86.0 C466.0,82.0 474.0,86.0 474.0,94.0 L474,126 L386.0,126.0 C378.0,126.0 374.0,134.0 378.0,140.0 C384.0,150.0 376.0,158.0 356.0,158.0 C336.0,158.0 328.0,150.0 334.0,140.0 C338.0,134.0 334.0,126.0 326.0,126.0 L238,126 L238.0,94.0 C238.0,86.0 246.0,82.0 252.0,86.0 C262.0,92.0 270.0,84.0 270.0,64.0 C270.0,44.0 262.0,36.0 252.0,42.0 C246.0,46.0 238.0,42.0 238.0,34.0 L238,2 Z"/><text class="pz-t" x="356.0" y="71.0" text-anchor="middle">Metrics</text></g><g class="pz a"><path d="M474,2 L694,2 A16,16 0 0 1 710,18 L710,126 L622.0,126.0 C614.0,126.0 610.0,118.0 614.0,112.0 C620.0,102.0 612.0,94.0 592.0,94.0 C572.0,94.0 564.0,102.0 570.0,112.0 C574.0,118.0 570.0,126.0 562.0,126.0 L474,126 L474.0,94.0 C474.0,86.0 466.0,82.0 460.0,86.0 C450.0,92.0 442.0,84.0 442.0,64.0 C442.0,44.0 450.0,36.0 460.0,42.0 C466.0,46.0 474.0,42.0 474.0,34.0 L474,2 Z"/><text class="pz-t" x="592.0" y="71.0" text-anchor="middle">Compression</text></g><g class="pz b"><path d="M2,126 L90.0,126.0 C98.0,126.0 102.0,118.0 98.0,112.0 C92.0,102.0 100.0,94.0 120.0,94.0 C140.0,94.0 148.0,102.0 142.0,112.0 C138.0,118.0 142.0,126.0 150.0,126.0 L238,126 L238.0,158.0 C238.0,166.0 246.0,170.0 252.0,166.0 C262.0,160.0 270.0,168.0 270.0,188.0 C270.0,208.0 262.0,216.0 252.0,210.0 C246.0,206.0 238.0,210.0 238.0,218.0 L238,250 L18,250 A16,16 0 0 1 2,234 L2,126 Z"/><text class="pz-t" x="120.0" y="195.0" text-anchor="middle">File format</text></g><g class="pz a"><path d="M238,126 L326.0,126.0 C334.0,126.0 338.0,134.0 334.0,140.0 C328.0,150.0 336.0,158.0 356.0,158.0 C376.0,158.0 384.0,150.0 378.0,140.0 C374.0,134.0 378.0,126.0 386.0,126.0 L474,126 L474.0,158.0 C474.0,166.0 466.0,170.0 460.0,166.0 C450.0,160.0 442.0,168.0 442.0,188.0 C442.0,208.0 450.0,216.0 460.0,210.0 C466.0,206.0 474.0,210.0 474.0,218.0 L474,250 L238,250 L238.0,218.0 C238.0,210.0 246.0,206.0 252.0,210.0 C262.0,216.0 270.0,208.0 270.0,188.0 C270.0,168.0 262.0,160.0 252.0,166.0 C246.0,170.0 238.0,166.0 238.0,158.0 L238,126 Z"/><text class="pz-t" x="356.0" y="195.0" text-anchor="middle">Probing</text></g><g class="pz next"><path d="M474,126 L562.0,126.0 C570.0,126.0 574.0,118.0 570.0,112.0 C564.0,102.0 572.0,94.0 592.0,94.0 C612.0,94.0 620.0,102.0 614.0,112.0 C610.0,118.0 614.0,126.0 622.0,126.0 L710,126 L710,234 A16,16 0 0 1 694,250 L474,250 L474.0,218.0 C474.0,210.0 466.0,206.0 460.0,210.0 C450.0,216.0 442.0,208.0 442.0,188.0 C442.0,168.0 450.0,160.0 460.0,166.0 C466.0,170.0 474.0,166.0 474.0,158.0 L474,126 Z"/><text class="pz-t" x="592.0" y="184.0" text-anchor="middle">Coverage</text><text class="pz-s" x="592.0" y="210.0" text-anchor="middle">Full 8-piece and more</text></g></svg><svg class="puzzle pz-narrow" viewBox="0 0 404 334" aria-hidden="true"><g class="pz a"><path d="M18,2 L202,2 L202.0,27.0 C202.0,35.0 210.0,39.0 216.0,35.0 C226.0,29.0 234.0,37.0 234.0,57.0 C234.0,77.0 226.0,85.0 216.0,79.0 C210.0,75.0 202.0,79.0 202.0,87.0 L202,112 L132.0,112.0 C124.0,112.0 120.0,104.0 124.0,98.0 C130.0,88.0 122.0,80.0 102.0,80.0 C82.0,80.0 74.0,88.0 80.0,98.0 C84.0,104.0 80.0,112.0 72.0,112.0 L2,112 L2,18 A16,16 0 0 1 18,2 Z"/><text class="pz-t" x="102.0" y="64.0" text-anchor="middle">Indexing</text></g><g class="pz b"><path d="M202,2 L386,2 A16,16 0 0 1 402,18 L402,112 L332.0,112.0 C324.0,112.0 320.0,120.0 324.0,126.0 C330.0,136.0 322.0,144.0 302.0,144.0 C282.0,144.0 274.0,136.0 280.0,126.0 C284.0,120.0 280.0,112.0 272.0,112.0 L202,112 L202.0,87.0 C202.0,79.0 210.0,75.0 216.0,79.0 C226.0,85.0 234.0,77.0 234.0,57.0 C234.0,37.0 226.0,29.0 216.0,35.0 C210.0,39.0 202.0,35.0 202.0,27.0 L202,2 Z"/><text class="pz-t" x="302.0" y="64.0" text-anchor="middle">Metrics</text></g><g class="pz b"><path d="M2,112 L72.0,112.0 C80.0,112.0 84.0,104.0 80.0,98.0 C74.0,88.0 82.0,80.0 102.0,80.0 C122.0,80.0 130.0,88.0 124.0,98.0 C120.0,104.0 124.0,112.0 132.0,112.0 L202,112 L202.0,137.0 C202.0,145.0 194.0,149.0 188.0,145.0 C178.0,139.0 170.0,147.0 170.0,167.0 C170.0,187.0 178.0,195.0 188.0,189.0 C194.0,185.0 202.0,189.0 202.0,197.0 L202,222 L132.0,222.0 C124.0,222.0 120.0,230.0 124.0,236.0 C130.0,246.0 122.0,254.0 102.0,254.0 C82.0,254.0 74.0,246.0 80.0,236.0 C84.0,230.0 80.0,222.0 72.0,222.0 L2,222 L2,112 Z"/><text class="pz-t" x="102.0" y="174.0" text-anchor="middle">Compression</text></g><g class="pz a"><path d="M202,112 L272.0,112.0 C280.0,112.0 284.0,120.0 280.0,126.0 C274.0,136.0 282.0,144.0 302.0,144.0 C322.0,144.0 330.0,136.0 324.0,126.0 C320.0,120.0 324.0,112.0 332.0,112.0 L402,112 L402,222 L332.0,222.0 C324.0,222.0 320.0,214.0 324.0,208.0 C330.0,198.0 322.0,190.0 302.0,190.0 C282.0,190.0 274.0,198.0 280.0,208.0 C284.0,214.0 280.0,222.0 272.0,222.0 L202,222 L202.0,197.0 C202.0,189.0 194.0,185.0 188.0,189.0 C178.0,195.0 170.0,187.0 170.0,167.0 C170.0,147.0 178.0,139.0 188.0,145.0 C194.0,149.0 202.0,145.0 202.0,137.0 L202,112 Z"/><text class="pz-t" x="302.0" y="174.0" text-anchor="middle">File format</text></g><g class="pz a"><path d="M2,222 L72.0,222.0 C80.0,222.0 84.0,230.0 80.0,236.0 C74.0,246.0 82.0,254.0 102.0,254.0 C122.0,254.0 130.0,246.0 124.0,236.0 C120.0,230.0 124.0,222.0 132.0,222.0 L202,222 L202.0,247.0 C202.0,255.0 194.0,259.0 188.0,255.0 C178.0,249.0 170.0,257.0 170.0,277.0 C170.0,297.0 178.0,305.0 188.0,299.0 C194.0,295.0 202.0,299.0 202.0,307.0 L202,332 L18,332 A16,16 0 0 1 2,316 L2,222 Z"/><text class="pz-t" x="102.0" y="284.0" text-anchor="middle">Probing</text></g><g class="pz next"><path d="M202,222 L272.0,222.0 C280.0,222.0 284.0,214.0 280.0,208.0 C274.0,198.0 282.0,190.0 302.0,190.0 C322.0,190.0 330.0,198.0 324.0,208.0 C320.0,214.0 324.0,222.0 332.0,222.0 L402,222 L402,316 A16,16 0 0 1 386,332 L202,332 L202.0,307.0 C202.0,299.0 194.0,295.0 188.0,299.0 C178.0,305.0 170.0,297.0 170.0,277.0 C170.0,257.0 178.0,249.0 188.0,255.0 C194.0,259.0 202.0,255.0 202.0,247.0 L202,222 Z"/><text class="pz-t" x="302.0" y="273.0" text-anchor="middle">Coverage</text><text class="pz-s" x="302.0" y="299.0" text-anchor="middle">Full 8-piece and more</text></g></svg></figure>
+    </div>
+    <h2 class="cert"><span>Tablebases promise certainty.</span> <span>That certainty is now <em>delivered</em>.</span></h2>
+    <p class="cert"><span>A proof shows the method is correct.</span> <span>ChessTB ships the tools for independent verification.</span></p>
+    <div class="verify">
+      <figure><svg viewBox="0 0 240 150" aria-hidden="true"><text class="vd-lab" x="61" y="28" text-anchor="middle">A</text><text class="vd-lab" x="179" y="28" text-anchor="middle">B</text><rect class="vd-w" x="14" y="40" width="14" height="14" rx="2"/><rect class="vd-w" x="30" y="40" width="14" height="14" rx="2"/><rect class="vd-d" x="46" y="40" width="14" height="14" rx="2"/><rect class="vd-w" x="62" y="40" width="14" height="14" rx="2"/><rect class="vd-l" x="78" y="40" width="14" height="14" rx="2"/><rect class="vd-w" x="94" y="40" width="14" height="14" rx="2"/><rect class="vd-w" x="14" y="56" width="14" height="14" rx="2"/><rect class="vd-d" x="30" y="56" width="14" height="14" rx="2"/><rect class="vd-d" x="46" y="56" width="14" height="14" rx="2"/><rect class="vd-w" x="62" y="56" width="14" height="14" rx="2"/><rect class="vd-w" x="78" y="56" width="14" height="14" rx="2"/><rect class="vd-l" x="94" y="56" width="14" height="14" rx="2"/><rect class="vd-d" x="14" y="72" width="14" height="14" rx="2"/><rect class="vd-w" x="30" y="72" width="14" height="14" rx="2"/><rect class="vd-w" x="46" y="72" width="14" height="14" rx="2"/><rect class="vd-l" x="62" y="72" width="14" height="14" rx="2"/><rect class="vd-w" x="78" y="72" width="14" height="14" rx="2"/><rect class="vd-d" x="94" y="72" width="14" height="14" rx="2"/><rect class="vd-w" x="14" y="88" width="14" height="14" rx="2"/><rect class="vd-w" x="30" y="88" width="14" height="14" rx="2"/><rect class="vd-l" x="46" y="88" width="14" height="14" rx="2"/><rect class="vd-d" x="62" y="88" width="14" height="14" rx="2"/><rect class="vd-w" x="78" y="88" width="14" height="14" rx="2"/><rect class="vd-w" x="94" y="88" width="14" height="14" rx="2"/><rect class="vd-l" x="14" y="104" width="14" height="14" rx="2"/><rect class="vd-w" x="30" y="104" width="14" height="14" rx="2"/><rect class="vd-d" x="46" y="104" width="14" height="14" rx="2"/><rect class="vd-w" x="62" y="104" width="14" height="14" rx="2"/><rect class="vd-d" x="78" y="104" width="14" height="14" rx="2"/><rect class="vd-w" x="94" y="104" width="14" height="14" rx="2"/><rect class="vd-w" x="132" y="40" width="14" height="14" rx="2"/><rect class="vd-w" x="148" y="40" width="14" height="14" rx="2"/><rect class="vd-d" x="164" y="40" width="14" height="14" rx="2"/><rect class="vd-w" x="180" y="40" width="14" height="14" rx="2"/><rect class="vd-l" x="196" y="40" width="14" height="14" rx="2"/><rect class="vd-w" x="212" y="40" width="14" height="14" rx="2"/><rect class="vd-w" x="132" y="56" width="14" height="14" rx="2"/><rect class="vd-d" x="148" y="56" width="14" height="14" rx="2"/><rect class="vd-d" x="164" y="56" width="14" height="14" rx="2"/><rect class="vd-w" x="180" y="56" width="14" height="14" rx="2"/><rect class="vd-w" x="196" y="56" width="14" height="14" rx="2"/><rect class="vd-l" x="212" y="56" width="14" height="14" rx="2"/><rect class="vd-d" x="132" y="72" width="14" height="14" rx="2"/><rect class="vd-w" x="148" y="72" width="14" height="14" rx="2"/><rect class="vd-w" x="164" y="72" width="14" height="14" rx="2"/><rect class="vd-l" x="180" y="72" width="14" height="14" rx="2"/><rect class="vd-w" x="196" y="72" width="14" height="14" rx="2"/><rect class="vd-d" x="212" y="72" width="14" height="14" rx="2"/><rect class="vd-w" x="132" y="88" width="14" height="14" rx="2"/><rect class="vd-w" x="148" y="88" width="14" height="14" rx="2"/><rect class="vd-l" x="164" y="88" width="14" height="14" rx="2"/><rect class="vd-d" x="180" y="88" width="14" height="14" rx="2"/><rect class="vd-w" x="196" y="88" width="14" height="14" rx="2"/><rect class="vd-w" x="212" y="88" width="14" height="14" rx="2"/><rect class="vd-l" x="132" y="104" width="14" height="14" rx="2"/><rect class="vd-w" x="148" y="104" width="14" height="14" rx="2"/><rect class="vd-d" x="164" y="104" width="14" height="14" rx="2"/><rect class="vd-w" x="180" y="104" width="14" height="14" rx="2"/><rect class="vd-d" x="196" y="104" width="14" height="14" rx="2"/><rect class="vd-w" x="212" y="104" width="14" height="14" rx="2"/><text class="vd-eq" x="120" y="88" text-anchor="middle">=</text><g class="vd-ok"><circle cx="120" cy="132" r="11"/><path d="M115 132 l3.5 3.5 6.5 -7"/></g></svg><figcaption><b>Compare</b>Every classification is checked against an independent source.</figcaption></figure>
+      <figure><svg viewBox="0 0 240 150" aria-hidden="true"><rect class="vd-box" x="80" y="10" width="80" height="42" rx="6"/><text class="vd-lab" x="120.0" y="25" text-anchor="middle">DTZ</text><text class="vd-val" x="120.0" y="43" text-anchor="middle">17</text><rect class="vd-box" x="14" y="98" width="92" height="42" rx="6"/><text class="vd-lab" x="60.0" y="113" text-anchor="middle">via DTM50</text><text class="vd-val" x="60.0" y="131" text-anchor="middle">17</text><rect class="vd-box" x="134" y="98" width="92" height="42" rx="6"/><text class="vd-lab" x="180.0" y="113" text-anchor="middle">via DTC</text><text class="vd-val" x="180.0" y="131" text-anchor="middle">17</text><path class="vd-agree" d="M60 98 L104 52 M180 98 L136 52"/><g class="vd-ok"><circle cx="120" cy="80" r="11"/><path d="M115 80 l3.5 3.5 6.5 -7"/></g></svg><figcaption><b>Check</b>Every metric holds its invariants, and the 50-move rule binds them.</figcaption></figure>
+      <figure><svg viewBox="0 0 240 150" aria-hidden="true"><rect class="vd-box" x="70" y="10" width="100" height="32" rx="6"/><text class="vd-val" x="120" y="31" text-anchor="middle">Win in 19</text><g class="vd-ok"><circle cx="194" cy="26" r="11"/><path d="M189 26 l3.5 3.5 6.5 -7"/></g><path class="vd-line" d="M120 42 L120 110 M120 42 L196 110"/><path class="vd-line vd-best" d="M120 42 L44 110"/><rect class="vd-box vd-boxbest" x="6" y="110" width="76" height="30" rx="6"/><text class="vd-val vd-sm" x="44.0" y="130" text-anchor="middle">Loss in 18</text><rect class="vd-box" x="86" y="110" width="68" height="30" rx="6"/><text class="vd-val vd-sm" x="120.0" y="130" text-anchor="middle">Draw</text><rect class="vd-box" x="158" y="110" width="76" height="30" rx="6"/><text class="vd-val vd-sm" x="196.0" y="130" text-anchor="middle">Win in 23</text></svg><figcaption><b>Compute</b>Every value is reconstructed to prove the table is a fixed point.</figcaption></figure>
+    </div>
+  </section>
+
+  <section class="wn-sec" id="integrate" aria-labelledby="int-title">
+    <div class="kicker">We're AI-first.</div>
+    <h2 id="int-title">A straightforward path to integrations.</h2>
+    <div class="proof-grid">
+      <div class="lead-row">
+        <p>Clear names, focused modules and a standalone probing library give your agent a direct path into the code. The documented formats and written proof explain how the pieces fit together. Point it here and tell it what you want to build.</p>
+      </div>
+      <div class="prompt">
+        <div class="row"><span class="label">Paste into your coding assistant</span><button class="copy-btn" type="button" id="copy-prompt">Copy</button></div>
+        <pre id="prompt-text">Add ChessTB endgame tablebase probing to this project. The file format is specified in README.md, the probing API in src/probe/probe.h, and the correctness proof in CORRECTNESS.md, all at github.com/noobpwnftw/chesstb. Make no mistakes.</pre>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script src="board.js"></script>
+<script>
+(function () {
+  var render = window.renderBoard;
+
+  // Packed boards: [key, centre x, centre y, tilt, material, longest win in moves, FEN] in Walter Trump's 11-square packing (side 3.8772, tilt 40.182 deg), turned 180 deg so the record sits on top.
+  // Rank order: the record in the top tilted square, then the tilted squares spiralling inward clockwise, then the edge squares clockwise from the top left.
+  var PACK = [["bell",0.60381,0.18173,40.182,"KRBBpKQp",597,"R7/8/8/8/7q/2K1B2p/7P/2Bk4 w - - 0 1"],["9",0.37159,0.3232,40.182,"KRBpKBNp",445,"8/8/1R1p4/b2P4/n1B5/2k5/8/K7 w - - 0 1"],["6",0.56447,0.49459,40.182,"KRRpKRBp",301,"8/8/8/5b2/K2k2r1/7p/6RP/2R5 w - - 0 1"],["5",0.37459,0.67182,40.182,"KRBpKBBp",273,"8/1b3p2/5P2/BK3R2/3k4/b7/8/8 w - - 0 1"],["8",0.18173,0.50045,40.182,"KRBNpKQp",248,"7R/7p/B6P/2K5/7q/8/4N3/5k2 w - - 0 1"],["0",0.12896,0.12896,0,"KRNpKBBp",248,"3b4/1k6/p7/PK3b2/1R6/8/1N6/8 w - - 0 1"],["7",0.87104,0.34684,0,"KRNpKNNp",224,"8/8/3p4/3P3k/6R1/1n6/5n2/NK6 w - - 0 1"],["4",0.87104,0.61311,0,"KRRBpKQp",222,"1q3k2/Bp6/1PK5/1R6/8/8/R7/8 w - - 0 1"],["1",0.87093,0.87103,0,"KBBNpKQp",218,"4q3/8/k2p4/8/8/3P4/2N5/B1K2B2 w - - 0 1"],["2",0.61301,0.87104,0,"KBNNpKQp",215,"8/8/3k4/8/2p5/2PN4/5N2/KB4q1 w - - 0 1"],["3",0.12896,0.87104,0,"KNNNpKQp",205,"8/8/1p5N/1Pq5/8/2N5/2K5/4k1N1 w - - 0 1"]];
+  (function () {
+    var frame = document.getElementById("pack"), read = document.getElementById("pack-read"), idle = read.innerHTML;
+    // Boards draw at 97% of their slot (a 3% gap between neighbours); the inner inset adds the same gap at the frame.
+    var box = document.createElement("div");
+    box.className = "pack-in";
+    frame.appendChild(box);
+    PACK.forEach(function (p, i) {
+      var el = document.createElement("div");
+      el.className = "mini" + (i === 0 ? " rec" : "");
+      el.id = "mini-" + i;
+      el.tabIndex = 0;
+      el.setAttribute("role", "link");
+      el.setAttribute("aria-label", p[4] + ", " + p[5] + " moves");
+      el.style.left = (p[1] * 100) + "%"; el.style.top = (p[2] * 100) + "%"; el.style.setProperty("--a", p[3] + "deg");
+      box.appendChild(el);
+      render(el.id, p[6], { label: p[4] + ", longest win " + p[5] + " moves" });
+      function show() {
+        box.querySelectorAll(".sel").forEach(function (b) { b.classList.remove("sel"); });
+        el.classList.add("sel");
+        read.innerHTML = "<b>" + p[4] + "</b> · <b>" + p[5] + "</b> moves" + (i === 0 ? ", the record" : "");
+      }
+      ["mouseenter", "focus"].forEach(function (ev) { el.addEventListener(ev, show); });
+      // Clicking (or Enter) opens the position in the explorer.
+      function open() { window.open("https://chesstb-explorer.hf.space/#fen=" + encodeURIComponent(p[6]), "_blank", "noopener"); }
+      el.addEventListener("click", open);
+      el.addEventListener("keydown", function (e) { if (e.key === "Enter") open(); });
+      // Leaving a board clears the caption, including into the gaps between boards; entering the next board shows it again.
+      el.addEventListener("mouseleave", function () { if (document.activeElement === el) el.blur(); clear(); });
+    });
+    function clear() { box.querySelectorAll(".sel").forEach(function (b) { b.classList.remove("sel"); }); read.innerHTML = idle; }
+    box.addEventListener("focusout", function (e) { if (!box.contains(e.relatedTarget)) clear(); });
+  })();
+  render("b-record", "R7/8/8/8/7q/2K1B2p/7P/2Bk4 w", { arrows: [["a8", "f8", "cursed"]], label: "KRBBpKQp, the record position: Rf8 is the only move that does not draw, 597 moves to the next zeroing move, a cursed win under the 50-move rule." });
+
+  // Storage model: Op1 (with castling) fits today; budget doubles every T years.
+  // Op1 with castling measured at 13.4 TiB in the bucket (WDL 5.66, DTZ 7.33, castling 0.43); all of 8 pieces ≈ 100× that (about 1.3 PiB, seven doublings).
+  var BASE_YEAR = 2026, OP1_TIB = 13, FULL_TIB = OP1_TIB * 100, OP1_SHARE = 0.01288, CELLS = 1000;
+  var T = 3;
+  var field = document.getElementById("field");
+  for (var i = 0; i < CELLS; i++) field.appendChild(document.createElement("i"));
+  var cells = field.children, op1Cells = Math.round(OP1_SHARE * CELLS);
+  function fmtTiB(t) { return t >= 1024 ? (t / 1024).toFixed(t >= 10240 ? 0 : 1) + " PiB" : Math.round(t) + " TiB"; }
+  // One update per animation frame, touching only cells whose state changed, so fast drags stay smooth.
+  var state = [], queued = false;
+  function schedule() { if (!queued) { queued = true; requestAnimationFrame(update); } }
+  function update() {
+    queued = false;
+    var y = +document.getElementById("year").value;
+    var budget = OP1_TIB * Math.pow(2, (y - BASE_YEAR) / T);
+    var frac = Math.min(1, Math.max(0, (budget - OP1_TIB) / (FULL_TIB - OP1_TIB)));
+    var share = OP1_SHARE + (1 - OP1_SHARE) * frac;
+    var lit = Math.round(share * CELLS);
+    for (var i = 0; i < CELLS; i++) {
+      var c = i < op1Cells ? "op1" : i < lit ? "lit" : "";
+      if (state[i] !== c) { cells[i].className = c; state[i] = c; }
+    }
+    document.getElementById("r-year").textContent = y;
+    document.getElementById("r-budget").textContent = fmtTiB(Math.min(budget, FULL_TIB));
+    document.getElementById("r-share").textContent = share >= 1 ? "100%" : (share * 100).toFixed(share < 0.1 ? 1 : 0) + "%";
+  }
+  // The track ends in the year all of 8 pieces fits, for the chosen doubling period.
+  function setRange() {
+    var input = document.getElementById("year");
+    var end = Math.ceil(BASE_YEAR + T * Math.log2(FULL_TIB / OP1_TIB));
+    input.max = end;
+    if (+input.value > end) input.value = end;
+  }
+  document.getElementById("year").addEventListener("input", schedule);
+  document.querySelectorAll("[data-t]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      T = +b.dataset.t;
+      setRange();
+      document.querySelectorAll("[data-t]").forEach(function (x) { x.setAttribute("aria-pressed", x === b ? "true" : "false"); });
+      update();
+    });
+  });
+  setRange();
+  update();
+
+  document.getElementById("copy-prompt").addEventListener("click", function () {
+    var btn = this, pre = document.getElementById("prompt-text");
+    function selectIt() { var r = document.createRange(); r.selectNodeContents(pre); var s = getSelection(); s.removeAllRanges(); s.addRange(r); btn.textContent = "Selected"; }
+    try { navigator.clipboard.writeText(pre.textContent).then(function () { btn.textContent = "Copied"; }, selectIt); } catch (e) { selectIt(); }
+    setTimeout(function () { btn.textContent = "Copy"; }, 1800);
+  });
+})();
+</script>
+</body>
+</html>
