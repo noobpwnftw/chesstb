@@ -1,0 +1,71 @@
+/* Shared by every ChessTB page: theme tokens, base type, top bar and the common controls.
+   Page-specific tokens (board squares, result colours, bar colours) stay in each page. */
+:root {
+  --paper: #FAFAFA;
+  --panel: #F0F0F0;
+  --ink: #1F1E1C;
+  --muted: #6B6862;
+  --rule: #E2E2E2;
+  --accent: #2343B8;
+  --accent-soft: #DCE2F7;
+  --display: "Gloock", "Georgia", "Times New Roman", serif;
+  --body: "Public Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  /* External-link glyph, drawn with mask so it takes the text colour. */
+  --ext-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='1.8 1.1 9.1 9.1'%3E%3Cpath d='M5.5 2.5H3.2a.7.7 0 0 0-.7.7v5.6a.7.7 0 0 0 .7.7h5.6a.7.7 0 0 0 .7-.7V6.5M7 1.8h3.2V5M10 2 5.6 6.4' fill='none' stroke='black' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  color-scheme: light;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #141414; --panel: #1E1E1E; --ink: #ECECEC; --muted: #A3A3A3; --rule: #2E2E2E;
+    --accent: #8EA6FF; --accent-soft: #1E2847;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #141414; --panel: #1E1E1E; --ink: #ECECEC; --muted: #A3A3A3; --rule: #2E2E2E;
+  --accent: #8EA6FF; --accent-soft: #1E2847;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+html { scrollbar-gutter: stable; }
+body { background: var(--paper); color: var(--ink); font-family: var(--body); padding-inline: 20px; }
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+.wrap { max-width: 1240px; margin: 0 auto; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+.nw { white-space: nowrap; }
+
+/* top bar */
+.top { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding-block: 22px; border-bottom: 1px solid var(--rule); line-height: 24px; }
+.brand { font-family: var(--mono); font-weight: 700; font-size: 15px; color: var(--ink); text-decoration: none; }
+.brand span { color: var(--accent); }
+.top nav { display: flex; gap: 18px; font-size: 14px; }
+.top nav a { color: var(--muted); text-decoration: none; }
+.top nav a:hover { color: var(--ink); }
+.top nav a[aria-current="page"] { color: var(--ink); font-weight: 600; }
+/* On phones the nav takes its own row under the logo instead of wrapping or hiding. */
+@media (max-width: 520px) {
+  .top { flex-wrap: wrap; row-gap: 12px; }
+  .top nav { width: 100%; gap: 16px; font-size: 13px; }
+}
+
+/* Segmented control. Each button's transparent border fills the pill's padding, so the whole pill is clickable. */
+.seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--rule); border-radius: 999px; background: var(--panel); }
+.seg button { font: inherit; font-size: 14px; font-weight: 600; border: solid transparent; border-width: 3px 1px; background: transparent padding-box; color: var(--muted); padding: 6px 13px; border-radius: 999px; cursor: pointer; }
+.seg button:first-child { border-left-width: 3px; }
+.seg button:last-child { border-right-width: 3px; }
+.seg button:not([aria-pressed="true"]):not(:disabled):hover { color: var(--ink); }
+.seg button[aria-pressed="true"] { background: var(--ink) padding-box; color: var(--paper); }
+.seg button:disabled { opacity: .35; cursor: default; }
+
+/* Pill link with a leading icon. */
+.pill-btn { display: inline-flex; align-items: center; gap: 8px; padding: 6px 13px; border: 1px solid var(--rule); border-radius: 999px; background: var(--panel); color: var(--ink); font-size: 13px; font-weight: 600; line-height: 1.6; text-decoration: none; }
+.pill-btn:hover { background: color-mix(in srgb, var(--ink) 6%, var(--panel)); border-color: color-mix(in srgb, var(--ink) 22%, var(--rule)); }
+.pill-btn svg { width: 14px; height: 14px; flex: none; color: var(--accent); }
+
