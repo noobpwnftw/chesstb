@@ -1194,8 +1194,22 @@ struct Generator::Impl
 				plan[adv][t] = slices;
 		}
 
+		// A budget's layer is a function of the layer below it and of values that do
+		// not depend on the budget, so once a layer repeats the one below it every
+		// layer above repeats too and is copied instead of solved.
+		bool settled = false;
+
 		for (int budget = 0; budget < DTC_BUDGETS; ++budget)
 		{
+			if (settled)
+			{
+				for (const Table* t : family)
+				{
+					layers[t].cur = layers[t].below;
+					if (t == report) out.on_dtc_budget(*t, budget, layers[t].cur);
+				}
+				continue;
+			}
 			for (const Table* t : family) layers[t].cur.assign(t->layout.size(), DTC_UNDECIDED);
 
 			for (auto& [adv, per_table] : plan)
@@ -1248,6 +1262,12 @@ struct Generator::Impl
 				}
 			}
 			for (const Table* t : family) if (t == report) out.on_dtc_budget(*t, budget, layers[t].cur);
+			if (budget > 0)
+			{
+				bool same = true;
+				for (const Table* t : family) if (layers[t].cur != layers[t].below) { same = false; break; }
+				settled = same;
+			}
 			for (const Table* t : family) layers[t].below.swap(layers[t].cur);
 		}
 	}

@@ -83,6 +83,12 @@ position that changed between the two layers above, so only those positions are
 evaluated again. Castling families, whose quiet moves can leave the table, are
 evaluated in full at every clock.
 
+DTC is solved from budget 0 up. A budget's layer is a function of the layer below
+it and of values that do not depend on the budget, so once a layer repeats the one
+below it, every layer above repeats too and is copied rather than solved. Both
+shortcuts are exact: they reproduce the values a full solve gives, which is what
+the comparison below checks.
+
 Memory is held to one byte per position for WDL, two for each distance metric
 asked for, and two for DTC on pawn materials. A sub-table's DTZ is dropped once it
 cannot be read again.
@@ -133,13 +139,21 @@ sets and unmake counts identical to the python-chess implementation.
 | All 11 3-4-man with pawns | 0, 1, 2, 3, 10, 25, 50, 75, 90, 96, 97, 98, 99 | 84,420,308 | 1,097,464,004 | none |
 | KrK, KrrK, KrKr, KrKR, KrKN, KrPK, KrKP and the KpKp pair table | all 100 | 1,641,532 | 164,153,200 | none |
 | KRBKR (5-man) | 0, 1, 2, 50, 97, 98, 99 | 152,620,510 | 1,068,343,570 | none |
+| KNPKN (5-man with a pawn) | 0, 1, 2, 50, 97, 98, 99 | 556,739,460 | 3,897,176,220 | none |
+| KrPKR (5-man, a castling right and a pawn) | WDL and DTZ only | 15,084,888 | | none |
 
 "Positions" counts each legal position once per side to move; DTM is also
 compared at every one of them from both `dtm/` and `dtm50/`, and DTZ at every
 position that is not a draw.
 
-For the materials with pawns, the DTC curve is compared at all 29 budgets
-(1,797,031,197 values) and the prober's DTC answer at clocks 0, 50 and 99
-(185,899,779 answers). KPKP, the one 3-4-man material with en passant positions,
-adds 42,366 of them, each checked for WDL, DTZ, DTM from both files, DTM50 at
-every clock above and the DTC answer.
+For the materials with pawns, the DTC curve is compared at all 29 budgets:
+1,797,031,197 values over the 3-4-man materials and 5,780,369,929 over KNPKN.
+The prober's DTC answer, which picks the smallest budget that fits the clock, is
+compared at clocks 0, 50 and 99 for the 3-4-man materials (185,899,779 answers).
+That comparison needs every budget's layer in memory at once, which is 23 GB for
+a 5-man material with a pawn, so at 5 men the stored curve is checked but the
+prober's choice among budgets is not.
+
+KPKP, the one 3-4-man material with en passant positions, adds 42,366 of them,
+each checked for WDL, DTZ, DTM from both files, DTM50 at every clock above and
+the DTC answer.
